@@ -5,15 +5,17 @@ The agent (or a human) orchestrates and decides; this script is the only
 thing that writes install content, so what lands in --target is
 byte-identical to this repo, never transcribed by a model.
 
-    install.py --target ~/aios                # copy the substrate in
-    install.py --target ~/aios --enable-demo  # add hello_fleet to the scheduler manifest
-    install.py --target ~/aios --uninstall    # de-schedule managed jobs, then remove the tree
+    install.py --detect                            # read-only: report prior installs on this machine
+    install.py --target ~/ai-os-seed               # copy the substrate in
+    install.py --target ~/ai-os-seed --enable-demo # add hello_fleet to the scheduler manifest
+    install.py --target ~/ai-os-seed --uninstall   # de-schedule managed jobs, then remove the tree
 
 Stdlib only. Refuses to overwrite a non-empty target; uninstall asks the
 scheduler to drop its managed jobs before deleting anything, and refuses a
 target that doesn't look like one of ours (degrade toward safety).
 """
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -40,8 +42,84 @@ def die(msg):
     return 2
 
 
+def looks_like_install(path: Path) -> bool:
+    return (path / "PRINCIPLES.md").exists() and (path / "scheduler" / "manifest.yml").exists()
+
+
+def looks_like_clone(path: Path) -> bool:
+    return (path / "install.py").exists() and (path / "AGENT-INSTALL.md").exists()
+
+
+# Where the log_run.py wrapper path in a scheduled command reveals its install root.
+_ROOT_IN_CMD = re.compile(r"(/\S+)/observability/log_run\.py")
+
+
+def detect():
+    """Read-only survey of prior AI-OS Seed (or adjacent AI-OS) footprints on
+    this machine, so a fresh install can ask instead of stumble. Always exit 0
+    — this reports, it never decides."""
+    findings = []
+
+    # 1. The crontab managed block (Linux; harmless empty result elsewhere).
+    try:
+        r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+        in_block = False
+        for line in r.stdout.splitlines():
+            if "BEGIN cc-seed managed jobs" in line:
+                in_block = True
+                continue
+            if "END cc-seed managed jobs" in line:
+                in_block = False
+                continue
+            if in_block and line.strip():
+                m = _ROOT_IN_CMD.search(line)
+                root = m.group(1) if m else "?"
+                name = line.rsplit("# cc-seed:", 1)[-1].strip() if "# cc-seed:" in line else "?"
+                findings.append(f"crontab: scheduled job '{name}' -> install root {root}")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # 2. launchd plists (macOS).
+    for plist in sorted((Path.home() / "Library" / "LaunchAgents").glob("dev.cc-seed.*.plist")):
+        m = _ROOT_IN_CMD.search(plist.read_text(errors="replace"))
+        root = m.group(1) if m else "?"
+        findings.append(f"launchd: {plist.name} -> install root {root}")
+
+    # 3. Directories a previous install (or AI-OS Core) commonly leaves behind.
+    for cand in ["~/ai-os-seed", "~/aios", "~/tools/ai-os-seed", "~/ai-os"]:
+        p = Path(cand).expanduser()
+        if not p.is_dir():
+            continue
+        if looks_like_clone(p):
+            findings.append(f"dir: {p} — an AI-OS Seed CLONE (repo source, not a live install)")
+        elif looks_like_install(p):
+            findings.append(f"dir: {p} — an AI-OS Seed INSTALL")
+        else:
+            findings.append(f"dir: {p} — exists but isn't a seed layout "
+                            f"(possibly AI-OS Core or something else of yours — do not touch it)")
+
+    if not findings:
+        print("no prior AI-OS Seed footprint detected on this machine.")
+        return 0
+    print(f"found {len(findings)} prior-install signal(s):")
+    for f in findings:
+        print(f"  - {f}")
+    print("\nOne machine supports ONE live seed install: the scheduler owns a single")
+    print("managed crontab block / dev.cc-seed.* label set, and two installs would")
+    print("fight over it. See AGENT-INSTALL.md Phase 0 for how to proceed.")
+    return 0
+
+
 def install(target: Path):
     if target.exists() and any(target.iterdir()):
+        if looks_like_clone(target):
+            return die(f"target {target} is the seed REPO CLONE, not an install "
+                       f"root — install into a separate directory (the clone is "
+                       f"the source you install FROM).")
+        if looks_like_install(target):
+            return die(f"target {target} is already an AI-OS Seed install. To keep "
+                       f"it, stop here (nothing to do). To replace it, run "
+                       f"--uninstall on it first, then install fresh.")
         return die(f"target {target} exists and is not empty — refusing to "
                    f"overwrite. Pick an empty/new directory.")
     missing = [c for c in COMPONENTS + ROOT_FILES if not (HERE / c).exists()]
@@ -104,12 +182,21 @@ def uninstall(target: Path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--target", required=True, help="install root (absolute path)")
+    ap.add_argument("--target", help="install root (absolute path)")
+    ap.add_argument("--detect", action="store_true",
+                    help="read-only: report prior seed installs/clones on this machine")
     ap.add_argument("--enable-demo", action="store_true",
                     help="add the hello_fleet demo to the scheduler manifest")
     ap.add_argument("--uninstall", action="store_true",
                     help="de-schedule managed jobs and remove the install")
     args = ap.parse_args()
+
+    if args.detect:
+        if args.target or args.enable_demo or args.uninstall:
+            return die("--detect takes no other flags (it's a read-only report)")
+        return detect()
+    if not args.target:
+        return die("--target is required (or use --detect for a read-only survey)")
 
     target = Path(args.target).expanduser()
     if not target.is_absolute():

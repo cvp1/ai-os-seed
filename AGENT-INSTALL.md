@@ -19,6 +19,24 @@ Binding rules for the whole install:
 
 Check, and report each result plainly:
 
+- **Prior installs first:** run `python3 install.py --detect` (read-only).
+  It surveys this machine for an existing seed install — the scheduler's
+  managed crontab block, `dev.cc-seed.*` launchd plists, and the
+  directories a previous install or clone commonly leaves behind. If it
+  reports anything, STOP and put the choice to the user plainly:
+  - **Keep the existing install** — end here; if they wanted an update,
+    point them at the existing install root instead of making a new one.
+  - **Replace it** — run `--uninstall` against the OLD root first (shown
+    before run, like everything else; it de-schedules that install's jobs
+    then removes its tree), and only then continue to Phase 1.
+  - **Never install twice on one machine.** The scheduler owns a single
+    managed crontab block / launchd label set per machine; two installs
+    silently fight over it. Don't offer side-by-side as an option.
+  If `--detect` flags a directory that exists but *isn't* a seed layout
+  (for example `~/ai-os` from AI-OS Core, a different product in this
+  family), leave it completely alone — it can coexist with the seed; just
+  pick an install root that can't be confused with it, and never write
+  into it.
 - OS is Linux or macOS (`uname`) — anything else: stop, unsupported.
 - `git` is installed.
 - `python3` is 3.9+ (`python3 --version`).
@@ -42,8 +60,13 @@ Check, and report each result plainly:
 
 Ask, one at a time:
 
-1. **Where should the system live?** Default suggestion: `~/aios` — any
-   absolute path is fine. Call it `<ROOT>` below.
+1. **Where should the system live?** Default suggestion: `~/ai-os-seed` —
+   any absolute path is fine, but avoid names that collide with other
+   AI-OS family products already on the machine (an `~/ai-os` dir from
+   AI-OS Core is NOT this system; one keystroke of difference has
+   confused real installs). Also keep it distinct from the clone
+   directory you're reading this file in — the clone is the source, the
+   install root is the live system. Call it `<ROOT>` below.
 2. **What's the first real thing you'd want to watch or automate?** (You
    won't build it now — knowing it lets you tailor the wrap-up advice.)
 3. **Name to use in their CLAUDE.md** (optional; skip if they prefer).

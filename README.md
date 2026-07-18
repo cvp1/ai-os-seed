@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.0-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.1-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -95,6 +95,15 @@ Known rough edge: Homebrew Python on modern macOS refuses a bare `pip
 install pyyaml` (PEP 668) — caught live on real hardware and by this
 project's own CI. AGENT-INSTALL.md's readiness phase has the fix (a
 venv, or `--break-system-packages`).
+
+Reinstalls used to stumble: a second install on a machine with an earlier
+one (or with AI-OS Core, this family's non-terminal edition) found the old
+clone and install directories and got confused — caught on a real Mac,
+v0.2.1-alpha. Now `install.py --detect` surveys prior footprints read-only,
+AGENT-INSTALL.md's Phase 0 runs it first and asks you what to do (keep or
+replace — never two installs on one machine, since the scheduler owns a
+single managed crontab block / launchd label set), and the default install
+root is `~/ai-os-seed`, unambiguous next to Core's `~/ai-os`.
 
 `CLAUDE.md.template` / `README.md.template` are structural references
 only — your agent drafts your actual `CLAUDE.md` fresh at install

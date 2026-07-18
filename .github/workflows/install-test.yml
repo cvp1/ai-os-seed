@@ -32,6 +32,9 @@ jobs:
         run: |
           python3 --version
           python3 -c "import yaml" || (echo "PyYAML missing" && exit 1)
+          # a fresh runner must report no prior installs; the checkout itself
+          # is the one legitimate signal (the seed CLONE we're installing from)
+          python3 install.py --detect
 
       - name: install (Phase 2)
         run: python3 install.py --target "${{ runner.temp }}/aios-target"
@@ -67,6 +70,8 @@ jobs:
           python3 install.py --target "$ROOT" --enable-demo
           bash "$ROOT/scheduler/sync.sh"
           bash "$ROOT/scheduler/sync.sh" --check
+          # with a job scheduled for real, --detect must now find this install
+          python3 install.py --detect | grep -q "install root" || (echo "--detect missed a live install" && exit 1)
 
       - name: uninstall removes the whole footprint (Phase 7 undo path)
         run: |
