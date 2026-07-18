@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Something broke
+    url: https://github.com/cvp1/ai-os-seed/issues/new
+    about: Open a blank issue — describe what happened, your OS, and where in AGENT-INSTALL.md it went sideways.

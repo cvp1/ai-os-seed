@@ -1,0 +1,45 @@
+name: First win
+description: You got the demo job green — the whole point of shipping this as an alpha.
+title: "first win: "
+labels: ["first-win"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the entire telemetry mechanism for this project — no
+        analytics, no phone-home, just you telling me it worked (or where
+        it didn't). Fill in what you're comfortable sharing; every field
+        but the first is optional.
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options:
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: watching
+    attributes:
+      label: What will you monitor with it?
+      placeholder: "e.g. a home server, a side project's cron jobs, a Pi"
+    validations:
+      required: false
+  - type: dropdown
+    id: path
+    attributes:
+      label: Which install path did you use?
+      options:
+        - Agent-driven (pasted the block into Claude Code / another agent)
+        - Manual (followed AGENT-INSTALL.md by hand)
+        - install.py directly
+    validations:
+      required: false
+  - type: textarea
+    id: friction
+    attributes:
+      label: Anything that broke, confused you, or felt off?
+      description: Especially anything the README's honest ledger didn't warn you about.
+    validations:
+      required: false

@@ -1,0 +1,61 @@
+name: install test
+
+# Runs the AGENT-INSTALL.md phase sequence for real, on a throwaway runner —
+# no secrets, no network calls beyond checkout, nothing that touches an
+# operator's real machine. This is the thing a "public alpha" README claims
+# to be true; CI is what keeps that claim honest between releases.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: readiness (Phase 0)
+        run: |
+          python3 --version
+          python3 -c "import yaml" || (echo "PyYAML missing" && exit 1)
+
+      - name: install (Phase 2)
+        run: python3 install.py --target "${{ runner.temp }}/aios-target"
+
+      - name: refuses a non-empty target (safety check)
+        run: |
+          if python3 install.py --target "${{ runner.temp }}/aios-target"; then
+            echo "expected a refusal on a non-empty target, got success"; exit 1
+          fi
+
+      - name: verify (Phase 3)
+        env:
+          CC_OBS_DB: ${{ runner.temp }}/aios-target/observability/data/runs.db
+          CC_HYGIENE_ROOT: ${{ runner.temp }}/aios-target
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          python3 "$ROOT/_lib/selftest.py"
+          python3 "$ROOT/observability/log_run.py" --job hello_fleet -- python3 "$ROOT/demo/hello_fleet.py"
+          python3 "$ROOT/observability/report.py" --job hello_fleet
+          python3 "$ROOT/observability/freshness.py" --all
+
+      - name: enable + install the demo job for real (Phase 5)
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          python3 install.py --target "$ROOT" --enable-demo
+          # idempotent: a second call must be a no-op, not a duplicate entry
+          python3 install.py --target "$ROOT" --enable-demo
+          bash "$ROOT/scheduler/sync.sh"
+          bash "$ROOT/scheduler/sync.sh" --check
+
+      - name: uninstall removes the whole footprint (Phase 6 undo path)
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          python3 install.py --target "$ROOT" --uninstall
+          if [ -d "$ROOT" ]; then echo "uninstall left the tree behind"; exit 1; fi

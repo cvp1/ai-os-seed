@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.2-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.3-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
