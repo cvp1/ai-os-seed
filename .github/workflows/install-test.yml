@@ -20,6 +20,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: dependencies an operator would install per the README
+        run: python3 -m pip install --user pyyaml
+
       - name: readiness (Phase 0)
         run: |
           python3 --version
