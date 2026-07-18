@@ -1,0 +1,33 @@
+# scheduler/manifest.yml — the scheduler's source of truth (SEED-014).
+#
+# One entry per scheduled job. `scheduler/sync.sh` reads this file and
+# reconciles the REAL scheduler (crontab on Linux, launchd on macOS) to
+# match it. Add, edit, or remove an entry here, then run `sync.sh` — never
+# hand-edit crontab or a launchd .plist directly; `sync.sh --check` will
+# catch and report that drift, never silently fix it.
+#
+# Fields:
+#   name      unique job id — also the --job key log_run.py records into
+#             runs.db and the key freshness.json's "jobs" map looks up.
+#   schedule  a standard 5-field cron expression (minute hour dom month
+#             dow). Translated automatically to the macOS launchd
+#             equivalent; only two shapes translate today — "*/N * * * *"
+#             (every N minutes, N a divisor of 60) and a fixed "M H * * *"
+#             or "M H * * D" (daily/weekly at one time). Anything else is
+#             refused at sync time with a clear message rather than
+#             silently mis-scheduled.
+#   command   the FULL command line, already wrapped through
+#             observability/log_run.py (see the example below) — sync.sh
+#             does not add this wrapping for you. An unwrapped job still
+#             runs; it just never appears in runs.db or freshness.
+#
+# Example — uncomment and fix SEED_ROOT to try the seed's own demo job:
+#
+# jobs:
+#   - name: hello_fleet
+#     schedule: "*/15 * * * *"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job hello_fleet --
+#       /usr/bin/python3 <SEED_ROOT>/demo/hello_fleet.py
+
+jobs: []

@@ -1,0 +1,9 @@
+{
+  "_comment": "Expected cadence for each SCHEDULED job. freshness.py flags a job as STALE if its newest run is older than max_age, MISSING if it has never run, or FAILING if its newest run exited non-zero. Only list jobs actually scheduled in scheduler/manifest.yml; max_age = the real interval plus slack for a missed beat. Durations: Nd / Nh / Nm. Ships pre-seeded with just the demo job (SEED-017) — add an entry here for every real job you schedule.",
+  "jobs": {
+    "hello_fleet": {
+      "max_age": "20m",
+      "label": "hello-fleet demo heartbeat (every 15 min)"
+    }
+  }
+}

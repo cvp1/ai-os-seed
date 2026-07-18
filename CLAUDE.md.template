@@ -1,0 +1,64 @@
+# CC — home-automation & monitoring monorepo
+
+This directory is a monorepo of small home-automation/monitoring projects, one
+per subdirectory (solar-direct, uptime-kuma, status-site, morning-brief,
+energy-report, unifi-health, smarthub-usage, battery-health, solar-health,
+cc-handoff, cron, bmad-lite). Per-project facts live in auto-memory; this file
+holds only the conventions that apply across all of them.
+
+## First principles
+- The generative rules behind the fleet live in `PRINCIPLES.md`. When a decision
+  isn't covered by a specific convention below, reason from there.
+
+## Secrets
+- All credentials live in `~/.key/` (e.g. `envoy.key`, `tesla.key`, `unifi.key`,
+  `ha_token`, `ss_key`, `kuma_{{REDACTED}}`). Read them from there — never hardcode or
+  echo secret values into the transcript or commits.
+- `~/.key/` is an **fscrypt-encrypted vault** (tooling + runbook in `keyvault/`).
+  It starts **locked after every reboot**; unlock with `keyvault/unlock.sh`.
+  While locked, `_lib/secrets.py` fails with a clear `🔒 ~/.key is locked`
+  message and the freshness check flags stalled jobs. Rotation runbook:
+  `keyvault/ROTATION.md`.
+
+## Git / GitHub
+- Account: **{{REDACTED}}**. Repos are **private**, remotes use **HTTPS** (SSH key auth
+  fails on this host).
+- Commit with explicit identity:
+  `git -c user.name='{{REDACTED}}' -c user.email='{{REDACTED}}@gmail.com' commit ...`
+- Use the `gh` CLI for GitHub operations.
+
+## Python
+- System/cron scripts: `/usr/bin/python3`.
+- Project tools with dependencies: the project's local `.venv/bin/python`.
+
+## Cron / scheduling
+- All cron logic lives under `~/Github/CC/` (`cron/` manifest + `sync.sh`, plus
+  per-project dirs). The hermes gateway is kept **only as the scheduler** —
+  shims in `~/.hermes/scripts/` must stay real files (the scheduler rejects
+  absolute/symlink paths).
+
+## Machine fleet (this host = `{{REDACTED}}`)
+- This machine is one of several Claude Code hosts ({{REDACTED}}, mac-desktop,
+  imac). Protocol: `~/notes/00 Meta/Fleet/FLEET.md` — knowledge → vault,
+  state → `00 Meta/Fleet/<host>/STATE.md` heartbeats, work → the `cc-handoff`
+  mailbox (tasks carry `to:`; the hourly `fleet_state` job polls + pings).
+- For fleet / cross-machine / "where does X live" questions: read the other
+  hosts' STATE.md files and check `cc-handoff/tasks/` before guessing. One
+  home per capability; capabilities move by install seed, never synced trees.
+
+## Infra endpoints (local network)
+| Service        | Address                  |
+|----------------|--------------------------|
+| Home Assistant | `{{HOST_IP}}:8123`     |
+| Enphase Envoy  | `{{HOST_IP}}` (HTTPS — DHCP-wanders; MAC in `_lib/mac_registry.json`) |
+| Tesla Gateway  | `{{HOST_IP}}` (HTTPS)  |
+| UniFi Network  | `{{HOST_IP}}:11443`    |
+| Uptime Kuma    | `{{HOST_IP}}:3001`     |
+
+## Conventions
+- Internal HTTPS targets use self-signed certs — `curl -sk` is expected.
+- Probe commands should carry a short `--max-time`/`--connect-timeout`.
+- **MCP servers** follow one homing convention — server lives with its
+  capability (`<project>/<project>_mcp_server.py`), one client plane, secrets
+  from `~/.key`, any network-listening server binds the LAN IP with a bearer.
+  Full convention + the served/consumed inventory: `cc-skills/MCP.md`.

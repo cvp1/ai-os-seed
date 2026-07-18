@@ -1,0 +1,12 @@
+# CC workspace meta-repo — tracks ONLY the root-level connective-tissue docs.
+# Every subdirectory is its own independent {{REDACTED}}/<name> git repo and is NOT
+# tracked here; this repo deliberately ignores them all to avoid nesting repos.
+/*
+!/.gitignore
+!/README.md
+!/VISION.md
+!/CLAUDE.md
+!/PRINCIPLES.md
+!/audits/
+# Root-anchored tool config (outputDir points OUTSIDE the repo — story 002).
+!/playwright-mcp.config.json
