@@ -1,64 +1,74 @@
-# CC — home-automation & monitoring monorepo
+# {{WORKSPACE_NAME}} — operating conventions
 
-This directory is a monorepo of small home-automation/monitoring projects, one
-per subdirectory (solar-direct, uptime-kuma, status-site, morning-brief,
-energy-report, unifi-health, smarthub-usage, battery-health, solar-health,
-cc-handoff, cron, bmad-lite). Per-project facts live in auto-memory; this file
-holds only the conventions that apply across all of them.
+This file is read by your coding agent on every session start (hierarchy
+load). It holds the conventions that apply across every project in this
+workspace — not per-project detail (that belongs in each project's own
+README, or in your agent's memory).
+
+Your install agent drafted a real version of this file for you already
+(AGENT-INSTALL.md Phase 4) — this template is a structural reference only,
+kept so you can see the shape and re-derive sections you delete later.
 
 ## First principles
-- The generative rules behind the fleet live in `PRINCIPLES.md`. When a decision
-  isn't covered by a specific convention below, reason from there.
+
+The generative rules the rest of this file's conventions fall out of live
+in [`PRINCIPLES.md`](PRINCIPLES.md). When a decision isn't covered by a
+specific convention below, reason from there.
 
 ## Secrets
-- All credentials live in `~/.key/` (e.g. `envoy.key`, `tesla.key`, `unifi.key`,
-  `ha_token`, `ss_key`, `kuma_{{REDACTED}}`). Read them from there — never hardcode or
-  echo secret values into the transcript or commits.
-- `~/.key/` is an **fscrypt-encrypted vault** (tooling + runbook in `keyvault/`).
-  It starts **locked after every reboot**; unlock with `keyvault/unlock.sh`.
-  While locked, `_lib/secrets.py` fails with a clear `🔒 ~/.key is locked`
-  message and the freshness check flags stalled jobs. Rotation runbook:
-  `keyvault/ROTATION.md`.
 
-## Git / GitHub
-- Account: **{{REDACTED}}**. Repos are **private**, remotes use **HTTPS** (SSH key auth
-  fails on this host).
-- Commit with explicit identity:
-  `git -c user.name='{{REDACTED}}' -c user.email='{{REDACTED}}@gmail.com' commit ...`
-- Use the `gh` CLI for GitHub operations.
+- Credentials live in `~/.key/` (or wherever `keyvault/` is pointed at).
+  Read them from there at point of use — never hardcode a secret value or
+  echo one into a transcript or commit.
+- `~/.key/` starts locked after every reboot on the platforms that support
+  encryption-at-rest (`keyvault/README.md`); `_lib/secrets.py` fails with a
+  clear locked message rather than silently proceeding, and the freshness
+  check flags any job that stalled because of it.
+
+## Git
+
+- Set your account/identity convention here once you have one — which
+  account owns these repos, whether they're private, HTTPS vs SSH.
+- Commit with explicit identity if the default `git config` on this
+  machine isn't yours: `git -c user.name='<you>' -c user.email='<you>'
+  commit ...`
 
 ## Python
-- System/cron scripts: `/usr/bin/python3`.
-- Project tools with dependencies: the project's local `.venv/bin/python`.
 
-## Cron / scheduling
-- All cron logic lives under `~/Github/CC/` (`cron/` manifest + `sync.sh`, plus
-  per-project dirs). The hermes gateway is kept **only as the scheduler** —
-  shims in `~/.hermes/scripts/` must stay real files (the scheduler rejects
-  absolute/symlink paths).
+- System/scheduled scripts: the bare system `python3` (no venv) — this is
+  why `_lib/` stays stdlib-only; `_lib/selftest.py` enforces it.
+- Project tools with real dependencies: give the project its own venv.
 
-## Machine fleet (this host = `{{REDACTED}}`)
-- This machine is one of several Claude Code hosts ({{REDACTED}}, mac-desktop,
-  imac). Protocol: `~/notes/00 Meta/Fleet/FLEET.md` — knowledge → vault,
-  state → `00 Meta/Fleet/<host>/STATE.md` heartbeats, work → the `cc-handoff`
-  mailbox (tasks carry `to:`; the hourly `fleet_state` job polls + pings).
-- For fleet / cross-machine / "where does X live" questions: read the other
-  hosts' STATE.md files and check `cc-handoff/tasks/` before guessing. One
-  home per capability; capabilities move by install seed, never synced trees.
+## Scheduling
 
-## Infra endpoints (local network)
-| Service        | Address                  |
-|----------------|--------------------------|
-| Home Assistant | `{{HOST_IP}}:8123`     |
-| Enphase Envoy  | `{{HOST_IP}}` (HTTPS — DHCP-wanders; MAC in `_lib/mac_registry.json`) |
-| Tesla Gateway  | `{{HOST_IP}}` (HTTPS)  |
-| UniFi Network  | `{{HOST_IP}}:11443`    |
-| Uptime Kuma    | `{{HOST_IP}}:3001`     |
+- Job source of truth: `scheduler/manifest.yml`; apply with
+  `scheduler/sync.sh` (crontab on Linux, launchd on macOS). Never hand-edit
+  crontab or a `.plist` directly — `sync.sh --check` will flag the drift,
+  never silently fix it.
+- See `scheduler/CONVENTIONS.md` for the found-work-vs-breakage exit
+  convention and why jobs must self-notify (neither scheduler pages you by
+  default).
+
+## Machine fleet (if you run more than one host)
+
+- Name this host here once you have a naming convention. If you run
+  several machines, a short shared protocol doc (which host owns which
+  capability, where state/heartbeats live) pays off fast — don't build it
+  until you actually have a second host.
+- One home per capability: don't let the same job run scheduled on two
+  hosts "just in case" — pick one, note it here.
+
+## Infra endpoints (fill in as you add them)
+
+| Service | Address |
+|---|---|
+| _(example)_ | `{{HOST_IP}}:PORT` |
 
 ## Conventions
-- Internal HTTPS targets use self-signed certs — `curl -sk` is expected.
-- Probe commands should carry a short `--max-time`/`--connect-timeout`.
-- **MCP servers** follow one homing convention — server lives with its
-  capability (`<project>/<project>_mcp_server.py`), one client plane, secrets
-  from `~/.key`, any network-listening server binds the LAN IP with a bearer.
-  Full convention + the served/consumed inventory: `cc-skills/MCP.md`.
+
+- Note anything here that would otherwise surprise a future session: a
+  self-signed cert that needs `curl -sk`, a probe that needs a short
+  timeout, a naming convention for scripts that talk to a device.
+- **Memory is keyed to the exact directory you launch your agent from** —
+  always launch from this workspace root, or memory silently won't load.
+  This is the one gotcha worth a permanent line here.

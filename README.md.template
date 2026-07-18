@@ -1,140 +1,61 @@
-# CC — home-automation & monitoring workspace
+# {{WORKSPACE_NAME}} — personal operating workspace
 
-**CC is a personal AI operating system.** It's the working directory for a fleet
-of ~45 small, sharp tools that watch and run one operator's home and an off-grid
-desert ranch — solar arrays and Powerwalls, a LoRa mesh and a Starlink dish,
-security cameras, network gear, inboxes and calendars — plus the knowledge,
-skills, and local-LLM infrastructure that tie them together. Most of it is built
-and operated by Claude Code itself; the human sets direction and holds the keys.
+**This is a personal operating system for one operator** — the working
+directory for a growing set of small, sharp tools you build and run
+yourself, on the substrate AI-OS Seed just installed for you.
 
-The fleet grew incident by incident, and so did its rules. A vendor app cried
-"device offline" while the device was fine locally; a green healthcheck read
-HEALTHY while a sensor flapped; an unbounded loop once wrote a 1.7 GB file. Each
-lesson hardened into a convention, and underneath the conventions sits a small
-set of **first principles** — the generative rules the rest of the system falls
-out of.
-
-## Why it exists
-
-The intent the rest of the system serves — what CC actually is, who it serves, and
-what "done" means — lives in [`VISION.md`](VISION.md).
+The set grows incident by incident, and so do its rules. A vendor app
+that cries "offline" while the device is fine locally, a healthcheck that
+reads green while something's actually flapping, a loop that forgot to
+bound its own output — each lesson you hit hardens into a convention, and
+underneath the conventions sits a small set of first principles the rest
+falls out of.
 
 ## First principles
 
-The full set — each with its *why* and a worked example — lives in
-[`PRINCIPLES.md`](PRINCIPLES.md). The spine:
+The full set — each with its *why* — lives in
+[`PRINCIPLES.md`](PRINCIPLES.md). The spine, distilled:
 
-- **Truth over status** — distrust green; lead with what's refuted; check what exists before naming a gap.
-- **Fail safe** — degrade toward safety; self-heal over lock; automate asymmetrically by risk.
+- **Truth over status** — distrust green; check what exists before naming a gap.
+- **Fail safe** — degrade toward safety, loudly; self-heal over lock.
 - **Signal, not noise** — edge-trigger alerts; bound every loop and output.
-- **Data and cost** — store facts and derive views; right-size the model to the turn.
+- **Data and cost** — store facts and derive views, never freeze a derived number.
 - **Architecture** — small sharp tools on a shared spine; validate live.
 - **Secrets** — they never touch the transcript.
-- **Operator** — recommend, don't poll.
 
 ## How it's held together
 
-This directory is **not a monorepo** — it's a flat workspace of ~45 independent
-git repos (each `{{REDACTED}}/<name>`, private) plus a few loose dirs, held together by
-four shared things:
+This directory is **not a monorepo** — as it grows, keep it a flat
+workspace of independent git repos (each project a direct child of this
+root) plus a few loose dirs, held together by a few shared things:
 
 | Shared spine | Where | Why it must stay where it is |
 |---|---|---|
 | Conventions | `CLAUDE.md` (root) | inherited by every subdir via hierarchy load |
-| Shared lib | `_lib/` (`{{REDACTED}}/cc-lib`) | sibling-imported at **depth-1** (`dirname(dirname(__file__))`) — projects must stay direct children of CC |
-| Scheduling | `cron/` (manifest + `sync.sh`) | hermes shims reference these paths |
-| **Auto-memory** | `~/.claude/projects/-home-{{REDACTED}}-Github-CC/memory/` | **keyed to this exact cwd** — always launch Claude from `~/Github/CC` or the memory silently won't load |
+| Shared lib | `_lib/` | sibling-imported at **depth-1** (`dirname(dirname(__file__))`) — projects must stay direct children of this root |
+| Scheduling | `scheduler/` (manifest + `sync.sh`) | job commands reference these paths |
+| Memory | wherever your agent's memory store lives | usually **keyed to this exact cwd** — always launch your agent from here |
 
 ## Organizing principle
 
-**Folders stay flat; domains are logical, not physical** — same model as the
-Obsidian vault (folder = location, tags = domain). The groups below are an index,
-*not* a directory layout. Don't nest projects into domain subfolders: it breaks
-the depth-1 `_lib` import, the cron paths, and (if you ever work from a subfolder)
-fragments the single memory scope. To keep this readable as it grows, prefer
-**naming-prefix families** (`solar-*`, `vivint-*`, `meshtastic-*`, `cc-*`).
+**Folders stay flat; domains are logical, not physical.** Don't nest
+projects into domain subfolders as you add them — it breaks the depth-1
+`_lib` import, the scheduler's paths, and (if you ever launch from a
+subfolder) fragments your agent's memory scope. A naming-prefix
+convention (`home-*`, `work-*`, whatever fits) reads just as well without
+paying that cost.
+
+## Your projects
+
+_(empty — this is where your own project index goes as you build. The one
+thing installed for you is the demo below; everything else here is
+yours.)_
+
+| Project | What |
+|---|---|
+| `demo/hello_fleet.py` | the seed's own first win — a heartbeat proving scheduler → job → observability → freshness. Delete it once you have something real to watch. |
 
 ---
 
-## ☀️ Solar & Energy
-| Project | What |
-|---|---|
-| `solar-direct` | Direct local-API to Enphase Envoy + Tesla gateway, bypassing HA |
-| `solar-health` | Solar-system health report (importable `gather()`/`render()`) |
-| `panel-health` | Per-microinverter anomaly watch (61-panel Enphase array) |
-| `battery-health` | Powerwall battery-health report |
-| `energy-advisor` | `/energy` self-consumption advisor + 6:30am push |
-| `energy-report` | Energy-usage reporting |
-| `smarthub-usage` | SSVEC SmartHub electric-co-op usage report |
-| `tesla-fleet` | Tesla Fleet / Powerwall integration (BYO dev app) |
-
-## 🌵 Ranch IoT & Environment
-| Project | What |
-|---|---|
-| `meshtastic` | Heltec V4 mesh → HA via MQTT bridge (systemd) |
-| `meshtastic-health` | Mesh health watchdog |
-| `ranch-watch` | Hourly NWS weather-hazard alerts (frost/fire/wind/flood/dust) |
-| `ranch-weather` | `/weather` location-exact calibrated forecast |
-| `starlink-health` | Dish gRPC telemetry early-warning (the ranch's only internet) |
-
-## 🌐 Network, Security & Devices
-| Project | What |
-|---|---|
-| `device-watch` | Unknown-device tripwire vs known-MAC registry |
-| `unifi-health` | UniFi network-health report |
-| `keyvault` | fscrypt `~/.key` tooling + rotation runbook + audit alerts |
-
-## 📹 Security Cameras (Vivint / Frigate)
-| Project | What |
-|---|---|
-| `frigate` | Frigate NVR (Docker) for the 3 Vivint cams via SmartHub proxy |
-| `vivint-direct` | Cloud-API flap detector (sensor flapping behind the panel chime) |
-| `vivint-ha-watchdog` | Reloads the HACS Vivint integration when its feed freezes |
-
-## ✉️ Comms, Mail & Messaging
-| Project | What |
-|---|---|
-| `morning-brief` | 5am personal brief (email + calendar + solar + news) to Proton |
-| `cognizant-brief` | 6am work brief ({{REDACTED}} inbox + meetings) to Gmail |
-| `composio-mcp` | Local stdio MCP shim for read-only {{REDACTED}} Outlook |
-| `fire-alert` | Ranch fire-team SMS alert system (Twilio roster) — `/firealert` |
-
-## 📊 Monitoring, Observability & Infra
-| Project | What |
-|---|---|
-| `status-site` | Dockerized status dashboard (`:8088`) |
-| `uptime-kuma` | Availability monitoring (`.77:3001`) |
-| `grafana` | Standalone Grafana over HA's InfluxDB (`.77:3000`) |
-| `host-monitor` | Beszel hub+agent monitoring the cc-host `.77` box itself |
-| `observability` | Cron/agent run history (`runs.db` SQLite) |
-| `home-digest` | Weekly week-over-week drift digest (zero-LLM) |
-| `evals` | Eval checks riding the run-log via exit codes |
-| `cron` | All hermes cron logic (manifest + `sync.sh`) + shims |
-| `_lib` | Shared stdlib-only lib: secrets/ha/mail/netreg (`{{REDACTED}}/cc-lib`) |
-| `docsite` | nginx static webserver (`cc-docs :8090`) to view generated HTML |
-| `cc-backup` | Full-instance encrypted backup/restore to `~/mnt/CC` |
-| `cc-handoff` | Cross-session handoff tooling |
-| `memory-prune` | Monthly auto-memory verify/prune job |
-
-## 🧠 Knowledge, Skills & Personal-AI
-| Project | What |
-|---|---|
-| `wiki` | `/wiki` precedent-search over the `~/notes` vault |
-| `board` | `/board` AI board of advisors (cloned experts) |
-| `garden` | `/garden` hydroponics help grounded in the 17-guide library |
-| `signal-scan` | Daily AI/tech frontier sweep → vault note |
-| `notes-backup` | Off-host GitHub backup of the `~/notes` vault |
-| `qrz-logbook` | Ham QSO log pull + dashboard + reel |
-| `cc-skills` | Shared skills repo + `skill-center` meta-skill |
-| `bmad-lite` | Spec-driven dev pipeline (project-scope slash commands) |
-| `cc-seed` | Replicate the CC substrate ("the OS") for others via a real installer — plan/backlog/one-pager |
-
-## 🤖 Local LLM
-| Project | What |
-|---|---|
-| `open-webui` | ChatGPT-style front-end (`.77:3080`) for the `.66` Ollama node |
-
----
-
-*Per-project detail lives in auto-memory (`~/.claude/.../memory/`), not here.*
-*This index mirrors the domain grouping in `MEMORY.md`.*
+*Per-project detail belongs in your agent's memory or each project's own
+README — this index is for orientation, not the whole story.*
