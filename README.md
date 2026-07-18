@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.3-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.4-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -43,6 +43,38 @@ own runs.db. Everything it does is shown before it runs, and
 
 Prefer to drive yourself? `AGENT-INSTALL.md` is written for an agent but
 every step is a plain command — follow it by hand.
+
+## Already running AI-OS Core? This is its upgrade.
+
+If your agent already has a workspace — an [AI-OS
+Core](https://craigvandeputte.com) counts — the seed doesn't install a
+second system. It composes into the one you have (`install.py --target
+<your workspace> --into`) and your assistant gains an operations floor
+it didn't have:
+
+- **It acts on a schedule now, not just in conversation.** Jobs run via
+  crontab or launchd while you're away; the scheduler's manifest is the
+  source of truth, and a drift check catches hand-edits before you
+  discover them the hard way.
+- **It keeps a record of every run.** One SQLite row per run: when, exit
+  code, duration, what it said. "Did the backup actually run last
+  night?" becomes a query, not a feeling.
+- **It notices silence.** The freshness backstop flags jobs that quietly
+  stop, the one failure mode per-job checks can't see.
+- **Secrets stay out of transcripts.** The keyvault pattern: encrypted
+  at rest, read at point of use, fail-closed when locked.
+- **Ops verbs for the agent you already talk to.** `/status` answers
+  "how is my system doing" honestly in one screen, and `/improve` and
+  `/recall` now ground themselves in your run history as well as your
+  memory.
+- **A weekly derived view.** `NOW.md` regenerated from your own run log
+  and git activity. Facts stored, views derived, no LLM in the loop.
+
+Your memory, your CLAUDE.md, your files stay exactly as they are. The
+install refuses rather than touch anything of yours, and uninstall
+removes only what the seed added. Tested for real: this repo's operator
+composed the seed into his own live AI-OS Core on a Mac the day this
+shipped, memory byte-intact, first job green on launchd.
 
 ## What's in the seed
 
@@ -64,8 +96,9 @@ every step is a plain command — follow it by hand.
 The last five rows are **the cognitive spine** (Wave 1.5): the loop that
 makes this an operating system rather than cron with logging — jobs
 produce facts, facts become memory, memory makes the next session
-smarter. `memory/THE-LOOP.md` (written at install) is the one-page map of
-which piece serves which arrow.
+smarter. `memory/THE-LOOP.md` is the one-page map of which piece serves
+which arrow (fresh installs get it in `memory/`; on an `--into` upgrade
+your memory is left alone, so read it from the clone).
 
 ## The honest ledger (alpha)
 

@@ -63,11 +63,18 @@ Ask, one at a time:
 
 1. **Where should the system live?** First ask: **do you already have a
    workspace your agent works in** (for example one AI-OS Core set up)?
-   - **Yes → the seed moves in.** One workspace, one memory, one agent —
-     don't multiply directories. Their existing workspace is `<ROOT>`,
-     and Phase 2 uses `--into`. (This matters mechanically, not just
-     aesthetically: agent memory is keyed to the working directory, so a
-     second root is literally a second brain that can't see the first.)
+   - **Yes → this install is an UPGRADE to that system, and say so.**
+     Frame it in capabilities before asking to proceed, something like:
+     *"You already have an AI-OS — this adds its operations floor. After
+     this, it can run jobs on a schedule while you're away, keep a
+     record of every run, catch jobs that silently stop, keep secrets
+     out of transcripts, and answer `/status` honestly in one screen —
+     and nothing about your current setup changes."* Their existing
+     workspace is `<ROOT>`, and Phase 2 uses `--into`. One workspace,
+     one memory, one agent — don't multiply directories. (This matters
+     mechanically, not just aesthetically: agent memory is keyed to the
+     working directory, so a second root is literally a second brain
+     that can't see the first.)
    - **No → a fresh directory.** Default suggestion: `~/ai-os-seed`; any
      absolute path is fine. Keep it distinct from the clone directory
      you're reading this file in — the clone is the source, the install
@@ -169,6 +176,16 @@ that's the whole spine live: **scheduler → job → runs.db → freshness.**
 
 Tell the user, concretely:
 
+- **If this was an `--into` upgrade of an existing AI-OS: recap what
+  their system can do now that it couldn't this morning**, in their
+  terms, not component names — it runs jobs on a schedule without them,
+  records every run, notices when something goes quiet, keeps secrets
+  out of transcripts, and `/status` gives them the honest one-screen
+  answer. Their memory and everything they had before is unchanged.
+  Point them at `memory/THE-LOOP.md` for how the pieces feed each other
+  — and note that on an `--into` install that file was deliberately not
+  written into their memory, so read it from the clone
+  (`<clone>/memory/THE-LOOP.md`) or copy it wherever they keep docs.
 - The undo path: `python3 install.py --target <ROOT> --uninstall` (removes
   the scheduled jobs it manages, then the seed's own files ONLY — anything
   the user or their agent created stays untouched. `memory/` in particular
