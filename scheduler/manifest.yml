@@ -29,5 +29,18 @@
 #     command: >-
 #       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job hello_fleet --
 #       /usr/bin/python3 <SEED_ROOT>/demo/hello_fleet.py
+#
+# A second example — your first REAL (non-demo) job: the weekly derived
+# view (views/weekly.py, SEED-054). Scheduled off the hour/day-boundary on
+# purpose (Monday 05:45, not 06:00) — a habit worth keeping once you have
+# more than one weekly job: everything firing on the dot piles up and any
+# one delay cascades into the next.
+#
+# jobs:
+#   - name: weekly_view
+#     schedule: "45 5 * * 1"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job weekly_view --
+#       /usr/bin/python3 <SEED_ROOT>/views/weekly.py
 
 jobs: []

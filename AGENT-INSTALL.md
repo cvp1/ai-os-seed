@@ -81,7 +81,26 @@ generated-at-install so they know it's theirs to rewrite. Do NOT copy
 `CLAUDE.md.template` — it's a leak-scrubbed export kept only as a
 structural reference.
 
-## Phase 5 — First win (scheduling for real)
+## Phase 5 — Memory (the first note, demonstrated not described)
+
+`<ROOT>/memory/` shipped in Phase 2 with an empty `MEMORY.md` index and a
+`CONVENTIONS.md` explaining the note format (four types, one fact per
+file, frontmatter schema — read it if you haven't). Two things now:
+
+1. Tell the user plainly: this only works if *your* memory (the agent
+   running this install) is actually configured to read from
+   `<ROOT>/memory/`. Confirm where your own memory store lives on this
+   machine and whether it already points here — if you're not sure, say
+   so rather than assuming; `CONVENTIONS.md`'s cwd-keying note explains
+   why this can silently diverge.
+2. Write the first note yourself, so the loop's first turn is
+   demonstrated rather than explained. Show the file content before you
+   write it (house rule). A `project`-type note is right for this: date,
+   `<ROOT>`, and what Phase 2 installed — nothing about the user beyond
+   what they told you in Phase 1's optional name. Add its index bullet to
+   `MEMORY.md` in the same step.
+
+## Phase 6 — First win (scheduling for real)
 
 Show, then run:
 
@@ -98,7 +117,7 @@ block now exists (their pre-existing entries are untouched). On macOS,
 freshness is green now and the scheduler keeps it green from here —
 that's the whole spine live: **scheduler → job → runs.db → freshness.**
 
-## Phase 6 — Hand back
+## Phase 7 — Hand back
 
 Tell the user, concretely:
 

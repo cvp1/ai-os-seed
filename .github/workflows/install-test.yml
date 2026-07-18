@@ -53,7 +53,13 @@ jobs:
           python3 "$ROOT/observability/report.py" --job hello_fleet
           python3 "$ROOT/observability/freshness.py" --all
 
-      - name: enable + install the demo job for real (Phase 5)
+      - name: memory scaffold present (Phase 5 — the agent's own note-writing isn't scriptable here)
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          test -f "$ROOT/memory/MEMORY.md"
+          test -f "$ROOT/memory/CONVENTIONS.md"
+
+      - name: enable + install the demo job for real (Phase 6)
         run: |
           ROOT="${{ runner.temp }}/aios-target"
           python3 install.py --target "$ROOT" --enable-demo
@@ -62,7 +68,7 @@ jobs:
           bash "$ROOT/scheduler/sync.sh"
           bash "$ROOT/scheduler/sync.sh" --check
 
-      - name: uninstall removes the whole footprint (Phase 6 undo path)
+      - name: uninstall removes the whole footprint (Phase 7 undo path)
         run: |
           ROOT="${{ runner.temp }}/aios-target"
           python3 install.py --target "$ROOT" --uninstall

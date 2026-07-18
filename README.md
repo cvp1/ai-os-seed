@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.5-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.0-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -54,8 +54,18 @@ every step is a plain command — follow it by hand.
 | `scheduler/` | manifest-as-source-of-truth job scheduling for plain crontab (Linux) / launchd (macOS), with drift detection |
 | `observability/` | one SQLite row per scheduled run + a freshness backstop that catches jobs that silently stop |
 | `demo/hello_fleet.py` | the first win: one heartbeat job proving the whole spine end-to-end |
-| `skills/` | skill-authoring conventions + a scaffold/audit tool |
-| `memory` conventions | (via your agent, at install) two-tier memory index discipline |
+| `memory/` | two-tier memory scaffold (`MEMORY.md` index + one-fact-per-file notes) — your agent writes the first note itself, at install |
+| `skills/improve` | corrections and taught preferences this session become durable memory notes |
+| `skills/recall` | "what do I know about X" over your memory notes + run history, with citations |
+| `skills/status` | one-verb honest answer to "how is my system doing" — read-only, distrust-green by design |
+| `skills/skill-center` | skill-authoring conventions + a scaffold/audit tool, for skills you build yourself |
+| `views/weekly.py` | scheduled, stdlib-only: a weekly `NOW.md` derived from your own run history + git activity — "store facts, derive views" made concrete |
+
+The last five rows are **the cognitive spine** (Wave 1.5): the loop that
+makes this an operating system rather than cron with logging — jobs
+produce facts, facts become memory, memory makes the next session
+smarter. `memory/THE-LOOP.md` (written at install) is the one-page map of
+which piece serves which arrow.
 
 ## The honest ledger (alpha)
 
@@ -89,6 +99,16 @@ venv, or `--break-system-packages`).
 `CLAUDE.md.template` / `README.md.template` are structural references
 only — your agent drafts your actual `CLAUDE.md` fresh at install
 instead of copying them.
+
+**The cognitive spine (v0.2.0-alpha, live-verified end to end.)** In one
+fresh sandbox install: the demo job ran and logged a row, `/status`
+reported it honestly (and, in a second run with its command tools
+withheld, correctly refused to fabricate a green answer rather than guess
+— exactly the doctrine it's supposed to enforce), a planted correction
+became a memory note via `/improve`, `/recall` found and cited that note
+from a plain-language question, and `views/weekly.py` wrote a `NOW.md`
+whose numbers matched `report.py --stats` by hand. Each skill also passes
+this repo's own `skill-center/audit.py`.
 
 No telemetry, no network calls, no accounts. The optional "confirm back"
 at the end of install is you choosing to open a GitHub issue saying it

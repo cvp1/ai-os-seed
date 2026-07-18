@@ -22,7 +22,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # What an install consists of — directories and files copied verbatim.
-COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills"]
+COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "views"]
 ROOT_FILES = ["PRINCIPLES.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
 
 DEMO_MANIFEST_ENTRY = """\
