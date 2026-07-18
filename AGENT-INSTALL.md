@@ -32,11 +32,12 @@ Check, and report each result plainly:
   - **Never install twice on one machine.** The scheduler owns a single
     managed crontab block / launchd label set per machine; two installs
     silently fight over it. Don't offer side-by-side as an option.
-  If `--detect` flags a directory that exists but *isn't* a seed layout
-  (for example `~/ai-os` from AI-OS Core, a different product in this
-  family), leave it completely alone — it can coexist with the seed; just
-  pick an install root that can't be confused with it, and never write
-  into it.
+  If `--detect` flags a directory that exists but *isn't* a seed layout,
+  ask the user what it is rather than assuming. If it's **their agent's
+  existing workspace** (say, one AI-OS Core built), the preferred move is
+  for the seed to move IN, not to open a second directory — see Phase 1.
+  If it's anything else (a repo checkout, someone else's files), leave it
+  completely alone and never write into it.
 - OS is Linux or macOS (`uname`) — anything else: stop, unsupported.
 - `git` is installed.
 - `python3` is 3.9+ (`python3 --version`).
@@ -60,27 +61,38 @@ Check, and report each result plainly:
 
 Ask, one at a time:
 
-1. **Where should the system live?** Default suggestion: `~/ai-os-seed` —
-   any absolute path is fine, but avoid names that collide with other
-   AI-OS family products already on the machine (an `~/ai-os` dir from
-   AI-OS Core is NOT this system; one keystroke of difference has
-   confused real installs). Also keep it distinct from the clone
-   directory you're reading this file in — the clone is the source, the
-   install root is the live system. Call it `<ROOT>` below.
+1. **Where should the system live?** First ask: **do you already have a
+   workspace your agent works in** (for example one AI-OS Core set up)?
+   - **Yes → the seed moves in.** One workspace, one memory, one agent —
+     don't multiply directories. Their existing workspace is `<ROOT>`,
+     and Phase 2 uses `--into`. (This matters mechanically, not just
+     aesthetically: agent memory is keyed to the working directory, so a
+     second root is literally a second brain that can't see the first.)
+   - **No → a fresh directory.** Default suggestion: `~/ai-os-seed`; any
+     absolute path is fine. Keep it distinct from the clone directory
+     you're reading this file in — the clone is the source, the install
+     root is the live system. Call it `<ROOT>` below.
 2. **What's the first real thing you'd want to watch or automate?** (You
    won't build it now — knowing it lets you tailor the wrap-up advice.)
 3. **Name to use in their CLAUDE.md** (optional; skip if they prefer).
 
 ## Phase 2 — Install (deterministic)
 
-Show, then run:
+Show, then run — fresh directory:
 
     python3 install.py --target <ROOT>
 
-This copies the substrate (`_lib/`, `keyvault/`, `scheduler/`,
-`observability/`, `demo/`, `skills/`, `PRINCIPLES.md`, the two
-`.template` reference files) into `<ROOT>` and refuses to overwrite a
-non-empty existing target. On failure: show the error, stop.
+…or, joining an existing workspace (Phase 1 said yes):
+
+    python3 install.py --target <ROOT> --into
+
+Either way this copies the substrate (`_lib/`, `keyvault/`, `scheduler/`,
+`observability/`, `demo/`, `skills/`, `memory/`, `views/`,
+`PRINCIPLES.md`, the two `.template` reference files) into `<ROOT>`.
+Without `--into` it refuses a non-empty target; with `--into` it refuses
+if ANY name it would write already exists there — the user's own content
+is never merged with or written over, and one collision stops the whole
+install before any byte moves. On failure: show the error, stop.
 
 ## Phase 3 — Verify (deterministic)
 
@@ -103,6 +115,10 @@ Keep it short — it will grow with their system. Mark it clearly as
 generated-at-install so they know it's theirs to rewrite. Do NOT copy
 `CLAUDE.md.template` — it's a leak-scrubbed export kept only as a
 structural reference.
+
+**If this was an `--into` install, `<ROOT>/CLAUDE.md` already exists and
+is theirs.** Don't replace it — propose a short addition (what the seed
+added, where the ops verbs live) and let the user approve the edit.
 
 ## Phase 5 — Memory (the first note, demonstrated not described)
 
@@ -145,8 +161,10 @@ that's the whole spine live: **scheduler → job → runs.db → freshness.**
 Tell the user, concretely:
 
 - The undo path: `python3 install.py --target <ROOT> --uninstall` (removes
-  the scheduled jobs it manages, then the tree — shown before run, like
-  everything else).
+  the scheduled jobs it manages, then the seed's own files ONLY — anything
+  the user or their agent created, including memory notes and, in an
+  `--into` install, their whole pre-existing workspace, stays untouched;
+  shown before run, like everything else).
 - Their next move: replace the demo with the real thing from Phase 1's
   answer — write the script, wrap it through `log_run.py` in a manifest
   entry, add a cadence line to `observability/freshness.json`, re-run

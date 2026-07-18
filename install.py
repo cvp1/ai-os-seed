@@ -110,7 +110,7 @@ def detect():
     return 0
 
 
-def install(target: Path):
+def install(target: Path, into: bool = False):
     if target.exists() and any(target.iterdir()):
         if looks_like_clone(target):
             return die(f"target {target} is the seed REPO CLONE, not an install "
@@ -120,8 +120,24 @@ def install(target: Path):
             return die(f"target {target} is already an AI-OS Seed install. To keep "
                        f"it, stop here (nothing to do). To replace it, run "
                        f"--uninstall on it first, then install fresh.")
-        return die(f"target {target} exists and is not empty — refusing to "
-                   f"overwrite. Pick an empty/new directory.")
+        if not into:
+            return die(f"target {target} exists and is not empty. If it's YOUR "
+                       f"agent's existing workspace and you want the seed to move "
+                       f"in alongside your content, re-run with --into. Otherwise "
+                       f"pick an empty/new directory.")
+        # Compose mode: the seed joins an existing workspace. Same covenant,
+        # applied per-name instead of per-tree — every component and root file
+        # the seed would write must be ABSENT; everything else in the
+        # workspace is the user's and is never touched. No partial merges: one
+        # collision refuses the whole install, loudly, before any byte moves.
+        collisions = [c for c in COMPONENTS + ROOT_FILES if (target / c).exists()]
+        if collisions:
+            return die(f"--into {target}: these names already exist there: "
+                       f"{', '.join(collisions)}. Refusing to merge or overwrite "
+                       f"— rename what's yours or pick a fresh directory.")
+    elif into:
+        return die(f"--into expects an existing, non-empty workspace at {target} "
+                   f"— for a fresh directory just use --target without --into.")
     missing = [c for c in COMPONENTS + ROOT_FILES if not (HERE / c).exists()]
     if missing:
         return die(f"this clone is incomplete (missing: {', '.join(missing)}) — "
@@ -131,7 +147,8 @@ def install(target: Path):
         shutil.copytree(HERE / comp, target / comp)
     for f in ROOT_FILES:
         shutil.copy2(HERE / f, target / f)
-    print(f"installed {len(COMPONENTS)} components + {len(ROOT_FILES)} files -> {target}")
+    mode = "composed into your existing workspace at" if into else "->"
+    print(f"installed {len(COMPONENTS)} components + {len(ROOT_FILES)} files {mode} {target}")
     print("next: run the Phase 3 verify commands from AGENT-INSTALL.md")
     return 0
 
@@ -165,24 +182,51 @@ def uninstall(target: Path):
         return die(f"{target} doesn't look like an AI-OS Seed install — refusing "
                    f"to delete it. Remove it yourself if you're sure.")
     # De-schedule first: empty the manifest, let sync reconcile (removes the
-    # managed crontab block / launchd plists), then remove the tree.
+    # managed crontab block / launchd plists), then remove the seed's files.
     manifest.write_text("jobs: []\n")
     r = subprocess.run([sys.executable, str(sync)], capture_output=True, text=True)
     if r.returncode != 0:
         print(f"warning: scheduler cleanup reported: {r.stderr.strip() or r.stdout.strip()}",
               file=sys.stderr)
-        print("continuing with tree removal; check `crontab -l` / launchctl yourself.",
+        print("continuing with file removal; check `crontab -l` / launchctl yourself.",
               file=sys.stderr)
     else:
         print("scheduled jobs removed.")
-    shutil.rmtree(target)
-    print(f"removed {target}. That's the whole footprint — nothing else was installed.")
+    # Remove ONLY the seed's own names, never the tree wholesale — a --into
+    # install shares its root with the user's workspace, and even a dedicated
+    # root may have grown user content (NOW.md, memory notes, their CLAUDE.md).
+    SHIPPED_MEMORY = {"MEMORY.md", "CONVENTIONS.md", "THE-LOOP.md"}
+    for name in COMPONENTS + ROOT_FILES:
+        p = target / name
+        if name == "memory" and p.is_dir():
+            # User-authored notes are irreplaceable — if any exist beyond the
+            # shipped scaffold, keep the whole directory and say so.
+            extra = {f.name for f in p.iterdir()} - SHIPPED_MEMORY
+            if extra:
+                print(f"kept {p} — it holds {len(extra)} note(s) you (or your "
+                      f"agent) wrote; delete it yourself if you're sure.")
+                continue
+        if p.is_dir():
+            shutil.rmtree(p)
+        elif p.exists():
+            p.unlink()
+    leftover = sorted(p.name for p in target.iterdir())
+    if leftover:
+        print(f"removed the seed's components from {target}.")
+        print(f"left untouched (yours, not the seed's): {', '.join(leftover[:10])}"
+              + (" …" if len(leftover) > 10 else ""))
+    else:
+        target.rmdir()
+        print(f"removed {target}. That's the whole footprint — nothing else was installed.")
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", help="install root (absolute path)")
+    ap.add_argument("--into", action="store_true",
+                    help="compose into an EXISTING workspace at --target (per-name "
+                         "collision check; your content is never touched)")
     ap.add_argument("--detect", action="store_true",
                     help="read-only: report prior seed installs/clones on this machine")
     ap.add_argument("--enable-demo", action="store_true",
@@ -203,12 +247,14 @@ def main():
         return die(f"--target must be an absolute path, got {args.target!r}")
     if args.enable_demo and args.uninstall:
         return die("--enable-demo and --uninstall are mutually exclusive")
+    if args.into and (args.enable_demo or args.uninstall):
+        return die("--into only applies to the initial install")
 
     if args.uninstall:
         return uninstall(target)
     if args.enable_demo:
         return enable_demo(target)
-    return install(target)
+    return install(target, into=args.into)
 
 
 if __name__ == "__main__":

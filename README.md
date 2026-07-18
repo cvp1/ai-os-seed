@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.1-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.2-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -99,11 +99,20 @@ venv, or `--break-system-packages`).
 Reinstalls used to stumble: a second install on a machine with an earlier
 one (or with AI-OS Core, this family's non-terminal edition) found the old
 clone and install directories and got confused — caught on a real Mac,
-v0.2.1-alpha. Now `install.py --detect` surveys prior footprints read-only,
-AGENT-INSTALL.md's Phase 0 runs it first and asks you what to do (keep or
-replace — never two installs on one machine, since the scheduler owns a
-single managed crontab block / launchd label set), and the default install
-root is `~/ai-os-seed`, unambiguous next to Core's `~/ai-os`.
+v0.2.1-alpha. Now `install.py --detect` surveys prior footprints read-only
+and AGENT-INSTALL.md's Phase 0 runs it first and asks you what to do (keep
+or replace — never two installs on one machine, since the scheduler owns a
+single managed crontab block / launchd label set).
+
+And if your agent already has a workspace, the seed doesn't open a second
+directory at all — v0.2.2-alpha's `install.py --target <workspace> --into`
+moves the substrate INTO it: one root, one memory, one agent. It refuses
+if any name it would write already exists there (your content is never
+merged or overwritten), and `--uninstall` is surgical everywhere — it
+removes only the seed's own files, keeps any memory notes you've written,
+and in a composed workspace leaves everything of yours exactly where it
+was. A fresh directory (default `~/ai-os-seed`) is only for machines with
+no workspace yet.
 
 `CLAUDE.md.template` / `README.md.template` are structural references
 only — your agent drafts your actual `CLAUDE.md` fresh at install

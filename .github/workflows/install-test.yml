@@ -62,6 +62,27 @@ jobs:
           test -f "$ROOT/memory/MEMORY.md"
           test -f "$ROOT/memory/CONVENTIONS.md"
 
+      - name: compose into an existing workspace (--into), user content untouched
+        run: |
+          WS="${{ runner.temp }}/existing-workspace"
+          mkdir -p "$WS/my-project"
+          echo "user content" > "$WS/CLAUDE.md.mine"
+          echo "user note" > "$WS/my-project/notes.txt"
+          # --into refuses an EMPTY dir (that's what plain --target is for)
+          mkdir "${{ runner.temp }}/empty-dir"
+          if python3 install.py --target "${{ runner.temp }}/empty-dir" --into; then
+            echo "--into should refuse an empty target"; exit 1; fi
+          python3 install.py --target "$WS" --into
+          python3 "$WS/_lib/selftest.py"
+          test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          # collision refusal: a second --into must refuse, not merge
+          if python3 install.py --target "$WS" --into; then
+            echo "second --into should refuse on collisions"; exit 1; fi
+          # surgical uninstall: seed components go, user content stays
+          python3 install.py --target "$WS" --uninstall
+          test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          if [ -d "$WS/_lib" ]; then echo "uninstall left seed components"; exit 1; fi
+
       - name: enable + install the demo job for real (Phase 6)
         run: |
           ROOT="${{ runner.temp }}/aios-target"
