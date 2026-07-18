@@ -65,22 +65,31 @@ jobs:
       - name: compose into an existing workspace (--into), user content untouched
         run: |
           WS="${{ runner.temp }}/existing-workspace"
-          mkdir -p "$WS/my-project"
+          # model an AI-OS-Core-shaped workspace: user files AND a live memory/
+          mkdir -p "$WS/my-project" "$WS/memory"
           echo "user content" > "$WS/CLAUDE.md.mine"
           echo "user note" > "$WS/my-project/notes.txt"
+          echo "# the user's live memory index" > "$WS/memory/MEMORY.md"
+          echo "a real note" > "$WS/memory/my-note.md"
           # --into refuses an EMPTY dir (that's what plain --target is for)
           mkdir "${{ runner.temp }}/empty-dir"
           if python3 install.py --target "${{ runner.temp }}/empty-dir" --into; then
             echo "--into should refuse an empty target"; exit 1; fi
+          # existing memory/ must SATISFY, not collide (the AI-OS Core case)
           python3 install.py --target "$WS" --into
           python3 "$WS/_lib/selftest.py"
           test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
+          if [ -f "$WS/memory/CONVENTIONS.md" ]; then
+            echo "seed scaffold was written into the user's memory/"; exit 1; fi
           # collision refusal: a second --into must refuse, not merge
           if python3 install.py --target "$WS" --into; then
-            echo "second --into should refuse on collisions"; exit 1; fi
-          # surgical uninstall: seed components go, user content stays
+            echo "second --into should refuse"; exit 1; fi
+          # surgical uninstall: seed components go, user content AND memory stay
           python3 install.py --target "$WS" --uninstall
           test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
+          test -f "$WS/memory/my-note.md"
           if [ -d "$WS/_lib" ]; then echo "uninstall left seed components"; exit 1; fi
 
       - name: enable + install the demo job for real (Phase 6)

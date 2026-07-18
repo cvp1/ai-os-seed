@@ -90,9 +90,14 @@ Either way this copies the substrate (`_lib/`, `keyvault/`, `scheduler/`,
 `observability/`, `demo/`, `skills/`, `memory/`, `views/`,
 `PRINCIPLES.md`, the two `.template` reference files) into `<ROOT>`.
 Without `--into` it refuses a non-empty target; with `--into` it refuses
-if ANY name it would write already exists there — the user's own content
-is never merged with or written over, and one collision stops the whole
-install before any byte moves. On failure: show the error, stop.
+if a name it would write already exists there — the user's own content is
+never merged with or written over, and one collision stops the whole
+install before any byte moves. The one deliberate exception: an existing
+`memory/` doesn't collide, it *satisfies* — a workspace that already has
+a live memory (every AI-OS Core does) already practices the discipline
+the seed's empty scaffold exists to start, so the scaffold simply isn't
+written and their memory stays exactly as it is. On failure: show the
+error, stop.
 
 ## Phase 3 — Verify (deterministic)
 
@@ -124,7 +129,11 @@ added, where the ops verbs live) and let the user approve the edit.
 
 `<ROOT>/memory/` shipped in Phase 2 with an empty `MEMORY.md` index and a
 `CONVENTIONS.md` explaining the note format (four types, one fact per
-file, frontmatter schema — read it if you haven't). Two things now:
+file, frontmatter schema — read it if you haven't). **If Phase 2 skipped
+`memory/` because the workspace already had one:** the user's existing
+memory conventions govern, not the seed's — read *their* index, follow
+*their* format for the note below, and change nothing about how their
+memory works. Two things now:
 
 1. Tell the user plainly: this only works if *your* memory (the agent
    running this install) is actually configured to read from
@@ -162,9 +171,11 @@ Tell the user, concretely:
 
 - The undo path: `python3 install.py --target <ROOT> --uninstall` (removes
   the scheduled jobs it manages, then the seed's own files ONLY — anything
-  the user or their agent created, including memory notes and, in an
-  `--into` install, their whole pre-existing workspace, stays untouched;
-  shown before run, like everything else).
+  the user or their agent created stays untouched. `memory/` in particular
+  is only removed if it's still byte-identical to the shipped scaffold;
+  one note or edit makes it theirs and it's kept. In an `--into` install
+  the pre-existing workspace survives minus exactly what the seed added.
+  Shown before run, like everything else).
 - Their next move: replace the demo with the real thing from Phase 1's
   answer — write the script, wrap it through `log_run.py` in a manifest
   entry, add a cadence line to `observability/freshness.json`, re-run

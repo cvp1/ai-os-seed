@@ -15,6 +15,7 @@ scheduler to drop its managed jobs before deleting anything, and refuses a
 target that doesn't look like one of ours (degrade toward safety).
 """
 import argparse
+import filecmp
 import re
 import shutil
 import subprocess
@@ -26,6 +27,9 @@ HERE = Path(__file__).resolve().parent
 # What an install consists of — directories and files copied verbatim.
 COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "views"]
 ROOT_FILES = ["PRINCIPLES.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
+# Components whose EXISTING presence in an --into workspace satisfies the
+# requirement instead of colliding (see the compose-mode comment in install()).
+SATISFIED_BY_EXISTING = {"memory"}
 
 DEMO_MANIFEST_ENTRY = """\
 jobs:
@@ -111,6 +115,7 @@ def detect():
 
 
 def install(target: Path, into: bool = False):
+    skipped = []
     if target.exists() and any(target.iterdir()):
         if looks_like_clone(target):
             return die(f"target {target} is the seed REPO CLONE, not an install "
@@ -130,11 +135,26 @@ def install(target: Path, into: bool = False):
         # the seed would write must be ABSENT; everything else in the
         # workspace is the user's and is never touched. No partial merges: one
         # collision refuses the whole install, loudly, before any byte moves.
-        collisions = [c for c in COMPONENTS + ROOT_FILES if (target / c).exists()]
+        #
+        # One exception, learned on a real machine: memory/. The seed's
+        # memory component is an EMPTY scaffold for a discipline; a workspace
+        # that already has memory/ (every AI-OS Core does — it's the user's
+        # live, cwd-keyed brain) already practices it. Existing memory
+        # SATISFIES the requirement, so it's skipped whole — nothing is
+        # written into it, not even the conventions doc. Functional
+        # components get no such pass: a colliding scheduler/ or _lib/ holds
+        # the user's bytes, not the seed's, and skipping one would produce an
+        # install that only thinks it's complete.
+        skipped = [c for c in SATISFIED_BY_EXISTING if (target / c).is_dir()]
+        collisions = [c for c in COMPONENTS + ROOT_FILES
+                      if (target / c).exists() and c not in skipped]
         if collisions:
             return die(f"--into {target}: these names already exist there: "
                        f"{', '.join(collisions)}. Refusing to merge or overwrite "
                        f"— rename what's yours or pick a fresh directory.")
+        for c in skipped:
+            print(f"{c}/ already exists — yours satisfies the requirement; "
+                  f"the seed's empty scaffold is not written.")
     elif into:
         return die(f"--into expects an existing, non-empty workspace at {target} "
                    f"— for a fresh directory just use --target without --into.")
@@ -143,12 +163,13 @@ def install(target: Path, into: bool = False):
         return die(f"this clone is incomplete (missing: {', '.join(missing)}) — "
                    f"re-clone rather than installing from a partial tree.")
     target.mkdir(parents=True, exist_ok=True)
-    for comp in COMPONENTS:
+    written = [c for c in COMPONENTS if c not in skipped]
+    for comp in written:
         shutil.copytree(HERE / comp, target / comp)
     for f in ROOT_FILES:
         shutil.copy2(HERE / f, target / f)
     mode = "composed into your existing workspace at" if into else "->"
-    print(f"installed {len(COMPONENTS)} components + {len(ROOT_FILES)} files {mode} {target}")
+    print(f"installed {len(written)} components + {len(ROOT_FILES)} files {mode} {target}")
     print("next: run the Phase 3 verify commands from AGENT-INSTALL.md")
     return 0
 
@@ -175,6 +196,20 @@ def enable_demo(target: Path):
     return 0
 
 
+def _memory_is_pristine(p: Path) -> bool:
+    """True only if memory/ is byte-identical to the shipped scaffold — same
+    file names, same contents, no subdirectories. Anything else means the
+    user (or their agent) has made it theirs."""
+    shipped = HERE / "memory"
+    if not shipped.is_dir():
+        return False  # can't prove pristine -> keep (degrade toward safety)
+    ours = sorted(f.name for f in shipped.iterdir() if f.is_file())
+    theirs = sorted(f.name for f in p.iterdir())
+    if ours != theirs:
+        return False
+    return all(filecmp.cmp(shipped / n, p / n, shallow=False) for n in ours)
+
+
 def uninstall(target: Path):
     sync = target / "scheduler" / "sync.py"
     manifest = target / "scheduler" / "manifest.yml"
@@ -195,17 +230,18 @@ def uninstall(target: Path):
     # Remove ONLY the seed's own names, never the tree wholesale — a --into
     # install shares its root with the user's workspace, and even a dedicated
     # root may have grown user content (NOW.md, memory notes, their CLAUDE.md).
-    SHIPPED_MEMORY = {"MEMORY.md", "CONVENTIONS.md", "THE-LOOP.md"}
     for name in COMPONENTS + ROOT_FILES:
         p = target / name
-        if name == "memory" and p.is_dir():
-            # User-authored notes are irreplaceable — if any exist beyond the
-            # shipped scaffold, keep the whole directory and say so.
-            extra = {f.name for f in p.iterdir()} - SHIPPED_MEMORY
-            if extra:
-                print(f"kept {p} — it holds {len(extra)} note(s) you (or your "
-                      f"agent) wrote; delete it yourself if you're sure.")
-                continue
+        if name == "memory" and p.is_dir() and not _memory_is_pristine(p):
+            # memory/ is the user's brain and notes are irreplaceable: it is
+            # only deleted when byte-identical to the shipped scaffold (a
+            # provably untouched install). Any note, edit, or a pre-existing
+            # workspace memory (a composed install never wrote here at all)
+            # makes it theirs — kept, unconditionally. Cheap to delete by
+            # hand; impossible to undo.
+            print(f"kept {p} — it differs from the shipped scaffold, so it's "
+                  f"yours, not the seed's; delete it yourself if you're sure.")
+            continue
         if p.is_dir():
             shutil.rmtree(p)
         elif p.exists():

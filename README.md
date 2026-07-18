@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.2-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.3-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -105,14 +105,19 @@ or replace — never two installs on one machine, since the scheduler owns a
 single managed crontab block / launchd label set).
 
 And if your agent already has a workspace, the seed doesn't open a second
-directory at all — v0.2.2-alpha's `install.py --target <workspace> --into`
-moves the substrate INTO it: one root, one memory, one agent. It refuses
-if any name it would write already exists there (your content is never
-merged or overwritten), and `--uninstall` is surgical everywhere — it
-removes only the seed's own files, keeps any memory notes you've written,
-and in a composed workspace leaves everything of yours exactly where it
-was. A fresh directory (default `~/ai-os-seed`) is only for machines with
-no workspace yet.
+directory at all — `install.py --target <workspace> --into` moves the
+substrate INTO it: one root, one memory, one agent. It refuses if a name
+it would write already exists there (your content is never merged or
+overwritten) — with one deliberate exception, caught composing into a
+real AI-OS Core workspace at v0.2.3-alpha: an existing `memory/` counts
+as *satisfied*, not colliding. Your live memory already is the thing the
+seed's empty scaffold exists to start, so the scaffold simply isn't
+written. `--uninstall` is surgical everywhere — it removes only the
+seed's own files, deletes `memory/` only if it's still byte-identical to
+the shipped scaffold (one note makes it yours), and in a composed
+workspace leaves everything of yours exactly where it was. A fresh
+directory (default `~/ai-os-seed`) is only for machines with no
+workspace yet.
 
 `CLAUDE.md.template` / `README.md.template` are structural references
 only — your agent drafts your actual `CLAUDE.md` fresh at install
