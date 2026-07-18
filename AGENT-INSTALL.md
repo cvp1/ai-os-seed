@@ -23,9 +23,17 @@ Check, and report each result plainly:
 - `git` is installed.
 - `python3` is 3.9+ (`python3 --version`).
 - PyYAML is importable (`python3 -c "import yaml"`) — needed by the
-  scheduler. If missing, tell the user how to get it on their OS
-  (`apt install python3-yaml`, `brew`-python `pip3 install pyyaml`, etc.)
-  and stop until it's resolved.
+  scheduler. If missing:
+  - Linux (Debian/Ubuntu): `sudo apt install python3-yaml`.
+  - macOS with Homebrew Python: a bare `pip3 install pyyaml` will likely
+    refuse with `externally-managed-environment` (PEP 668, live-verified
+    in this project's own CI). The clean fix is a venv: `python3 -m venv
+    ~/.venvs/aios-seed && ~/.venvs/aios-seed/bin/pip install pyyaml`, then
+    use `~/.venvs/aios-seed/bin/python3` for every command in this guide
+    instead of bare `python3`. `pip3 install --break-system-packages
+    pyyaml` also works but modifies the system Python — only suggest it if
+    the user prefers that over a venv.
+  Stop until this is resolved either way.
 - Ask the user: **does this machine stay on?** A laptop that sleeps means
   scheduled jobs silently don't run — warn plainly and let them proceed
   informed, or pick a different machine.

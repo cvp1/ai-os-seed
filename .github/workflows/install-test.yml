@@ -21,7 +21,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: dependencies an operator would install per the README
-        run: python3 -m pip install --user pyyaml
+        # Homebrew Python on modern macOS refuses a bare `pip install`
+        # (PEP 668, externally-managed-environment) — caught live by this
+        # CI job; --break-system-packages is appropriate on an ephemeral
+        # runner. AGENT-INSTALL.md's readiness guidance carries the real
+        # fix (a venv) for an operator's own machine.
+        run: python3 -m pip install --break-system-packages pyyaml || python3 -m pip install --user pyyaml
 
       - name: readiness (Phase 0)
         run: |
