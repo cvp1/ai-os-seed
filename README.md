@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.3-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.4-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -59,19 +59,29 @@ every step is a plain command — follow it by hand.
 
 ## The honest ledger (alpha)
 
-Live-verified, in an isolated sandbox, on Linux:
-- demo job → `log_run.py` → runs.db row → `report.py` shows it
-- `freshness.py` reports OK, and correctly flags STALE when a job goes silent
-- crontab reconciliation: install, idempotent re-run, content-drift and
-  orphan detection, preservation of your pre-existing crontab entries
+**CI runs the full install on every push** — [![install
+test](https://github.com/cvp1/ai-os-seed/actions/workflows/install-test.yml/badge.svg)](https://github.com/cvp1/ai-os-seed/actions/workflows/install-test.yml)
+— on real `ubuntu-latest` and `macos-latest` runners: install, selftest,
+the demo job through `log_run.py`, `freshness.py` reporting OK, a REAL
+crontab (Linux) / launchd (macOS) install with drift-check, then
+`--uninstall` removing the whole footprint. If that badge is green, the
+install worked on both OSes as of the last push — not "should work,"
+observed.
 
-Built and reviewed but **not yet run against real infrastructure**:
-- macOS: launchd plist generation is unit-tested; never run on a real Mac
-- the scheduler's `sync.py` needs PyYAML (`python3 -c "import yaml"` to
-  check; readiness will tell you)
-- `CLAUDE.md.template` / `README.md.template` are leak-scrubbed exports,
-  not finished prose — your agent drafts your actual CLAUDE.md fresh at
-  install instead
+What CI doesn't cover: your specific machine's quirks. Live-verified in
+an isolated sandbox beyond CI:
+- STALE detection (backdating a run and confirming `freshness.py` flags it)
+- crontab content-drift and orphan-job detection, and that your
+  pre-existing crontab entries survive untouched
+
+Known rough edge: Homebrew Python on modern macOS refuses a bare `pip
+install pyyaml` (PEP 668) — caught live by this project's own CI.
+AGENT-INSTALL.md's readiness phase has the fix (a venv, or
+`--break-system-packages`).
+
+`CLAUDE.md.template` / `README.md.template` are structural references
+only — your agent drafts your actual `CLAUDE.md` fresh at install
+instead of copying them.
 
 No telemetry, no network calls, no accounts. The optional "confirm back"
 at the end of install is you choosing to open a GitHub issue saying it
