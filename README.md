@@ -4,9 +4,11 @@ A self-installing seed of a working personal AI operating system — the
 substrate layer that turns "a machine with Claude Code on it" into an
 operated system: a secrets vault, a manifest-driven scheduler, run
 observability with a liveness backstop, memory discipline, and skills
-conventions. Extracted live from a system that has run a high-desert
-Arizona ranch — solar, water, cameras, a small machine fleet, and the
-operator's working life — for years, by a leak-audited build pipeline.
+conventions. Extracted live, by a leak-audited build pipeline, from
+a system that runs a high-desert Arizona ranch — solar, water, cameras, a
+small machine fleet, and the operator's working life. The system is young
+and says so: built in the open since late May 2026, it grew to ~80 small
+projects running ~17,000 scheduled jobs a week on exactly this substrate.
 This repo *is* that pipeline's output; nothing here is hand-maintained
 prose about a system, it's the system's own OS layer, genericized.
 
