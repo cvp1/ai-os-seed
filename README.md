@@ -30,7 +30,7 @@ you — start with [AI-OS Core](https://craigvandeputte.com) instead.)
 Open Claude Code on the machine that will run the system and paste:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.4-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.1.5-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -59,14 +59,21 @@ every step is a plain command — follow it by hand.
 
 ## The honest ledger (alpha)
 
-**CI runs the full install on every push** — [![install
+**Verified on real hardware, both OSes.** I've installed this myself on a
+real Mac — launchd job live, freshness green, the full spine confirmed —
+in addition to my own daily-driver Linux box. **CI also runs the full
+install on every push** — [![install
 test](https://github.com/cvp1/ai-os-seed/actions/workflows/install-test.yml/badge.svg)](https://github.com/cvp1/ai-os-seed/actions/workflows/install-test.yml)
-— on real `ubuntu-latest` and `macos-latest` runners: install, selftest,
-the demo job through `log_run.py`, `freshness.py` reporting OK, a REAL
-crontab (Linux) / launchd (macOS) install with drift-check, then
-`--uninstall` removing the whole footprint. If that badge is green, the
-install worked on both OSes as of the last push — not "should work,"
-observed.
+— on `ubuntu-latest` and `macos-latest`: install, selftest, the demo job
+through `log_run.py`, `freshness.py` reporting OK, a REAL crontab (Linux)
+/ launchd (macOS) install with drift-check, then `--uninstall` removing
+the whole footprint. If that badge is green, the install worked on both
+OSes as of the last push — not "should work," observed.
+
+The first real-hardware install caught and reported a genuine bug
+([#1](https://github.com/cvp1/ai-os-seed/issues/1), fixed same day) — that's
+the whole point of shipping this as an alpha instead of waiting for
+imagined completeness.
 
 What CI doesn't cover: your specific machine's quirks. Live-verified in
 an isolated sandbox beyond CI:
@@ -75,9 +82,9 @@ an isolated sandbox beyond CI:
   pre-existing crontab entries survive untouched
 
 Known rough edge: Homebrew Python on modern macOS refuses a bare `pip
-install pyyaml` (PEP 668) — caught live by this project's own CI.
-AGENT-INSTALL.md's readiness phase has the fix (a venv, or
-`--break-system-packages`).
+install pyyaml` (PEP 668) — caught live on real hardware and by this
+project's own CI. AGENT-INSTALL.md's readiness phase has the fix (a
+venv, or `--break-system-packages`).
 
 `CLAUDE.md.template` / `README.md.template` are structural references
 only — your agent drafts your actual `CLAUDE.md` fresh at install
