@@ -94,7 +94,7 @@ Show, then run — fresh directory:
     python3 install.py --target <ROOT> --into
 
 Either way this copies the substrate (`_lib/`, `keyvault/`, `scheduler/`,
-`observability/`, `demo/`, `skills/`, `memory/`, `views/`,
+`observability/`, `demo/`, `skills/`, `memory/`, `memory-mesh/`, `views/`,
 `PRINCIPLES.md`, the two `.template` reference files) into `<ROOT>`.
 Without `--into` it refuses a non-empty target; with `--into` it refuses
 if a name it would write already exists there — the user's own content is
@@ -154,6 +154,95 @@ memory works. Two things now:
    `<ROOT>`, and what Phase 2 installed — nothing about the user beyond
    what they told you in Phase 1's optional name. Add its index bullet to
    `MEMORY.md` in the same step.
+3. Bootstrap the memory mesh — the event-sourced layer underneath the
+   notes (append-only history, contradiction detection, replay; spec in
+   `<ROOT>/memory-mesh/SPEC.md`). Show, then run:
+
+       bash <ROOT>/memory-mesh/install.sh
+
+   This starts a local event log (plain git, this machine only), schedules
+   a 5-minute fold, backfills the index bullet from step 2 as the first
+   event, and flips `MEMORY.md` to fold-generated (the pre-flip index is
+   kept at `MEMORY.md.pre-mesh`). Verify: `MEMORY.md` now opens with a
+   GENERATED header and carries the step-2 note. From here, new durable
+   lessons are emitted (`/improve` does this), never hand-indexed. More
+   machines later: `<ROOT>/memory-mesh/ENROLL.md`.
+
+## Phase 5.5 — Governance (optional, opt-in)
+
+Ask the user: **should this install be governed by a permission policy?**
+Recommended for any shared, organizational, or client-facing use; optional
+for a personal solo install. If **no**: say plainly "governance: none — the
+personal/solo path" and skip straight to Phase 6. Nothing about the install
+changes; `<ROOT>/governance/` is never created.
+
+If **yes**:
+
+1. **Enable the component.** Show, then run:
+
+       python3 install.py --target <ROOT> --enable-governance
+
+   Copies `governance/` into `<ROOT>` (opt-in only — never part of the
+   default install, see `install.py`'s `OPTIONAL_COMPONENTS`).
+
+2. **Choose the policy.** Default: the shipped reference at
+   `<ROOT>/governance/policy.yml` (enterprise-neutral, matches vault "AI
+   Agent Permission Matrix" v0.2). If the user has a workshop-produced org
+   policy, copy it over the reference file (deterministic copy, don't
+   retype it).
+
+3. **Validate.** Show, then run:
+
+       python3 <ROOT>/governance/tools/validate_policy.py <ROOT>/governance/policy.yml
+
+   A refused policy STOPS here — show the exact error, fix the policy (or
+   pick a different one), re-run. Do not proceed on a policy that fails
+   validation for any reason, including a custom policy's overlay
+   attempting to loosen a base cell.
+
+4. **Compile.** Show, then run:
+
+       python3 <ROOT>/governance/tools/compile_profile.py <ROOT>/governance/policy.yml --out <ROOT>/governance/out
+
+   Read `<ROOT>/governance/out/COMPILE-REPORT.md` yourself and summarize
+   for the user: how many cells bound at the harness layer, and — by
+   name — any prohibition reporting `UNENFORCED`, with its compensating
+   control. Never silently treat an `UNENFORCED` line as "handled."
+
+5. **Consent, shown as a diff.** This is the gated step — wiring a hook is
+   never silent (see PRINCIPLES.md's self-modification gate). Show the
+   user the EXACT change about to be made to `<ROOT>/.claude/settings.json`:
+   the `permissions` block from `governance/out/settings-fragment.json`,
+   and a new `hooks.PreToolUse` entry running `governance/hooks/
+   profile_gate.py` with the classification/staged/audit paths embedded
+   directly in the command (inline env-var prefix, not relying on shell
+   inheritance — durable across future sessions):
+
+       SEED_GOVERNANCE_CLASSIFICATION=<ROOT>/governance/out/classification.json SEED_GOVERNANCE_STAGED_DIR=<ROOT>/.seed/staged SEED_GOVERNANCE_AUDIT_DIR=<ROOT>/.seed/audit python3 <ROOT>/governance/hooks/profile_gate.py
+
+   If `<ROOT>/.claude/settings.json` already exists, show a proper
+   before/after diff and merge (don't clobber unrelated keys — permissions
+   arrays union, hooks.PreToolUse appends). If it doesn't exist, show the
+   full file you're about to create. **Only write after the user says
+   yes.** This is the one step in this phase that is genuinely
+   irreversible-by-accident (a wired hook governs every future tool call)
+   — do not skip showing the diff even if earlier steps went smoothly.
+
+6. **Prove it — conformance.** Show, then run:
+
+       python3 <ROOT>/governance/conformance/run_conformance.py --policy <ROOT>/governance/policy.yml --classify <ROOT>/governance/classify_defaults.yml --hook <ROOT>/governance/hooks/profile_gate.py --results <ROOT>/governance/conformance/RESULTS.md
+
+   **A conformance FAIL stops the install here — do not proceed to Phase
+   6.** Show the FAIL lines exactly as printed, and do not offer to
+   "continue anyway." This is the wave's halt-before-capability rule:
+   governance and capability arrive together, or not at all. If every
+   probe is PASS or an honestly-reported UNENFORCED, continue.
+
+7. **Confirm.** Tell the user plainly: governance is ON, name the policy
+   in use, name any UNENFORCED prohibition and its compensating control
+   again (repetition here is deliberate — this is the thing most likely
+   to be forgotten later), and point at `governance/tools/audit_report.py`
+   for the monthly one-pager once real usage accumulates.
 
 ## Phase 6 — First win (scheduling for real)
 
@@ -186,11 +275,18 @@ Tell the user, concretely:
   — and note that on an `--into` install that file was deliberately not
   written into their memory, so read it from the clone
   (`<clone>/memory/THE-LOOP.md`) or copy it wherever they keep docs.
+- **If Phase 5.5 was run:** recap governance status again here — on, which
+  policy, any UNENFORCED prohibition and its compensating control. If it
+  was skipped, say "governance: none" plainly so the user knows it's an
+  available, not-yet-taken option (`install.py --target <ROOT>
+  --enable-governance`, then Phase 5.5's steps, any time later).
 - The undo path: `python3 install.py --target <ROOT> --uninstall` (removes
   the scheduled jobs it manages, then the seed's own files ONLY — anything
   the user or their agent created stays untouched. `memory/` in particular
   is only removed if it's still byte-identical to the shipped scaffold;
-  one note or edit makes it theirs and it's kept. In an `--into` install
+  one note or edit makes it theirs and it's kept. `governance/` follows the
+  same rule — a policy.yml you've customized (org name, overlays) is kept,
+  not deleted. In an `--into` install
   the pre-existing workspace survives minus exactly what the seed added.
   Shown before run, like everything else).
 - Their next move: replace the demo with the real thing from Phase 1's

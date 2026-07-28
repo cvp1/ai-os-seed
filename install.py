@@ -25,7 +25,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 
 # What an install consists of — directories and files copied verbatim.
-COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "views"]
+COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "memory-mesh", "views"]
+# Opt-in only (SEED-065): governance/ never ships via the default COMPONENTS
+# copy — a default `install.py --target <ROOT>` is byte-for-byte unchanged
+# by this wave. --enable-governance is the explicit "governance: none is
+# NOT the default, but activation IS" opt-in, run only when the recipient
+# says yes in AGENT-INSTALL.md's governance phase.
+OPTIONAL_COMPONENTS = ["governance"]
 ROOT_FILES = ["PRINCIPLES.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
 # Components whose EXISTING presence in an --into workspace satisfies the
 # requirement instead of colliding (see the compose-mode comment in install()).
@@ -196,6 +202,29 @@ def enable_demo(target: Path):
     return 0
 
 
+def enable_governance(target: Path):
+    """Copy the governance/ tree into an existing install — opt-in only,
+    never part of the default COMPONENTS copy (SEED-065). Idempotent:
+    refuses if governance/ already exists there rather than silently
+    overwriting a possibly-customized policy.yml."""
+    if not (target / "PRINCIPLES.md").exists():
+        return die(f"{target} doesn't look like an AI-OS Seed install — is --target correct?")
+    dest = target / "governance"
+    if dest.exists():
+        print(f"{dest} already exists — nothing to do (if you want to reset it, "
+              f"remove it yourself first; policy.yml may be customized).")
+        return 0
+    src = HERE / "governance"
+    if not src.exists():
+        return die(f"this clone is incomplete (missing governance/) — re-clone rather than "
+                   f"installing from a partial tree.")
+    shutil.copytree(src, dest)
+    print(f"governance/ copied to {dest}")
+    print("next: run the governance phase's validate/compile/consent/conformance steps "
+          "from AGENT-INSTALL.md before treating this install as governed.")
+    return 0
+
+
 def _memory_is_pristine(p: Path) -> bool:
     """True only if memory/ is byte-identical to the shipped scaffold — same
     file names, same contents, no subdirectories. Anything else means the
@@ -208,6 +237,18 @@ def _memory_is_pristine(p: Path) -> bool:
     if ours != theirs:
         return False
     return all(filecmp.cmp(shipped / n, p / n, shallow=False) for n in ours)
+
+
+def _tree_is_pristine(shipped: Path, installed: Path) -> bool:
+    """Recursive byte-identical check (governance/'s policy.yml is very
+    plausibly org-customized after a real governance install — same
+    keep-if-touched caution as memory/, generalized)."""
+    if not shipped.is_dir() or not installed.is_dir():
+        return False
+    cmp = filecmp.dircmp(shipped, installed)
+    if cmp.left_only or cmp.right_only or cmp.diff_files or cmp.funny_files:
+        return False
+    return all(_tree_is_pristine(shipped / d, installed / d) for d in cmp.common_dirs)
 
 
 def uninstall(target: Path):
@@ -230,8 +271,10 @@ def uninstall(target: Path):
     # Remove ONLY the seed's own names, never the tree wholesale — a --into
     # install shares its root with the user's workspace, and even a dedicated
     # root may have grown user content (NOW.md, memory notes, their CLAUDE.md).
-    for name in COMPONENTS + ROOT_FILES:
+    for name in COMPONENTS + OPTIONAL_COMPONENTS + ROOT_FILES:
         p = target / name
+        if not p.exists() and name in OPTIONAL_COMPONENTS:
+            continue  # never enabled — nothing to remove, nothing to warn about
         if name == "memory" and p.is_dir() and not _memory_is_pristine(p):
             # memory/ is the user's brain and notes are irreplaceable: it is
             # only deleted when byte-identical to the shipped scaffold (a
@@ -241,6 +284,13 @@ def uninstall(target: Path):
             # hand; impossible to undo.
             print(f"kept {p} — it differs from the shipped scaffold, so it's "
                   f"yours, not the seed's; delete it yourself if you're sure.")
+            continue
+        if name == "governance" and p.is_dir() and not _tree_is_pristine(HERE / "governance", p):
+            # Same caution as memory/: a real governance install very likely
+            # customized policy.yml (org name, overlays) — kept unless
+            # provably untouched.
+            print(f"kept {p} — it differs from the shipped scaffold (likely a "
+                  f"customized policy.yml), so it's yours; delete it yourself if you're sure.")
             continue
         if p.is_dir():
             shutil.rmtree(p)
@@ -267,12 +317,15 @@ def main():
                     help="read-only: report prior seed installs/clones on this machine")
     ap.add_argument("--enable-demo", action="store_true",
                     help="add the hello_fleet demo to the scheduler manifest")
+    ap.add_argument("--enable-governance", action="store_true",
+                    help="copy the governance/ profile-compiler into an existing install "
+                         "(opt-in only — never part of the default install)")
     ap.add_argument("--uninstall", action="store_true",
                     help="de-schedule managed jobs and remove the install")
     args = ap.parse_args()
 
     if args.detect:
-        if args.target or args.enable_demo or args.uninstall:
+        if args.target or args.enable_demo or args.enable_governance or args.uninstall:
             return die("--detect takes no other flags (it's a read-only report)")
         return detect()
     if not args.target:
@@ -281,15 +334,18 @@ def main():
     target = Path(args.target).expanduser()
     if not target.is_absolute():
         return die(f"--target must be an absolute path, got {args.target!r}")
-    if args.enable_demo and args.uninstall:
-        return die("--enable-demo and --uninstall are mutually exclusive")
-    if args.into and (args.enable_demo or args.uninstall):
+    exclusive = [args.enable_demo, args.enable_governance, args.uninstall]
+    if sum(bool(x) for x in exclusive) > 1:
+        return die("--enable-demo, --enable-governance, and --uninstall are mutually exclusive")
+    if args.into and any(exclusive):
         return die("--into only applies to the initial install")
 
     if args.uninstall:
         return uninstall(target)
     if args.enable_demo:
         return enable_demo(target)
+    if args.enable_governance:
+        return enable_governance(target)
     return install(target, into=args.into)
 
 

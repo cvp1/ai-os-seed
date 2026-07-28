@@ -1,8 +1,11 @@
 # Scheduler conventions
 
 Two rules make a plain-crontab/launchd scheduler behave like a fleet instead
-of a pile of unrelated jobs. Both are distilled from the same convention
-running CC's own hermes-backed scheduler; neither is hermes-specific.
+of a pile of unrelated jobs. Both are distilled from the conventions running
+the source fleet's own 81-job estate; neither is scheduler-specific — that
+estate has since moved from a hermes-backed scheduler to systemd user timers
+and both rules carried over untouched, which is the point of stating them as
+conventions rather than as features of one scheduler.
 
 ## 1. Exit semantics — found work vs breakage
 
@@ -37,6 +40,17 @@ The corollary: `runs.db` + `freshness.py` are your **pull** channel (you or
 a dashboard checks them), and self-notify is the **push** channel (the job
 tells you unprompted). A job that matters usually wants both — log the run
 so history exists, and notify so you don't have to go looking.
+
+**This rule was learned the expensive way, and it generalises past crontab.**
+The source fleet ran 81 jobs on a scheduler whose docs — and whose per-job
+header comments — stated that output was "pinged to you on non-empty stdout."
+It wasn't. Reading the scheduler's source showed the delivery mode every one
+of those jobs used resolved to a no-op: *"local-only jobs don't deliver — not
+a failure."* It had never sent a single notification. Nothing was actually
+broken, because every job that mattered already self-notified — which is
+exactly why nobody noticed for months. Assume your scheduler notifies nobody
+until you have read the code that would do it, and put the notification in
+the job where you can see it.
 
 ## The one demo job
 

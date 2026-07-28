@@ -1,0 +1,16 @@
+# Subject registry — the controlled vocabulary that makes contradiction
+# detection possible. Two sessions naming one subject differently never
+# collide, so the detector silently fails (Grok review 3, finding 2). The
+# fold PARKS any event whose subject class isn't registered here.
+#
+# Shape: <class>/<entity>. Entities are free-form within the class but
+# host entities MUST use canonical fleet slugs (FLEET.md table).
+
+[classes]
+ssh-route = "reachability of a host over ssh (entity = fleet slug)"
+endpoint = "a network service location (entity = service name)"
+install = "presence/version of a tool on a host (entity = host.tool)"
+policy = "a rule encoded in code or doctrine (entity = doc-or-module.key)"
+lesson = "a behavioral lesson (entity = kebab slug, same as memory slugs)"
+capability = "what a host or component can do (entity = host.capability)"
+home = "a canonical fact artifact being watched (entity = doc name)"

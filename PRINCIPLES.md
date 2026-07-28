@@ -73,3 +73,14 @@ covered by a specific convention, reason from here.
 15. **Recommend, don't poll.** For design and sequencing calls, give a decision and
     proceed; reserve questions for forks only the operator can resolve. Keep
     interactive answers tight — decision first; long-form goes to the vault.
+
+## Portability
+16. **Capability lives in the repo; the harness gets a generated shim.** A skill,
+    subagent, or headless call's real logic belongs in a Python/bash tool with a
+    `python -m <project>` CLI entry point — never only in a SKILL.md's prose or a
+    hand-rolled `claude -p` subprocess call. The harness-specific surface (a
+    SKILL.md trigger, an AGENTS.md, a `.claude/agents/*.md` role file) is a thin,
+    ideally *generated* view over that capability, not where the capability lives.
+    This is why the fleet survives a harness swap the same way it survives a
+    connectivity loss: audit + backlog at
+    `audits/2026-07-20-harness-portability/BACKLOG.md`.

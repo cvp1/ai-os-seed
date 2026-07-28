@@ -31,7 +31,7 @@ import db
 import switches
 
 SUMMARY_MAX = 500      # chars stored for the first stdout line
-ERRTAIL_MAX = 2000     # chars stored for the stderr tail on failure
+ERRTAIL_MAX = 2000     # chars stored for the stderr tail (any run that wrote one)
 
 # A wrapped job can report token usage by appending one JSON object per line to
 # the file named in $CC_OBS_TOKENS_FILE, with any of: tokens_in, tokens_out,
@@ -168,7 +168,14 @@ def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage):
                 summary = line.strip()[:SUMMARY_MAX]
                 break
         ok = 1 if exit_code == 0 else 0
-        error_tail = "" if ok else stderr_s.strip()[-ERRTAIL_MAX:]
+        # Keep the stderr tail whenever the child wrote one — NOT only on
+        # failure. A job that catches its own exception, logs the reason to
+        # stderr and exits 0 is the "soft failure" shape: healthy to every
+        # consumer while doing nothing at all. rain_watch sat there for 26 days
+        # (7,505 runs, all exit 0, ~260 bytes of stderr each) because this line
+        # stored a byte count and threw the words away. freshness.py now reads
+        # these tails to catch the shape; see cron/AUDIT-2026-07-26.md.
+        error_tail = stderr_s.strip()[-ERRTAIL_MAX:]
         duration_ms = int((finished - started).total_seconds() * 1000)
         tok_in = usage.get("tokens_in") if usage else None
         tok_out = usage.get("tokens_out") if usage else None

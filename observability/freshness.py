@@ -2,10 +2,12 @@
 """Freshness / liveness check over the observability store.
 
 Reads expected cadence from freshness.json and, for each scheduled job, reports:
-  OK      newest run is recent and succeeded
-  STALE   newest run is older than max_age (job has gone silent)
-  MISSING job is configured but has never logged a run
-  FAILING newest run is recent but exited non-zero
+  OK       newest run is recent and succeeded
+  STALE    newest run is older than max_age (job has gone silent)
+  MISSING  job is configured but has never logged a run
+  FAILING  newest run is recent but exited non-zero
+  SOFTFAIL every recent run "succeeded" but most wrote to stderr — the job is
+           swallowing its own errors and exiting 0 (see soft_failure below)
 
 Designed to be run as its own cron job: it prints ONLY problems to stdout,
 led by a `FINDINGS:` summary line, and exits 0 — finding stale/failing jobs is
@@ -99,6 +101,42 @@ def _fmt_age(delta: timedelta) -> str:
     return f"{hrs // 24}d"
 
 
+# --- soft-failure detection (cron/AUDIT-2026-07-26.md) ------------------------
+# A job can fail without ever failing: catch its own exception, write the reason
+# to stderr, exit 0. Every signal this file watches stays green — it ran, it
+# ran recently, it exited 0 — while the job does nothing. rain_watch did that
+# for 26 days through monsoon season.
+#
+# The discriminator is PERSISTENCE, not presence: plenty of healthy jobs emit an
+# occasional traceback or warning on stderr and recover. A job writing to stderr
+# on most of its recent runs, every one of them "successful", is the soft-
+# failure shape. Jobs that legitimately narrate to stderr on every good run
+# declare "stderr_ok": true in freshness.json.
+SOFT_WINDOW = 12       # most recent runs considered
+SOFT_MIN_RUNS = 4      # don't judge a job with less history than this
+SOFT_RATIO = 0.75      # this share of them writing stderr = persistent
+
+
+def soft_failure(conn, job):
+    """Detail string if `job` looks soft-failing, else None. Never raises."""
+    try:
+        rows = conn.execute(
+            "SELECT ok, stderr_bytes, error_tail FROM runs WHERE job=? "
+            "ORDER BY started_at DESC LIMIT ?", (job, SOFT_WINDOW)).fetchall()
+    except Exception:  # noqa: BLE001 — a backstop must not crash the job
+        return None
+    if len(rows) < SOFT_MIN_RUNS:
+        return None
+    if any(not r["ok"] for r in rows):
+        return None        # a real failure in the window — FAILING already covers it
+    noisy = [r for r in rows if (r["stderr_bytes"] or 0) > 0]
+    if len(noisy) / len(rows) < SOFT_RATIO:
+        return None
+    tail = (noisy[0]["error_tail"] or "").strip().splitlines()
+    note = tail[-1][:120] if tail else f"{noisy[0]['stderr_bytes']} bytes, text not captured"
+    return (f"exit 0 but wrote stderr on {len(noisy)}/{len(rows)} recent runs: {note}")
+
+
 def evaluate(conn, now):
     cfg = json.loads(_CONFIG.read_text())
     results = []
@@ -128,8 +166,11 @@ def evaluate(conn, now):
                             "detail": f"last run failed: {note[:120]}",
                             "age": _fmt_age(age)})
         else:
-            results.append({"job": job, "label": label, "status": "OK",
-                            "detail": f"last run {_fmt_age(age)} ago", "age": _fmt_age(age)})
+            soft = None if spec.get("stderr_ok") else soft_failure(conn, job)
+            results.append({"job": job, "label": label,
+                            "status": "SOFTFAIL" if soft else "OK",
+                            "detail": soft or f"last run {_fmt_age(age)} ago",
+                            "age": _fmt_age(age)})
     return results
 
 
@@ -150,7 +191,8 @@ def main():
     # STALE (went silent) and FAILING (crashed) are high-confidence — they page.
     # MISSING (never run) is weaker: usually a newly-instrumented job that hasn't
     # hit its next schedule yet, so it's informational unless --strict is given.
-    paging = {"STALE", "FAILING", "MISSING"} if args.strict else {"STALE", "FAILING"}
+    paging = ({"STALE", "FAILING", "SOFTFAIL", "MISSING"} if args.strict
+              else {"STALE", "FAILING", "SOFTFAIL"})
     problems = [r for r in results if r["status"] in paging]
 
     if args.json:

@@ -1,0 +1,25 @@
+# Mesh membership — starts EMPTY (solo mode). The mesh is fully functional
+# on one machine: append-only event log, deterministic fold, contradiction
+# parking, replay. Peers, nudges, and --sync activate only once hosts are
+# enrolled here. Enrollment runbook: ENROLL.md (same directory).
+#
+# When you add a second machine, list EVERY mesh host (including this one),
+# then run install.sh on the new machine. Example:
+#
+# [[hosts]]
+# name = "desktop"          # the machine's mesh slug (usually its hostname)
+# ssh = "desktop"           # ssh alias every OTHER host can reach it by
+# repo = "memory-events"    # events repo path relative to $HOME on that host
+#
+# [[hosts]]
+# name = "laptop"
+# ssh = "laptop"
+# repo = "memory-events"
+
+# Home watcher — canonical documents whose change should emit an
+# update-pointer event (one-home-per-fact enforcement). Starts empty;
+# register your own homes as you adopt the pattern. Example:
+#
+# [[homes]]
+# name = "workspace-claude-md"
+# path = "~/{{WORKSPACE}}/CLAUDE.md"

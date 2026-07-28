@@ -1,0 +1,139 @@
+# AI Agent Operating Permissions — reference policy (SEED-060)
+#
+# This is v0.2 of the signable page — vault "01 Ideas/AI Agent Permission
+# Matrix - One-Page Governance Artifact.md" — transcribed as data, cell for
+# cell. It is the workshop TEMPLATE: an org edits a copy of this file during
+# the engagement workshop (docs/governance-profile.md, "How it's delivered"),
+# never this one. See policy-schema.md for what every key means.
+#
+# Nothing in this file is org-specific. It ships as-is.
+
+version: 1
+
+org:
+  name: "{{ORG_NAME}}"
+  policy_owner: "{{POLICY_OWNER}}"
+  security_owner: "{{SECURITY_OWNER}}"
+  signed_date: "{{SIGNED_DATE}}"
+
+# --- §1 surfaces --------------------------------------------------------
+surfaces:
+  private_workspace:
+    label: "Private workspace"
+    description: "own files, drafts, scratch analysis"
+    classify:
+      - kind: path
+        pattern: "**"
+        default: true
+
+  team_shared:
+    label: "Team-shared"
+    description: "tickets, wikis, repos with review gates"
+    classify:
+      - kind: connector
+        pattern: "chat.dm.*"
+        note: "a DM to one colleague is team-shared, not private — draftable back, but observed (v0.2 binding call)"
+      - kind: repo
+        pattern: "*"
+        requires: "review_gate=true"
+      - kind: connector
+        pattern: "calendar.*"
+        note: "internal-only calendar actions are team-shared; an external attendee promotes to external, see below"
+
+  system_of_record:
+    label: "System of record"
+    description: "prod config, master data, ledgers, HR/CRM records, access grants"
+    classify:
+      - kind: repo
+        pattern: "*"
+        requires: "review_gate=false"
+        note: "a repo WITHOUT review gates is a system of record — merge is truth (v0.2 binding call)"
+      - kind: connector
+        pattern: "db.prod.*"
+      - kind: connector
+        pattern: "hr.*"
+      - kind: connector
+        pattern: "crm.*"
+
+  external:
+    label: "External"
+    description: "outbound mail, publishing, spend, anything a customer sees"
+    classify:
+      - kind: connector
+        pattern: "mail.send"
+      - kind: connector
+        pattern: "publish.*"
+      - kind: connector
+        pattern: "spend.*"
+        note: "money is always external — a third party is on the other end of every payment (v0.2)"
+      - kind: connector
+        pattern: "calendar.invite.external"
+        note: "adding an external attendee promotes a calendar action to external (v0.2)"
+
+# --- §2 tiers ------------------------------------------------------------
+tiers: [ACT, ACT_NOTIFY, PROPOSE, DRAFT_ONLY, NEVER]
+
+# --- §3 matrix -------------------------------------------------------------
+matrix:
+  private_workspace:
+    reversible: ACT
+    costly: ACT_NOTIFY
+    irreversible: PROPOSE
+  team_shared:
+    reversible: ACT_NOTIFY
+    costly: PROPOSE
+    irreversible: PROPOSE
+  system_of_record:
+    reversible: PROPOSE
+    costly: PROPOSE
+    irreversible: DRAFT_ONLY
+  external:
+    reversible: DRAFT_ONLY
+    costly: DRAFT_ONLY
+    irreversible: DRAFT_ONLY
+
+# --- §4 prohibitions ---------------------------------------------------
+prohibitions:
+  - id: secrets_vaulted
+    text: >
+      Secrets are read from the organization's vault at point of use; they
+      never appear in prompts, transcripts, logs, or outputs.
+    enforce_at: harness
+  - id: no_mfa_handling
+    text: "No MFA/OTP handling. Authentication challenges go to a human, always."
+    enforce_at: harness
+  - id: egress_first_party_only
+    text: >
+      Enterprise data reaches only contracted, enterprise-tier model
+      providers. Never consumer endpoints or unapproved third parties.
+      Unknown data classification fails closed.
+    enforce_at: network
+  - id: no_self_modification
+    text: >
+      The agent cannot alter its own permissions, this matrix, or its
+      automation hooks without human sign-off.
+    enforce_at: harness
+  - id: no_impersonation
+    text: >
+      External communication carries a human's deliberate send, or it does
+      not go.
+    enforce_at: connector
+
+# --- §5 read scope ----------------------------------------------------
+read_scope:
+  approved_classes: [public, internal]
+  excluded_classes: [restricted, regulated]
+  unclassified: fail_closed
+
+# --- §6 delegation ----------------------------------------------------
+delegation:
+  terminal_cell_governs: true
+
+# --- §7 spend ------------------------------------------------------------
+spend:
+  monthly_budget_usd: 500
+  alert_threshold_pct: 80
+  on_exceed: propose_all
+
+# --- §8 overlays (none in the reference — orgs add their own, tighten-only)
+overlays: {}

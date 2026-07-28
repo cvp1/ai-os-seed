@@ -35,6 +35,17 @@ from pathlib import Path
 # found" rather than crashing _repos()'s unconditional iterdir().
 CC = Path(os.path.expanduser(os.environ.get("CC_HYGIENE_ROOT", "~/Github/CC")))
 DEFAULT_DAYS = 7
+
+# --- Catastrophic content loss (added 2026-07-27) ----------------------------
+# Written after PRINCIPLES.md — all 16 first principles — sat at 0 bytes for
+# roughly five hours and NOTHING noticed. The `dirty` check below could not have
+# caught it: it waits 7 days and then reports a COUNT ("3 dirty tracked files"),
+# so a doctrine file emptied by a stray `> $UNSET_VAR` reads exactly like a
+# work-in-progress edit. Content LOSS is a different class from content CHANGE
+# and pages immediately, with the file named.
+GUTTED_MIN_BYTES = 400   # under this, "90% smaller" is noise, not destruction
+GUTTED_KEEP_FRAC = 0.10  # keeping <=10% of the committed bytes = gutted
+GUTTED_MAX_FILES = 300   # bound the per-repo work (Principle 8)
 SASHA_CONFIG = Path(os.path.expanduser("~/.config/sasha/config.json"))
 HERMES_SCRIPTS = Path(os.path.expanduser("~/.hermes/scripts"))
 
@@ -63,6 +74,71 @@ def _porcelain_paths(repo: Path) -> list:
     return paths
 
 
+def _head_blob_sizes(repo: Path) -> dict:
+    """{path: byte size} for every regular-file blob at HEAD, from ONE
+    `git ls-tree -r -l -z HEAD` call. Symlinks (mode 120000) and submodules
+    (type commit) are skipped. Empty on unborn HEAD — no comparison, no finding.
+
+    v2 (2026-07-27, same day as v1): the guard originally walked `git status`'s
+    dirty list. Grok's eval pass called the hole and a live control CONFIRMED it:
+    the incident's own destroying command printed a CLEAN status, and a file
+    truncated under `update-index --assume-unchanged` was invisible to v1. A
+    guard against silent destruction cannot take git's word for which files
+    changed — HEAD is the ground truth, so enumerate HEAD and stat the tree."""
+    r = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-l", "-z", "HEAD"],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return {}
+    sizes = {}
+    for rec in r.stdout.split("\0"):
+        if not rec or "\t" not in rec:
+            continue
+        meta, path = rec.split("\t", 1)
+        parts = meta.split()               # mode type hash size
+        if len(parts) != 4 or parts[1] != "blob" or parts[0] == "120000":
+            continue
+        if parts[3].isdigit():
+            sizes[path] = int(parts[3])
+    return sizes
+
+
+def _gutted(repo: Path) -> list:
+    """Tracked files whose working copy has lost nearly all of its committed
+    content, measured HEAD-vs-disk for EVERY tracked file — deliberately NOT via
+    `git status`, which the incident proved can report clean over destruction.
+    Two shapes, both flagged with NO grace period:
+
+      * emptied  — 0 bytes where HEAD had content. This is never a deliberate
+                   edit; it is a failed write or a redirect onto the wrong path.
+      * gutted   — kept <=10% of a >=400-byte file. Rewrites shrink; they don't
+                   evaporate.
+
+    SCOPE BOUNDARY — a tracked file *missing* from the working tree is out of
+    scope: usually a deliberate delete, and the `dirty` check ages it out. NOTE
+    the known residual: a delete that ALSO fools `git status` evades both checks.
+    Accepted for now — a missing file is at least loud the moment anything
+    imports it, where a 0-byte file imports cleanly and lies.
+    """
+    out = []
+    heads = _head_blob_sizes(repo)
+    for p, head in heads.items():
+        if head == 0:
+            continue                       # nothing committed to lose
+        if len(out) >= GUTTED_MAX_FILES:
+            out.append(("…", 0, 0, f"more than {GUTTED_MAX_FILES} hits; truncated"))
+            break
+        try:
+            live = (repo / p).stat().st_size
+        except OSError:
+            continue                       # missing/unreadable → out of scope
+        if live == 0:
+            out.append((p, head, live, "emptied to 0 bytes"))
+        elif head >= GUTTED_MIN_BYTES and live <= head * GUTTED_KEEP_FRAC:
+            pct = 100.0 * (head - live) / head
+            out.append((p, head, live, f"lost {pct:.0f}% of its content"))
+    return out
+
+
 def _repos() -> list:
     repos = []
     if not CC.is_dir():
@@ -80,6 +156,18 @@ def sweep_repos(days: int, now: float) -> list:
     problems = []
     for repo in _repos():
         name = repo.name if repo != CC else "CC (cc-meta)"
+
+        dirty_paths = _porcelain_paths(repo)
+
+        # Content loss pages IMMEDIATELY — no `days` grace — and is checked
+        # FIRST, before the no-remote early-exit below: a repo with no remote is
+        # the LAST place you want content destruction to go unreported. NOT fed
+        # from dirty_paths: the incident's status output was clean (v2).
+        for path, head, live, why in _gutted(repo):
+            problems.append({"repo": name, "kind": "gutted",
+                             "detail": f"{path}: {why} "
+                                       f"({head} bytes at HEAD, {live} now) — "
+                                       f"restore with: git -C {repo} restore {path}"})
 
         has_upstream = subprocess.run(
             ["git", "-C", str(repo), "rev-parse", "@{u}"],
@@ -105,7 +193,6 @@ def sweep_repos(days: int, now: float) -> list:
                                                f"{age_days:.0f}d old (>{days}d)"})
 
         # dirty tracked files, aged by the newest such file's mtime
-        dirty_paths = _porcelain_paths(repo)
         if dirty_paths:
             newest = 0.0
             for p in dirty_paths:
