@@ -13,7 +13,9 @@ Layout (events repo, default ~/memory-events — separate from this code repo):
     state/                    last-seen refs (FF guard), alert edge state
     view.version              sha256 of folded state — the staleness contract
 """
+import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -21,6 +23,7 @@ import re
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 CODE_DIR = Path(__file__).resolve().parent
@@ -308,12 +311,82 @@ def subject_problem(subject, registry):
     return None
 
 
+# ── concurrency ──────────────────────────────────────────────────────────────
+# SPEC invariant 1 calls events/<host>.ndjson a SINGLE-WRITER log, and means one
+# writer per HOST — the parallelism the design was built for is across hosts.
+# Several agents in one shell on one host are several writers to one file.
+#
+# Measured 2026-07-28, 5 concurrent emits on {{REDACTED}}: all 5 event lines
+# landed intact (one write() under O_APPEND, events ~800B, far under PIPE_BUF),
+# but 2 of 5 GIT COMMITS failed on index.lock. Nothing was lost only because a
+# later agent's commit swept up the earlier lines — accidental recovery, and it
+# does not cover the LAST writer. An uncommitted event is worse than it looks:
+# read_all_events() loads from head_blob(), i.e. committed state only, so the
+# event never folds into MEMORY.md and never reaches a peer. It sits on disk,
+# inert, until something else happens to commit.
+LOCK_PATH = MESH_ROOT / ".mesh.lock"
+LOCK_WAIT = 30          # seconds to wait for the lock before failing loudly
+
+
+@contextlib.contextmanager
+def repo_lock(timeout=LOCK_WAIT):
+    """Serialize the append+add+commit critical section across processes.
+
+    Held across the WHOLE sequence, not per git call: locking each call
+    individually still lets two agents interleave between add and commit.
+
+    Advisory (flock) — which is sufficient because every writer is our code.
+    Fails loudly on timeout rather than proceeding unserialized: a caller that
+    silently skipped the lock would reintroduce exactly the race this closes.
+    """
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"mesh: could not acquire {LOCK_PATH} within {timeout}s — "
+                        "another writer is stuck; not proceeding unserialized")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 # ── git helpers ──────────────────────────────────────────────────────────────
-def git(*args, cwd=None, check=True, timeout=60):
-    r = subprocess.run(["git", "-C", str(cwd or MESH_ROOT), *args],
-                       capture_output=True, text=True, timeout=timeout)
-    if check and r.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()[:300]}")
+_LOCK_ERR = ("index.lock", "unable to create", "cannot lock ref", "ref lock")
+
+
+def git(*args, cwd=None, check=True, timeout=60, retries=6):
+    """Run git, retrying transient LOCK contention with bounded backoff.
+
+    Defence in depth behind repo_lock(): the fold, home_watch and a human shell
+    also touch this repo and do not take our lock. Only lock-shaped failures
+    retry — a real error (bad ref, conflict) must fail on the first try rather
+    than being sat on for a second.
+    """
+    delay = 0.05
+    for attempt in range(retries + 1):
+        r = subprocess.run(["git", "-C", str(cwd or MESH_ROOT), *args],
+                           capture_output=True, text=True, timeout=timeout)
+        if r.returncode == 0:
+            return r.stdout
+        err = (r.stderr or "").lower()
+        if attempt < retries and any(m in err for m in _LOCK_ERR):
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
+            continue
+        if check:
+            raise RuntimeError(f"git {' '.join(args)}: {r.stderr.strip()[:300]}")
+        return r.stdout
     return r.stdout
 
 

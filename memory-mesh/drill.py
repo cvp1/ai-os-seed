@@ -112,6 +112,9 @@ class Mesh:
             for h in self.HOSTS:
                 self.fold(h)
 
+    def git(self, h, *args):
+        return run(["git", "-C", str(self.dirs[h]), *args], check_rc=False)
+
     def parked(self, h):
         f = self.dirs[h] / "views" / "operator" / "CONFLICTS.md"
         return f.read_text() if f.exists() else ""
@@ -275,8 +278,59 @@ def drill_7(m):
               "lesson/collide" not in m.parked(h) and "belief reconciled" in idx(h))
 
 
+def drill_8(m):
+    print("drill 8 — N concurrent writers on ONE host do not lose a commit")
+    # SPEC invariant 1 calls events/<host>.ndjson single-writer, meaning one
+    # writer per HOST. Several agents in one shell are several writers to one
+    # file. Measured 2026-07-28 BEFORE repo_lock(): 5 concurrent emits landed
+    # 5 intact lines but only 3 commits — two lost index.lock. Nothing was lost
+    # only because a later commit happened to sweep the earlier lines up, which
+    # does not cover the last writer. An uncommitted event never folds:
+    # read_all_events() reads committed state only.
+    import concurrent.futures as cf
+    N = 8
+    host = m.HOSTS[0]
+
+    def one(i):
+        # check_rc=False: a lost commit must be OBSERVED and asserted on, not
+        # raised as a harness error that hides which writers failed.
+        return run([sys.executable, str(CODE / "emit.py"), "--no-nudge",
+                    "--session", f"drill-conc-{i}",
+                    "--kind", "lesson", "--subject", f"lesson/conc-{i}",
+                    "--content", f"concurrent writer {i}"],
+                   env=m.env(host), check_rc=False)
+
+    with cf.ThreadPoolExecutor(max_workers=N) as ex:
+        results = list(ex.map(one, range(N)))
+
+    rc = [r.returncode for r in results]
+    check(f"all {N} concurrent emits exited 0", all(c == 0 for c in rc), str(rc))
+
+    log = m.dirs[host] / "events" / f"{host}.ndjson"
+    lines = [x for x in log.read_text().splitlines() if x.strip()]
+    check(f"all {N} lines on disk", len(lines) >= N, f"{len(lines)} lines")
+
+    import json as _json
+    bad = 0
+    for x in lines:
+        try:
+            _json.loads(x)
+        except ValueError:
+            bad += 1
+    check("no torn/interleaved line", bad == 0, f"{bad} unparseable")
+
+    # The real assertion: every event is COMMITTED, not merely on disk.
+    committed = m.git(host, "show", f"HEAD:events/{host}.ndjson").stdout
+    missing = [i for i in range(N) if f"concurrent writer {i}" not in committed]
+    check("every concurrent event reached HEAD", not missing, f"missing {missing}")
+
+    status = m.git(host, "status", "--porcelain").stdout.strip()
+    dirty = [l for l in status.splitlines() if "events/" in l]
+    check("no event left uncommitted in the worktree", not dirty, str(dirty))
+
+
 def main():
-    sel = sys.argv[1:] or ["1", "2", "3", "5", "7", "6", "4"]  # 4 last (diverges hosta)
+    sel = sys.argv[1:] or ["1", "2", "3", "5", "7", "8", "6", "4"]  # 4 last (diverges hosta)
     with tempfile.TemporaryDirectory() as root:
         m = Mesh(root)
         for d in sel:

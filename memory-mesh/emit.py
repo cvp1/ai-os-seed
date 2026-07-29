@@ -83,9 +83,15 @@ def main():
     # One write() of one line — a torn append is a torn LINE, which the fold
     # holds out as unparseable rather than corrupting neighbors (drill 3).
     # append_event_line also heals a pre-existing torn tail (drill 7).
-    log = M.append_event_line(line)
-    M.git("add", str(log.relative_to(M.MESH_ROOT)))
-    M.git("commit", "-q", "-m", f"emit {ev['kind']} {ev['subject']} {ev['id']}")
+    # Lock the WHOLE append+add+commit, not each git call: several agents in
+    # one shell on one host are several writers to this single-writer log, and
+    # a commit that loses index.lock leaves its event uncommitted — invisible
+    # to the fold, which reads committed state only. Measured 2/5 failures at
+    # 5-way concurrency before this lock (2026-07-28).
+    with M.repo_lock():
+        log = M.append_event_line(line)
+        M.git("add", str(log.relative_to(M.MESH_ROOT)))
+        M.git("commit", "-q", "-m", f"emit {ev['kind']} {ev['subject']} {ev['id']}")
     print(f"emitted {ev['id']} ({ev['kind']} {ev['subject']}) → {log.name}")
 
     if not args.no_nudge:

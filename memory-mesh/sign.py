@@ -27,8 +27,9 @@ import mesh_lib as M
 
 def append(ev, line):
     log = M.append_event_line(line)
-    M.git("add", str(log.relative_to(M.MESH_ROOT)))
-    M.git("commit", "-q", "-m", f"sign {ev['kind']} {ev['subject']} {ev['id']}")
+    with M.repo_lock():
+        M.git("add", str(log.relative_to(M.MESH_ROOT)))
+        M.git("commit", "-q", "-m", f"sign {ev['kind']} {ev['subject']} {ev['id']}")
 
 
 def main():
