@@ -77,11 +77,19 @@ INDEX_BUDGET = 20_480          # bytes, per SPEC — the MESH's own views only.
 # false when the constant was picked, because nobody measured the composition.
 LOADER_BYTE_CEILING = 24_986
 LOADER_LINE_CEILING = 200
-# Share of the ceiling the PINNED tier may hold before the fold alarms. See the
-# bound in fold_events: a majority, chosen as a regime boundary rather than a
-# tuned constant — pins are uncontested residency, so past half the ceiling the
-# merit ranking is no longer deciding what Craig sees.
-PIN_DOMINANCE_SHARE = 0.5
+# Share of the DELIVERED file (not the loader ceiling — the delivered file is
+# what a session actually gets) that the pinned tier may hold. Unsigned pins
+# past this are REFUSED by fold_events, oldest-admitted-first.
+#
+# This is a POLICY limit, not a measured one, and saying otherwise was the
+# thing Grok caught: the first version called 0.5 "a regime boundary rather
+# than a threshold anyone had to measure or invent", which is a tuned constant
+# wearing a costume. There is no measured cliff in loader behaviour at half the
+# file. What IS measured (2026-07-31, 16 pins live): the pinned tier renders
+# 3,047 B, or 12.6% of DELIVERY_BYTES — so the cap sits at ~4x today's usage
+# and refusing at it costs nothing now. The number to revisit is this headroom,
+# and the alarm names the byte figure so drift is visible rather than inferred.
+PIN_DELIVERY_SHARE = 0.5
 # What we publish to: headroom below the ceiling, so a memory written mid-session
 # cannot cross the cliff before the next fold re-renders.
 DELIVERY_BYTES = 24_200
@@ -701,33 +709,56 @@ def fold_events(events, registry):
     # pin that silently protects nothing is indistinguishable from a pin that
     # works, and the whole point of pinning a boundary is that its absence is
     # never silent. Same reasoning as the dangling-supersedes tripwire above.
-    pinned_subjects = {e["subject"] for e in pins}
+    #
+    # The pinned tier is a HARD CAP, not an alarm (Grok review, 2026-07-31 — the
+    # first version only appended to `alarms`). Pinned rows are UNCONTESTED
+    # residency, an agent can emit a `pin` event, and `pin` outranks `_signed`
+    # in score_for_index — so alarm-only left an unmetered write path into the
+    # one file every session loads, which is the memory-poisoning amplifier
+    # shape ([[improve-loop-poisoning-surface]]) and the same "absence is
+    # silent" failure this overlay was written to kill, moved from eviction to
+    # capture. An alarm nobody reads is not a bound.
+    #
+    # Admission is OLDEST-FIRST, and that ordering is the security property: a
+    # flood of new pins is refused at the door, rather than displacing the
+    # boundaries already resident. Operator-SIGNED pins are admitted before any
+    # cap applies — an agent cannot sign by construction, so Craig can always
+    # pin past the cap and nothing an agent emits can crowd him out.
+    by_subject_servable = {}
     for e in servable:
-        if e["subject"] in pinned_subjects:
-            e["_pin"] = True
-    for subj in sorted(pinned_subjects - {e["subject"] for e in servable}):
-        alarms.append(f"PIN on {subj} protects nothing — no live event has that "
-                      f"subject (typo, or the target was retracted/parked)")
-
-    # Bound the pinned tier (Principle 8). Pinned rows are UNCONTESTED
-    # residency: they never lose a slot, so every pin is a permanent withdrawal
-    # from the budget the other ~112 rows compete over. Past a point the ranking
-    # stops ranking and the index is just the pin list — and because an agent
-    # can emit a pin, that is also the amplifier shape for memory poisoning
-    # ([[improve-loop-poisoning-surface]]): pinning does not make content
-    # trusted (lineage quarantine runs first, above) but it does buy a poisoned
-    # operator-direct lesson a permanent front-page slot at real doctrine's
-    # expense. The bound is a MAJORITY, not a tuned number — at >50% the pinned
-    # set outweighs everything merit-ranked, which is a regime change rather
-    # than a threshold anyone had to measure or invent.
-    pinned_bytes = sum(len(index_row(e).encode("utf-8")) + 1 for e in servable
-                       if (e.get("_pin") or e.get("pin"))
-                       and e["audience"] in VIEW_INCLUDES["operator"])
-    if pinned_bytes > LOADER_BYTE_CEILING * PIN_DOMINANCE_SHARE:
+        by_subject_servable.setdefault(e["subject"], []).append(e)
+    budget = DELIVERY_BYTES * PIN_DELIVERY_SHARE
+    spent, pinned_subjects, refused = 0, set(), []
+    for p in sorted(pins, key=lambda e: (0 if e.get("_signed") else 1,
+                                         e["ts"], e["id"])):
+        targets = by_subject_servable.get(p["subject"])
+        if not targets:
+            alarms.append(
+                f"PIN {p['id']} on {p['subject']} protects nothing — no live "
+                f"event has that subject (typo, or the target was "
+                f"retracted/parked); retract the pin or fix the subject")
+            continue
+        if p["subject"] in pinned_subjects:
+            continue                      # duplicate pin, already paid for
+        cost = sum(line_bytes(index_row(t)) for t in targets
+                   if t["audience"] in VIEW_INCLUDES["operator"])
+        if not p.get("_signed") and spent + cost > budget:
+            refused.append(p)
+            continue
+        spent += cost
+        pinned_subjects.add(p["subject"])
+    # Assigned for EVERY servable event, not just the pinned ones: `_pin` is an
+    # overlay on a dict the caller may hold across folds, so a retract has to
+    # clear it rather than leave a stale True behind.
+    for e in servable:
+        e["_pin"] = e["subject"] in pinned_subjects
+    if refused:
         alarms.append(
-            f"pinned rows are {pinned_bytes} B of the {LOADER_BYTE_CEILING} B "
-            f"loader ceiling (>{PIN_DOMINANCE_SHARE:.0%}) — the pinned tier now "
-            f"outweighs the merit-ranked one; eviction order is decorative")
+            f"{len(refused)} PIN(s) REFUSED — the pinned tier is at {spent} B of "
+            f"its {int(budget)} B cap ({PIN_DELIVERY_SHARE:.0%} of the "
+            f"{DELIVERY_BYTES} B delivered file). Not applied: "
+            + ", ".join(f"{p['id']}/{p['subject']}" for p in refused[:5])
+            + ". Retract a pin to make room, or sign these to admit them.")
     # A quarantined claim cannot park a served subject (see above), but it can
     # still SAY that it disagrees with one. That is the poisoned-source tripwire:
     # untrusted content arriving with a different story about a fact we already
@@ -748,7 +779,12 @@ def fold_events(events, registry):
                  and e["id"] not in superseded]
     return {"live": servable, "parked": parked, "unnormalized": unnormalized,
             "quarantined": quarantined, "denials": denials,
-            "proposals": proposals, "alarms": alarms, "total": len(events)}
+            "proposals": proposals, "alarms": alarms, "total": len(events),
+            # Pin events never render as index rows, so without this projection
+            # the only record of WHY a memory is resident — and the only place
+            # to find the id needed to retract it — is raw log spelunking.
+            "pins": pins, "pins_active": sorted(pinned_subjects),
+            "pins_refused": refused, "pinned_bytes": spent}
 
 
 def score_for_index(e, correction_counts, session_breadth):
@@ -897,10 +933,45 @@ def render_views(fold, audience):
         quar.append(f"- {e['content'][:400]}")
         quar.append("")
 
+    # PINS.md — the residency audit trail. A pin event never renders as an index
+    # row, so without this the answer to "why is this memory always-on, who
+    # decided, and what id do I retract to undo it?" lives only in the raw
+    # ndjson. That makes the documented unpin path unreachable in practice a few
+    # months out, which is the same as not having one.
+    cap = int(DELIVERY_BYTES * PIN_DELIVERY_SHARE)
+    active = set(fold.get("pins_active", []))
+    refused_ids = {p["id"] for p in fold.get("pins_refused", [])}
+    pinsmd = [f"# PINS ({audience}) — subjects held in the always-on tier "
+              f"regardless of merit rank",
+              "#",
+              f"# Tier usage: {fold.get('pinned_bytes', 0)} B of the {cap} B cap "
+              f"({PIN_DELIVERY_SHARE:.0%} of the {DELIVERY_BYTES} B delivered file).",
+              "# Unsigned pins past the cap are REFUSED, oldest admitted first;",
+              "# an operator-signed pin is admitted before the cap applies.",
+              "#",
+              "# Unpin needs no new verb — retract the PIN EVENT by its id:",
+              "#   emit.py --kind retract --subject <subject> --supersedes <pin id> \\",
+              "#           --content 'unpin: <why>' --session <sesh>",
+              ""]
+    for p in sorted(fold.get("pins", []), key=lambda x: (x["ts"], x["id"])):
+        if p["audience"] not in inc:
+            continue
+        state = ("ACTIVE" if p["subject"] in active else
+                 "REFUSED (over cap)" if p["id"] in refused_ids else
+                 "DANGLING (protects nothing)")
+        pinsmd.append(f"## {p['subject']}  [{state}]")
+        pinsmd.append(f"- pin id {p['id']} · {p['ts']} · {p['host']}"
+                      f"{' · SIGNED' if p.get('_signed') else ''}")
+        pinsmd.append(f"- {p['content'][:300]}")
+        pinsmd.append("")
+    if not active and not fold.get("pins"):
+        pinsmd.append("_no pins — every memory competes on merit rank._")
+
     return {"INDEX.md": "\n".join(lines) + "\n",
             "CONFLICTS.md": "\n".join(conflicts) + "\n",
             "DENIALS.md": "\n".join(denials) + "\n",
-            "QUARANTINE.md": "\n".join(quar) + "\n"}
+            "QUARANTINE.md": "\n".join(quar) + "\n",
+            "PINS.md": "\n".join(pinsmd) + "\n"}
 
 
 # ── harness MEMORY.md (cutover phase 7) ──────────────────────────────────────

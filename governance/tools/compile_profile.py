@@ -64,6 +64,20 @@ SELF_PROTECT_PATTERNS = [
     "Write(governance/policy.yml)",
     "Edit(governance/out/**)",
     "Write(governance/out/**)",
+    # The staged proposals and the audit log are governance state, not work
+    # product. Added 2026-07-31 after an eval pass measured the hole: a staged
+    # proposal is what a human reads before approving, so an agent that can
+    # rewrite one can show a human action A and have them apply action B. The
+    # approval_digest alone can't stop that -- the agent recomputes it -- so
+    # the staged dir has to be as unwritable as policy.yml itself.
+    "Edit(staged/**)",
+    "Write(staged/**)",
+    "Edit(**/.seed/staged/**)",
+    "Write(**/.seed/staged/**)",
+    "Edit(audit/**)",
+    "Write(audit/**)",
+    "Edit(**/.seed/audit/**)",
+    "Write(**/.seed/audit/**)",
 ]
 
 # no_mfa_handling's concrete binding — any tool-name shape that looks like an
@@ -89,10 +103,20 @@ PROHIBITION_LAYER = {
         "settings — do this by hand until an org-specific allowlist is supplied"),
     "no_self_modification": ("harness", "BOUND",
         "settings.json + hook deny Edit/Write against the governance files themselves (see self-protection block)"),
-    "informed_approval": ("harness", "BOUND",
-        "every STAGE-tier call writes the full action plus an approval_digest over its exact "
-        "bytes (profile_gate.write_staged); --verify-staged re-derives that digest and refuses "
-        "a proposal altered after review, and a proposal with no digest fails closed"),
+    "informed_approval": ("harness", "BOUND-PARTIAL",
+        "every STAGE-tier call writes the full action; a digest over the WHOLE consent surface "
+        "(command, args, note, staging id) is recorded in both the proposal and the append-only "
+        "audit log, keyed by a uuid. --verify-staged checks the file against the AUDIT copy, so "
+        "rewriting the proposal and its own digest together is caught, two anchors for one id is "
+        "caught, and a missing digest/anchor fails closed. Resolved-path self-protection denies "
+        "agent writes into the staged and audit dirs however the path is spelled. "
+        "RESIDUAL, and it is not small: every copy lives in the operator's own filesystem, "
+        "written by this same process. A shell-capable agent running as the SAME USER can edit "
+        "the proposal and the audit log without going through any tool this hook sees, and "
+        "nothing in-band detects that. This binding stops a confused or tool-bound agent, not a "
+        "compromised one with a shell. Closing it needs a privilege split this compiler cannot "
+        "make: an append-only or root-owned audit medium, or an out-of-band anchor (show the "
+        "digest to the human at staging time and compare by eye)."),
     "no_impersonation": ("harness", "BOUND-VIA-MATRIX",
         "the external row's DRAFT_ONLY tier already denies direct-send tool patterns at the "
         "harness layer for every cell; capability-layer reinforcement (withhold send scope "

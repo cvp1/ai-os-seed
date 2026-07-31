@@ -606,6 +606,8 @@ def drill_12(m):
                    "'live':[x['subject']+'|'+x['content'] for x in f['live']],"
                    "'ts':{x['subject']:x['ts'] for x in f['live']},"
                    "'ids':{x['subject']:x['id'] for x in f['live']},"
+                   "'pinned_bytes':f['pinned_bytes'],"
+                   "'pin_cap':int(M.DELIVERY_BYTES*M.PIN_DELIVERY_SHARE),"
                    "'alarms':f['alarms']}))" % str(CODE)], env=m.env(h))
         return json.loads(out.stdout)
 
@@ -743,9 +745,53 @@ print(json.dumps({
     unt = fold_of("hostb")
     check("an untrusted-lineage pin does not take effect",
           "lesson/pin-untrusted" not in unt["pinned"], str(unt["pinned"]))
-    check("the pin overlay is applied to exactly the subjects pinned by a "
-          "TRUSTED pin event, and nothing else",
-          set(unt["pinned"]) <= {"lesson/pin-boundary"}, str(unt["pinned"]))
+    # Exact, not `<=`. A subset assertion passes on the empty set and would also
+    # have passed if pin-boundary were still pinned after its retract — it locks
+    # nothing. Everything pinned in this drill has been retracted or refused by
+    # now, so the expected set is empty and saying so is the whole check.
+    check("the pin overlay marks exactly the expected set, no more",
+          unt["pinned"] == [], str(unt["pinned"]))
+
+    # 8. THE CAP IS A GATE, NOT AN ALARM. Pins are uncontested residency and an
+    #    agent can emit one, so the first version's alarm-only bound left an
+    #    unmetered write path into the file every session loads. Flood the tier
+    #    and assert that excess pins are REFUSED, that the refusal is loud, and
+    #    — the security property — that the flood does not displace a boundary
+    #    that was already resident.
+    m.emit("hosta", "--kind", "lesson", "--subject", "lesson/pin-incumbent",
+           "--content", "the boundary that was here first and must stay")
+    m.emit("hosta", "--kind", "pin", "--subject", "lesson/pin-incumbent",
+           "--content", "pinned before the flood")
+    m.fold_all()
+    seated = fold_of("hosta")
+    check("the incumbent boundary is pinned before the flood",
+          "lesson/pin-incumbent" in seated["pinned"], str(seated["pinned"]))
+
+    for i in range(120):
+        m.emit("hosta", "--kind", "lesson", "--subject", f"lesson/pin-flood{i}",
+               "--content", "x" * 200)
+        m.emit("hosta", "--kind", "pin", "--subject", f"lesson/pin-flood{i}",
+               "--content", "an agent pinning its own lesson " + "y" * 100)
+    m.fold_all()
+    flood = fold_of("hosta")
+    check("excess unsigned pins are REFUSED, not merely alarmed about",
+          any("REFUSED" in a for a in flood["alarms"]), str(flood["alarms"])[:400])
+    check("the flood does not displace the incumbent boundary (oldest-first "
+          "admission is the security property)",
+          "lesson/pin-incumbent" in flood["pinned"],
+          str(flood["pinned"])[:300])
+    check("the pinned tier is held under its byte cap",
+          flood["pinned_bytes"] <= flood["pin_cap"],
+          f'{flood["pinned_bytes"]} B vs cap {flood["pin_cap"]} B')
+    check("not every flood pin was admitted",
+          len(flood["pinned"]) < 120, str(len(flood["pinned"])))
+
+    # 9. The pin state is discoverable: PINS.md names the id needed to retract.
+    pins_md = (m.dirs["hosta"] / "views" / "operator" / "PINS.md")
+    check("PINS.md exists and names a pin event id for the operator to retract",
+          pins_md.exists() and "pin id" in pins_md.read_text()
+          and "lesson/pin-incumbent" in pins_md.read_text(),
+          pins_md.read_text()[:200] if pins_md.exists() else "missing")
 
 
 def main():

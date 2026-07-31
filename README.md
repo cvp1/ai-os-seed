@@ -175,9 +175,21 @@ Read it, then before you apply it:
 python3 governance/hooks/profile_gate.py --verify-staged <the-file>.json
 ```
 
-`OK` means the proposal is byte-for-byte what you read. `REFUSED` means it
-changed after it was staged — don't apply it. A file with no digest is also
-refused, because "nothing to check" must never read as "checked."
+`OK` means the proposal is byte-for-byte what you read — checked against the
+audit log, not against the file's own claim about itself. `REFUSED` means it
+changed after staging; don't apply it. Missing digest or missing audit record
+is also `REFUSED`, because "nothing to check" must never read as "checked."
+
+**What this does and doesn't defend against — read this before you rely on
+it.** Both copies live in your filesystem, written by the same process. An
+agent with a *shell* running as *your user* can edit the proposal and the
+audit log without going through any tool the hook sees, and nothing here
+detects that. This stops a confused or tool-bound agent; it does not stop a
+compromised one with shell access. Closing that needs a privilege split the
+seed can't make for you — an append-only or root-owned audit log, or reading
+the digest yourself at staging time. The compile report says the same thing
+in the same words (`BOUND-PARTIAL`), on purpose: a control that overstates
+itself is worse than one you know the edges of.
 
 This exists because of a specific failure that is easy to build by accident:
 an approval prompt that asks for a click, a PIN, or a signature without

