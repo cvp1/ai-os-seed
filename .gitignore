@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+
+# governance runtime state — yours, not ours
+staged/
+audit/
+governance/conformance/RESULTS.md
