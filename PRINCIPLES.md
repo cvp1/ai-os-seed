@@ -84,3 +84,18 @@ covered by a specific convention, reason from here.
     This is why the fleet survives a harness swap the same way it survives a
     connectivity loss: audit + backlog at
     `audits/2026-07-20-harness-portability/BACKLOG.md`.
+
+## Consent
+17. **Show what you're asking to approve.** An approval gate proves only what the
+    human could SEE at the moment they approved. A prompt that asks for a
+    signature, a PIN, a touch, or a click without displaying the thing being
+    approved — the command, the recipient, the diff, the bytes — collects
+    *presence*, not *consent*, and hands whoever chose the content full
+    authority. So: display the artifact in the surface that takes the approval,
+    bind the approval to those exact bytes (a digest, or a signature over
+    content), and make the display the part an agent cannot rewrite. Reading
+    costs the human nothing, which is why there is never a UX argument for
+    skipping it — the seamless version and the safe version are the same
+    version. Origin: 2026-07-31, a signing flow that met "go, PIN, touch"
+    exactly and would have collected a perfect signature on bytes the operator
+    never saw.

@@ -81,22 +81,50 @@ def main():
 
     # Cutover phase 7: on hosts that opted in (.mesh-generated marker in the
     # store), the harness-loaded MEMORY.md is regenerated from this fold.
-    M.write_harness_memory(fold)
+    # Its write gate reports compaction, an unfittable index, or a write
+    # failure; those join the edge-triggered alarm picture below rather than
+    # being printed into the victim session's own context.
+    harness = M.write_harness_memory(fold)
+    alarms.extend(harness.get("alarms", []))
+
+    # One fact, one answer, on both surfaces (Craig's ruling 2026-07-30: "if I
+    # promote it, that must be fact everywhere"). The store's quarantine list is
+    # a projection of this fold, published beside the index by the same writer on
+    # the same timer — so a promotion clears it and an untrusted write adds to it
+    # without anyone maintaining a second list.
+    alarms.extend(M.write_store_quarantine(fold).get("alarms", []))
+
+    # The frontmatter join still needs checking, and this stays DETECTION only:
+    # per-file `lineage:` is a fact with an owner (memory_write.py), and a fold
+    # that silently edited facts to match its own view would be the same mistake
+    # pointed the other way.
+    if M.harness_store():
+        alarms.extend("quarantine drift: " + d
+                      for d in M.store_quarantine_drift(fold))
 
     # Edge trigger: page only when the parked/alarm picture CHANGES.
     edge_f = M.MESH_ROOT / "state" / "alert-edge.json"
+    # Quarantined ids join the edge state by ID, not by count: a promotion and a
+    # fresh untrusted write can cancel out numerically, and "the held-back set
+    # changed" is the thing worth telling the operator about.
     now_state = {"parked": sorted(fold["parked"]), "alarms": sorted(alarms),
                  "problems": sorted(problems),
+                 "quarantined": sorted(e["id"] for e in fold["quarantined"]),
                  "unnormalized": len(fold["unnormalized"])}
     prev = json.loads(edge_f.read_text()) if edge_f.exists() else None
     edge_f.write_text(json.dumps(now_state, indent=1))
 
     changed = prev != now_state
-    if changed and (now_state["parked"] or alarms or problems):
+    if changed and (now_state["parked"] or now_state["quarantined"]
+                    or alarms or problems):
         print(f"FINDINGS: {len(fold['parked'])} parked subject(s), "
+              f"{len(fold['quarantined'])} quarantined, "
               f"{len(alarms)} alarm(s), {len(problems)} log problem(s)")
         for s in fold["parked"]:
             print(f"[PARKED ] {s} — opposing/inconsistent claims; see CONFLICTS.md")
+        for e in fold["quarantined"]:
+            print(f"[QUARANT] {e['subject']} (id {e['id']}) — untrusted lineage, "
+                  f"NOT served; promote with sign.py --promote {e['id']}")
         for a in alarms:
             print(f"[ALARM  ] {a}")
         for p in problems:

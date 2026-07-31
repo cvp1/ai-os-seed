@@ -118,6 +118,15 @@ prohibitions:
       External communication carries a human's deliberate send, or it does
       not go.
     enforce_at: connector
+  - id: informed_approval
+    text: >
+      An approval must show what is being approved, and bind to it. Any
+      surface that asks a human to approve, sign, or apply an action displays
+      that action's content in the same surface, and records a digest of the
+      exact bytes approved. A proposal whose content changed after review is
+      refused, not applied. An approval prompt without a display collects
+      presence, not consent.
+    enforce_at: harness
 
 # --- §5 read scope ----------------------------------------------------
 read_scope:

@@ -143,7 +143,7 @@ refuses to touch a tree that isn't ours.
 
 | Component | What it gives you |
 |---|---|
-| `PRINCIPLES.md` | 15 generative operating principles the rest reasons from |
+| `PRINCIPLES.md` | 17 generative operating principles the rest reasons from |
 | `_lib/` | stdlib-only spine: lock-aware secrets loader, event bus, report builder, import selftest |
 | `keyvault/` | encrypted-at-rest secrets directory (fscrypt on Linux), fail-closed when locked |
 | `scheduler/` | manifest-as-source-of-truth job scheduling on plain crontab (Linux) / launchd (macOS), with drift detection |
@@ -155,11 +155,42 @@ refuses to touch a tree that isn't ours.
 | `skills/status` | one honest screen answering "how is my system doing" — read-only, distrust-green by design |
 | `skills/skill-center` | authoring conventions plus a scaffold/audit tool, for the skills you build |
 | `views/weekly.py` | a weekly `NOW.md` derived from your own run history and git activity — "store facts, derive views," made concrete |
+| `governance/` | a permission matrix your agent is *held to*: policy → compiled hook → a 21-probe conformance suite that makes it refuse on camera |
 
 The last five rows are **the cognitive spine**: the loop that makes this an
 operating system rather than cron with logging. Jobs produce facts, facts
 become memory, memory makes the next session smarter.
 `memory/THE-LOOP.md` maps which piece serves which arrow.
+
+### Approving what the agent can't do alone
+
+Some actions the agent proposes instead of taking — that's the permission
+matrix doing its job. Each one is written to your staged directory as a small
+JSON file holding the **whole** action: the tool, every argument, and a
+digest of those exact bytes.
+
+Read it, then before you apply it:
+
+```sh
+python3 governance/hooks/profile_gate.py --verify-staged <the-file>.json
+```
+
+`OK` means the proposal is byte-for-byte what you read. `REFUSED` means it
+changed after it was staged — don't apply it. A file with no digest is also
+refused, because "nothing to check" must never read as "checked."
+
+This exists because of a specific failure that is easy to build by accident:
+an approval prompt that asks for a click, a PIN, or a signature without
+showing what's being approved. That collects your *presence*, not your
+*consent*, and hands whoever chose the content your authority. Principle 17,
+and the conformance suite proves it — one probe stages a real action, mutates
+it behind your back, and fails if the tamper isn't caught.
+
+Watch the whole matrix refuse, on your own machine:
+
+```sh
+python3 governance/conformance/run_conformance.py   # 21 probes, no network, no API key
+```
 
 ### If you already run AI-OS Core, this is its upgrade
 

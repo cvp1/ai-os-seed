@@ -89,6 +89,10 @@ PROHIBITION_LAYER = {
         "settings — do this by hand until an org-specific allowlist is supplied"),
     "no_self_modification": ("harness", "BOUND",
         "settings.json + hook deny Edit/Write against the governance files themselves (see self-protection block)"),
+    "informed_approval": ("harness", "BOUND",
+        "every STAGE-tier call writes the full action plus an approval_digest over its exact "
+        "bytes (profile_gate.write_staged); --verify-staged re-derives that digest and refuses "
+        "a proposal altered after review, and a proposal with no digest fails closed"),
     "no_impersonation": ("harness", "BOUND-VIA-MATRIX",
         "the external row's DRAFT_ONLY tier already denies direct-send tool patterns at the "
         "harness layer for every cell; capability-layer reinforcement (withhold send scope "

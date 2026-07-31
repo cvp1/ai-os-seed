@@ -18,6 +18,8 @@ cannot manufacture authority.
 """
 import argparse
 import json
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -30,6 +32,54 @@ def append(ev, line):
     with M.repo_lock():
         M.git("add", str(log.relative_to(M.MESH_ROOT)))
         M.git("commit", "-q", "-m", f"sign {ev['kind']} {ev['subject']} {ev['id']}")
+
+
+MEMORY_WRITE = Path(os.path.expanduser(
+    "~/Github/CC/cc-skills/improve/memory_write.py"))
+
+
+def reconcile_store(subject):
+    """After a promotion, make it fact on the STORE surface too (2026-07-30).
+
+    Craig's ruling, in his words: "if I promote it, that must be fact
+    everywhere." Before this, promotion wrote only the mesh — so a memory came
+    out of the mesh quarantine and started being served while its store file
+    still said `lineage: contains-untrusted` and the store's own QUARANTINE.md
+    still listed it. One fact, two surfaces, two different answers.
+
+    The store's per-file `lineage:` is the fact; `memory_write.py retag` owns
+    writing it (a hand edit is blocked by the write guard, and rightly). Note
+    that retag's docstring points at `consolidate.py` to move the index line —
+    that script NO LONGER EXISTS, so nothing has maintained the store's
+    QUARANTINE.md since the fold took over index generation. That file is an
+    orphan holding stale entries; the fold's divergence check (mesh_lib
+    .store_quarantine_drift) is what makes the remaining gap loud instead of
+    silent, and it is Craig's open decision whether that file becomes a
+    fold-derived view or is retired.
+
+    Failure here does NOT fail the promotion: the signed event is already
+    committed and is the authority. But it must be LOUD, because a half-applied
+    promotion is exactly the divergence this function exists to end.
+    """
+    if not subject.startswith("lesson/"):
+        return                      # only lessons have store files
+    slug = subject.split("/", 1)[1]
+    if not (Path(M.store_dir()) / f"{slug}.md").exists():
+        return                      # mesh-only subject; nothing to reconcile
+    if not MEMORY_WRITE.exists():
+        print(f"  STORE NOT RECONCILED: {MEMORY_WRITE} missing — the store copy "
+              f"still reads lineage: contains-untrusted while the mesh serves "
+              f"this fact. Retag it by hand-equivalent tooling.", file=sys.stderr)
+        return
+    r = subprocess.run([sys.executable, str(MEMORY_WRITE), "retag", slug,
+                        "--lineage", "craig-direct", "--commit"],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode == 0:
+        print(f"  store reconciled: {slug} -> lineage: craig-direct")
+    else:
+        print(f"  STORE NOT RECONCILED for {slug} (the signed event stands and "
+              f"is authoritative, but the store copy still says "
+              f"contains-untrusted):\n{r.stdout}{r.stderr}", file=sys.stderr)
 
 
 def main():
@@ -54,9 +104,18 @@ def main():
         prop = next((e for e in events if e["id"] == args.promote), None)
         if prop is None:
             sys.exit(f"sign: no event {args.promote!r} found")
-        if prop["kind"] != "propose-correct":
-            sys.exit(f"sign: {args.promote} is kind={prop['kind']}, not propose-correct "
-                     f"(only proposals are promoted; write others explicitly)")
+        # Two things are promotable, and for the same reason: both are claims
+        # this fold deliberately refuses to serve until the operator's key says
+        # otherwise. A proposal (an agent's suggested correction) and a
+        # quarantined fact (lineage contains-untrusted — written while working on
+        # ingested content) are the same shape of withheld authority.
+        promotable = (prop["kind"] == "propose-correct"
+                      or prop.get("lineage") == "contains-untrusted")
+        if not promotable:
+            sys.exit(f"sign: {args.promote} is kind={prop['kind']} / "
+                     f"lineage={prop.get('lineage')!r} — only proposals and "
+                     f"quarantined (contains-untrusted) events are promoted; "
+                     f"write others explicitly with --subject/--content")
         subject = subject or prop["subject"]
         content = content or prop["content"]
         home = home or prop.get("home")
@@ -67,6 +126,23 @@ def main():
         parked = fold["parked"].get(subject, [])
         supersedes = sorted({args.promote, *supersedes,
                              *(e["id"] for e in parked)})
+        # A promotion must not SILENTLY overwrite a fact already being served.
+        # Superseding the parked set clears a conflict the operator is already
+        # looking at; reaching past that into live truth is a different act, and
+        # it needs to be named on the command line. Left unsaid, the fold's own
+        # lesson rule parks the subject — loud, and recoverable — rather than the
+        # newer claim quietly winning.
+        clash = [e for e in fold["live"]
+                 if e["subject"] == subject and e["content"] != content
+                 and e["id"] not in supersedes]
+        for e in clash:
+            print(f"  WARNING: {e['id']} is SERVED on {subject} with different "
+                  f"content and is NOT being superseded:\n"
+                  f"    served:   {e['content'][:120]}\n"
+                  f"    promoting:{content[:120]}\n"
+                  f"  the fold will PARK this subject. Re-run with "
+                  f"--supersedes {e['id']} if you mean to replace it.",
+                  file=sys.stderr)
 
     if not subject or not content:
         sys.exit("sign: --subject and --content required (or --promote)")
@@ -84,6 +160,8 @@ def main():
     print(f"signed {ev['id']} ({subject}) by {args.signer}")
     if supersedes:
         print(f"  supersedes: {', '.join(supersedes)}")
+    if args.promote:
+        reconcile_store(subject)
     return 0
 
 

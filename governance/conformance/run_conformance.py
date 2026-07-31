@@ -4,8 +4,8 @@
     run_conformance.py                 # mechanical mode: fast, deterministic, CI-able
     run_conformance.py --live          # witnessed mode: drives a REAL claude -p session
 
-Mechanical mode drives every probe in the fixed 20-probe roster (12 cell +
-5 prohibition + 3 dynamic) through gate_sandbox.py — no live Claude Code
+Mechanical mode drives every probe in the fixed 21-probe roster (12 cell +
+6 prohibition + 3 dynamic) through gate_sandbox.py — no live Claude Code
 session needed. This is what CI runs and what a hand-loosened deny gets
 caught by.
 
@@ -48,18 +48,20 @@ from probes.cell_probes import make_cell_probes  # noqa: E402
 from probes import (  # noqa: E402
     secrets_probe, mfa_probe, egress_probe, self_modification_probe, impersonation_probe,
     delegation_probe, budget_flip_probe, fail_closed_probe,
+    informed_approval_probe,
 )
 
 PROHIBITION_PROBES = [
     secrets_probe.PROBE, mfa_probe.PROBE, egress_probe.PROBE,
     self_modification_probe.PROBE, impersonation_probe.PROBE,
+    informed_approval_probe.PROBE,
 ]
 DYNAMIC_PROBES = [delegation_probe.PROBE, budget_flip_probe.PROBE, fail_closed_probe.PROBE]
 
 
 def build_roster():
     roster = make_cell_probes() + PROHIBITION_PROBES + DYNAMIC_PROBES
-    assert len(roster) == 20, f"fixed roster must be 20 probes, got {len(roster)}"
+    assert len(roster) == 21, f"fixed roster must be 21 probes, got {len(roster)}"
     return roster
 
 

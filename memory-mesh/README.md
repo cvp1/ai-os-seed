@@ -35,7 +35,7 @@ v1.7 (Grok review 4, priorities 1+2): lessons chain by explicit `supersedes`
 tails are healed on append instead of eating the next event.
 Pending: 5 only (compaction+checkpoints — logs are years from the size cap).
 
-## Signing (v1.3)
+## Signing (v1.5)
 
 Signed events are the only truth the fold defends: any unsigned event
 disagreeing with a signed one on the same subject PARKS and ALARMS. Signing
@@ -52,6 +52,22 @@ vault, so signing requires Craig at a terminal — that passphrase IS the
 authority boundary. Agents may emit `propose-correct` events; only
 `sign.py --promote` turns one into truth, and promotion supersedes every live
 claim on that subject, so one operator act clears a whole park.
+
+**Never load this key into ssh-agent.** `ssh-keygen -Y sign` will use a loaded
+agent identity on its own, so an agent-held key makes every sentence above
+false — any local process can then mint Craig's authority, here and on the
+fleet bus (`cc-handoff/sign_task.py` uses the same key file). v1.4 did exactly
+this, deliberately, to spare Craig a passphrase per event; the premise was
+wrong — `sign_event` has one caller, no scheduled job, and 3 signed events in
+157. The cost was real: on 2026-07-30 a production deploy was signed with no
+human in the loop. v1.5 strips `SSH_AUTH_SOCK` at both call sites, so signing
+is interactive or it fails. If you find yourself wanting the agent back, the
+frequency problem it solved does not exist — check the numbers first.
+
+Drilled: drill 11 stands up a real agent holding a real passphrase-protected
+key and proves unattended signing is refused — the earlier suite could not
+have caught the v1.4 drift, because its fixture key has no passphrase and so
+never exercises the agent path at all.
 
 Verified at fold on every host independently (a forged `sig` string is caught
 everywhere, not trusted because it looks signed) and drilled: drill 6 proves

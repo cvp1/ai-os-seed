@@ -139,13 +139,61 @@ def write_staged(staged_dir: Path, tool_name: str, tool_input: dict, note: str) 
         "tool_name": tool_name,
         "tool_input": tool_input,
         "note": note,
+        # Principle 17 (informed approval). A staged call is a CONSENT SURFACE:
+        # the human reads this file and then acts on it. Two failure modes it
+        # has to survive, and neither is exotic --
+        #   1. the human applies it without reading it, and
+        #   2. the file changes between the read and the apply.
+        # (2) is the dangerous one: an agent that can write staged_dir can
+        # rewrite a proposal AFTER review, and the human then applies bytes
+        # nobody approved. Content alone doesn't fix that -- the approval has
+        # to BIND to specific bytes. approval_digest is that binding; the
+        # human (or a wrapper) re-derives it at apply time and refuses on
+        # mismatch. See verify_staged().
+        "approval_digest": approval_digest(tool_name, tool_input),
         "apply_instruction": (
             f"Review this staged {tool_name} call, then run/apply it yourself "
-            f"(this is a PROPOSE-tier action — the agent may not execute it directly)."
+            f"(this is a PROPOSE-tier action — the agent may not execute it directly). "
+            f"Before applying, confirm the file still matches what you read: "
+            f"`profile_gate.py --verify-staged {path.name}`. A mismatch means the "
+            f"proposal changed after you reviewed it — do not apply it."
         ),
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     return path
+
+
+def approval_digest(tool_name: str, tool_input: dict) -> str:
+    """Bind an approval to exact bytes.
+
+    Canonical JSON (sorted keys, no incidental whitespace) so the digest is
+    stable across re-serialization -- otherwise a formatting change would read
+    as tampering and train people to ignore the check, which is worse than not
+    having it."""
+    canonical = json.dumps({"tool_name": tool_name, "tool_input": tool_input},
+                            sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_staged(path: Path):
+    """Re-derive the digest of a staged proposal. Returns (ok, message).
+
+    Fails CLOSED on a missing digest: a staged file with no approval_digest is
+    either pre-Principle-17 or has had the field stripped, and 'no binding' must
+    never read as 'binding satisfied'."""
+    try:
+        payload = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as exc:
+        return False, f"unreadable staged proposal: {exc}"
+    recorded = payload.get("approval_digest")
+    if not recorded:
+        return False, ("no approval_digest — this proposal is not bound to its "
+                        "content and cannot be verified. Re-stage it.")
+    actual = approval_digest(payload.get("tool_name", ""), payload.get("tool_input", {}) or {})
+    if actual != recorded:
+        return False, ("CONTENT CHANGED after staging — the proposal you are "
+                        "about to apply is not the one that was recorded. Do not apply.")
+    return True, "unchanged since staging"
 
 
 def decide(event: dict, classification: dict, staged_dir: Path, audit_dir: Path, call_cost: float):
@@ -245,6 +293,26 @@ def emit(decision: str, reason: str):
 
 
 def main():
+    # --verify-staged runs BEFORE the stdin read: it's a human-facing check
+    # invoked from a terminal, not a hook event, and blocking on stdin would
+    # hang it. Exit 1 on mismatch so a wrapper script can gate on it.
+    if len(sys.argv) > 2 and sys.argv[1] == "--verify-staged":
+        # Accept what a human would actually type: an absolute path, a path
+        # relative to the current directory, or a bare filename meaning "the
+        # one in the staged dir". Resolving a relative path against the staged
+        # dir unconditionally broke the documented workflow -- 'staged/x.json'
+        # became '<staged_dir>/staged/x.json' and every verify REFUSED with a
+        # file-not-found, which reads exactly like a tamper alert. A check that
+        # cries tamper when the user merely typed a working path is worse than
+        # no check: it teaches people to ignore it.
+        target = Path(sys.argv[2])
+        if not target.exists():
+            candidate = env_path("SEED_GOVERNANCE_STAGED_DIR", DEFAULT_STAGED_DIR) / target.name
+            if candidate.exists():
+                target = candidate
+        ok, msg = verify_staged(target)
+        print(f"{'OK' if ok else 'REFUSED'}: {target.name} — {msg}")
+        return 0 if ok else 1
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}

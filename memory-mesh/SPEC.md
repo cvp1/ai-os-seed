@@ -107,15 +107,32 @@ Extends the existing sanctioned CLI (the one door; hook-enforced).
    tripwire).
 2. Read all logs **from HEAD blobs**; dedup by id; validate host↔filename,
    subject registry, schema.
-3. Apply supersedes chains; then the **contradiction rule pass**
-   (deterministic, ~200 lines, no LLM):
+3. Apply supersedes chains; **hold back untrusted lineage**; then the
+   **contradiction rule pass** (deterministic, ~200 lines, no LLM):
+   - `lineage: contains-untrusted` → **quarantined**: rendered to
+     `QUARANTINE.md`, never served, and — the ordering matters — held out
+     *before* the rule pass, so an untrusted claim can never park a served
+     fact. If it could, one crafted page would silence any memory just by
+     disagreeing with it. It still **alarms** when it disagrees with served
+     content. Unknown/absent lineage quarantines and alarms.
+     Promotion needs the operator's passphrase-gated key — `sign.py --promote
+     <id>`, or a signature on the event itself. An agent cannot promote.
+     *(Built 2026-07-30. Enforced write-side since Story 029 and ignored here
+     for the whole life of the feature: the first untrusted fact ever written
+     went straight into the always-on index while this document and the
+     write-guard hook both described a QUARANTINE.md that did not exist.)*
    - opposing polarity, same subject → park both
    - >1 live non-identical `assert` on one subject → park all
    - >1 live non-identical `lesson` on one subject → park all (a lesson
      revision must supersede its predecessors — the producer resolves the
      chain automatically; identical restatements collapse to the earliest,
      never park). Lessons obey invariant 4 like everything else.
-   - live event contradicting an operator-**signed** event → park + alert
+   - live event contradicting an operator-**signed** event → park + alert.
+     Compared **across kinds**: until 2026-07-30 this rule only ever compared
+     asserts with asserts and lessons with lessons, so a signed `correct` and
+     an unsigned `lesson` disagreeing on one subject both served silently — and
+     since lessons are 123 of 141 events, the tripwire was blind to the
+     dominant kind. Found by drill 10.
    - `supersedes` pointing at a missing id (compaction bug tripwire) → alarm
 4. Materialize per-audience views (operator sees `operator+shared`; family
    sees `family+shared`):
@@ -124,6 +141,31 @@ Extends the existing sanctioned CLI (the one door; hook-enforced).
      operator-signed → correction-history → breadth (distinct sessions per
      subject; raw recall counts are gameable) → recency last.
    - `CONFLICTS.md` — parked subjects, served only as UNRESOLVED.
+   - `QUARANTINE.md` — untrusted-lineage facts, not served, with the promotion
+     command. Rendered TWICE from one verdict set, exactly as the served index
+     is: once as a mesh view and once into the store beside the harness index.
+     One writer, so they cannot disagree — a rendering, not a duplicate. Slugs
+     and one-line hooks only; bodies never appear in either.
+   - A nonzero quarantine count prints one line in the harness `MEMORY.md`, and
+     quarantined slugs are dropped from the on-demand appendix. **Withheld must
+     never be indistinguishable from absent, and advertising a withheld fact is
+     serving it in the weak sense** — both halves, or the control fails in one
+     direction or the other.
+   - `/recall` serves a TOMBSTONE for a quarantined slug, never the body: it
+     stays retrievable (its one-line description is kept, so a query still finds
+     it and the operator learns it exists) while the prose an attacker controls
+     at length never reaches the context. Guarding the force-loaded index alone
+     is not quarantine — `/recall` is the path an agent uses *deliberately*.
+
+**Lineage epistemology (state it, or the next writer gets it wrong):**
+**events are the fact.** A memory file's `lineage:` frontmatter and every
+`QUARANTINE.md`/index listing are fold PROJECTIONS of the event log.
+`memory_write.py` may set frontmatter only as an optimistic mirror of the event
+it emits in the same breath. A tool that writes frontmatter and skips the event
+leaves the fold blind and the memory served. *(This paragraph exists because a
+2026-07-30 design proposal asserted the opposite — "frontmatter is the fact" —
+and Grok 4.5's review caught that the sentence itself would produce the next
+bypass.)*
    - denial ledger view (review / force-accept queue).
    - `view.version` — sha256 of folded state (the staleness contract).
 5. Edge-triggered: new parks or alarms page via owner-alerts; a no-op fold
@@ -188,6 +230,11 @@ properties (deterministic full-replay consumers, cryptographic history).
    identical `view.version` everywhere.
 6. **Compaction checkpoint:** compact on one host; prove peers verify the
    hash before truncating; corrupt the snapshot; prove alarm.
+7. **Lineage quarantine:** emit an untrusted-lineage fact that contradicts a
+   served one; prove it is absent from `INDEX.md`, present in `QUARANTINE.md`,
+   cannot park the subject it contradicts, still alarms — then promote it with
+   the key and prove it serves fleet-wide, and that promoting *over* a served
+   fact warns and parks rather than winning quietly. (`drill.py 10`.)
 
 ## Build order
 
