@@ -216,8 +216,17 @@ def enable_governance(target: Path):
         return 0
     src = HERE / "governance"
     if not src.exists():
-        return die(f"this clone is incomplete (missing governance/) — re-clone rather than "
-                   f"installing from a partial tree.")
+        # WITHHELD 2026-07-31, not missing. Distinguish the two: the old message
+        # here told the user their clone was incomplete and to re-clone, which
+        # would send them round a loop that can never succeed against a build
+        # that deliberately doesn't carry this tree.
+        return die("governance/ is withheld in this release — your clone is fine.\n"
+                    "The informed-approval control was unsound (an allowed Bash call "
+                    "could rewrite a staged proposal and its audit anchor while the "
+                    "verifier still reported it unchanged), so the layer is held back "
+                    "rather than shipped reading stronger than it is.\n"
+                    "Principle 17 in PRINCIPLES.md still stands — the doctrine was "
+                    "right, the enforcement was not.")
     shutil.copytree(src, dest)
     print(f"governance/ copied to {dest}")
     print("next: run the governance phase's validate/compile/consent/conformance steps "
