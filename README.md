@@ -138,6 +138,20 @@ De-schedules the jobs, then removes only what the seed added. In a
 workspace it joined, everything of yours stays exactly where it was. It
 refuses to touch a tree that isn't ours.
 
+**The mesh is not covered by it.** If you ran the Phase 5 bootstrap,
+`--uninstall` removes `memory-mesh/` but leaves the two timers it
+installed and your event log — so clean those up by hand, in this order:
+
+    # Linux
+    systemctl --user disable --now memory-fold.timer memory-home-watch.timer
+    rm ~/.config/systemd/user/memory-{fold,home-watch}.{service,timer}
+    # macOS
+    launchctl unload ~/Library/LaunchAgents/local.memory-{fold,home-watch}.plist
+    rm ~/Library/LaunchAgents/local.memory-{fold,home-watch}.plist
+
+`~/memory-events` is left alone on purpose — it's your memory, not the
+seed's, and deleting it is your call.
+
 ---
 
 ## What you get
