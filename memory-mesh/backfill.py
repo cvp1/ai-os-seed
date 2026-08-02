@@ -31,11 +31,51 @@ INDEX = M.store_dir() / "MEMORY.md"
 LINE = re.compile(r"^- \[(?P<title>[^\]]+)\]\((?P<slug>[a-z0-9-]+)\.md\)\s+—\s+(?P<hook>.+)$")
 
 
+FRONT_DESC = re.compile(r"^description:\s*(.*)$", re.M)
+
+
+def compose_content(slug, title, hook):
+    """Event content for a migrated memory: (content, note) or (None, reason).
+
+    Sources the memory file's `description:` — the LOSSLESS field — not the
+    legacy index `hook`. The hook is a cache of the description that a pre-mesh
+    authoring loop truncated to fit a row; migrating it made the derivative
+    canonical and the tail unrecoverable
+    ([[rendering-is-not-a-duplicate-when-one-writer]] cuts the other way here:
+    the derivative had a SECOND writer, the truncator).
+
+    Three guards, all of which exist because the old line had none:
+    - the `"{title}: "` prefix is dropped; it restated the slug the row already
+      prints in brackets, and it spent that restatement out of the same budget
+      the tail was cut from;
+    - `description:` is collapsed to one line — it is file-local metadata and
+      was never specified to be a single-line index clause, so it may carry
+      newlines or markdown this channel cannot hold;
+    - a missing/empty description is REFUSED, never silently backfilled from the
+      stumped hook. A fallback here would re-canonise the exact garbage this
+      function exists to stop.
+    """
+    f = M.store_dir() / f"{slug}.md"
+    if not f.exists():
+        return None, "no store file"
+    m = FRONT_DESC.search(f.read_text(encoding="utf-8"))
+    if not m:
+        return None, "no description: in frontmatter"
+    desc = " ".join(m.group(1).strip().strip('"').split())
+    if not desc:
+        return None, "empty description:"
+    reject = M.admission_reject(desc)
+    if reject:
+        return None, reject
+    return desc, ("unchanged" if desc == hook else
+                  f"{len(desc) - len(hook):+d} chars vs legacy hook")
+
+
 def main():
     apply = "--commit" in sys.argv
     events, _ = M.read_all_events()
     have = {e["subject"] for e in events if e["kind"] == "lesson"}
-    todo = []
+    todo, refused = [], []
     for line in INDEX.read_text().splitlines():
         m = LINE.match(line.strip())
         if not m:
@@ -43,7 +83,9 @@ def main():
         subj = f"lesson/{m['slug']}"
         if subj in have:
             continue
-        todo.append((subj, f"{m['title']}: {m['hook']}"[:900]))
+        content, why = compose_content(m["slug"], m["title"], m["hook"])
+        (todo if content else refused).append(
+            (subj, content or m["hook"], why))
     ondemand = []
     seen_ex = set()
     exclude = INDEX.parent / "_index-exclude.txt"
@@ -61,12 +103,20 @@ def main():
     print(f"{len(todo)} index entries to backfill "
           f"({len(have)} lesson subjects already in the mesh); "
           f"{len(ondemand)} on-demand slugs to preserve in the exclude manifest")
+    # The expansion is the point, so SHOW it: "migrated N" reads identically
+    # whether the migration was faithful or lossy, which is how the last one
+    # passed unnoticed ([[check-the-delivery-not-just-the-doing]]).
+    if refused:
+        print(f"REFUSED {len(refused)} — not migrated, and NOT backfilled from "
+              f"the legacy hook (a stump is not a memory):")
+        for s, _, why in refused:
+            print(f"  ! {s} — {why}")
     if not apply:
-        for s, c in todo[:8]:
-            print(f"  {s} — {c[:80]}")
+        for s, c, why in todo[:8]:
+            print(f"  {s} [{why}] — {c[:80]}")
         print("(dry run — pass --commit)")
         return 0
-    for subj, content in todo:
+    for subj, content, _ in todo:
         ev, line = M.make_event("lesson", subj, content,
                                 session="backfill-2026-07-27",
                                 lineage="operator-direct",

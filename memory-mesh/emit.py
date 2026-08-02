@@ -11,6 +11,7 @@ operator corrections (SPEC Kafka-gap row 1). Nudge is garnish, never
 load-bearing.
 """
 import argparse
+import json
 import subprocess
 import sys
 import time
@@ -40,10 +41,35 @@ def main():
                          "(a local fold pass) and supersede them all — the "
                          "retract/replace path for lessons, where the caller "
                          "knows the subject but not the event ids")
+    ap.add_argument("--residency", choices=sorted(M.RESIDENCIES),
+                    help="SPEC v4 tier. Omit while a memory's residency is "
+                         "undeclared — the renderer then treats it exactly as "
+                         "v3 did. doctrine/pinned require an operator "
+                         "signature to hold across the mesh; unsigned events "
+                         "are READ as state (mesh_lib.effective_residency).")
+    ap.add_argument("--hook", help="SPEC v4: the served index line, <=140 chars")
+    ap.add_argument("--body", help="SPEC v4: the full memory body (the fact)")
+    ap.add_argument("--body-file", help="read --body from a file")
+    ap.add_argument("--expires", metavar="YYYY-MM-DD",
+                    help="state rows only: render-hide after this date")
     ap.add_argument("--pin", action="store_true")
     ap.add_argument("--sync", action="store_true",
                     help="block until one peer confirms replication (bounded)")
     ap.add_argument("--no-nudge", action="store_true")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="VALIDATE and print the event; write nothing. Until "
+                         "this existed the only way to find out whether an "
+                         "event would be accepted was to create it, so "
+                         "diagnosing a refusal meant polluting the log — which "
+                         "is exactly how a junk 'probe' event reached the live "
+                         "log on 2026-07-31 and had to be retracted. A log "
+                         "whose only test is a real write has no test.")
+    ap.add_argument("--carry-forward", action="store_true",
+                    help="re-emit an EXISTING event's content verbatim "
+                         "(lineage/retag work), bypassing the admission gate "
+                         "that refuses stumped or over-length lesson content. "
+                         "Perpetuating a legacy stump adds no new loss; "
+                         "minting one does — never use this for new content.")
     args = ap.parse_args()
 
     # Fact-shape gate at the producer: a lesson carrying infrastructure
@@ -51,6 +77,51 @@ def main():
     if args.kind == "lesson" and FACT_RX.search(args.content) and not args.home:
         sys.exit("emit: lesson carries fact literals but no --home pointer — "
                  "put the fact in its home first, then point at it")
+
+    body = args.body
+    if args.body_file:
+        if body:
+            sys.exit("emit: pass --body or --body-file, not both")
+        body = Path(args.body_file).read_text(encoding="utf-8")
+    hook = args.hook
+    if hook is not None and len(hook) > M.HOOK_MAX_CHARS:
+        # Refuse, never truncate (SPEC v4 A4). A machine-shortened hook is a
+        # rule with its qualifier cut off, and this one is the line the agent
+        # actually reads every session — degrading it silently is how a bounded
+        # rule becomes a wrong rule.
+        sys.exit(f"emit: --hook is {len(hook)} chars, over the "
+                 f"{M.HOOK_MAX_CHARS} limit — rewrite it shorter; it is the "
+                 "line every session reads")
+    # Audience confidentiality under body-in-event (SPEC v4 A2): bodies ride
+    # the fleet git transport, so only fleet-visible audiences may carry one.
+    # family/host-private memories emit hook-only and keep the body local —
+    # render-time filtering is not confidentiality.
+    if body is not None and args.audience not in M.BODY_AUDIENCES:
+        sys.exit(f"emit: audience {args.audience!r} may not carry a body — "
+                 "bodies replicate to every peer host. Emit hook-only and "
+                 "keep the body in the local store.")
+    # SPEC v4: close the ghost hole. A lesson event with NO body and NO store
+    # file behind it renders an always-on index row that /recall cannot serve —
+    # measured 2026-07-31: 11 such rows, 2,825 B, invisible to an exact-title
+    # query. The ghosts came from agents invoking this producer directly, so the
+    # gate belongs here rather than in any one caller.
+    #
+    # This cannot cause amnesia: BOTH escapes keep the lesson. Carry --body (the
+    # event is then self-sufficient and the fold projects the file), or write
+    # through memory_write, which creates the file and emits in one locked step.
+    #
+    # Resolved through harness_store(), which carries the SANDBOX GUARD: a
+    # drill or replay pointed at a throwaway event log gets None and the gate
+    # stands down. Hardcoding the operator's store path here would have made
+    # every sandbox consult — and be judged against — the real brain, which is
+    # the same class of bug that guard was written for.
+    ghost = M.ghost_refusal_reason(args.kind, args.subject, body,
+                                   M.harness_store())
+    if ghost:
+        sys.exit("emit: " + ghost)
+    if args.expires and args.residency == "pinned":
+        sys.exit("emit: a pinned memory may not carry --expires — expiry is "
+                 "for state rows; pinned is the tier that never lapses")
 
     supersedes = [s for s in (args.supersedes or "").split(",") if s] or None
     if args.supersedes_live_on:
@@ -78,7 +149,20 @@ def main():
         args.kind, args.subject, args.content, session=args.session,
         polarity=args.polarity, home=args.home, lineage=args.lineage,
         audience=args.audience, confidence=args.confidence,
-        supersedes=supersedes, pin=args.pin)
+        supersedes=supersedes, pin=args.pin, residency=args.residency,
+        hook=hook, body=body, expires=args.expires,
+        carry_forward=args.carry_forward)
+
+    # Everything above is validation — make_event raises on a refused admission,
+    # a bad schema or an oversized event, so reaching here means this event WOULD
+    # be accepted. That is the whole answer a diagnosis needs, and it is now
+    # available without a write. Placed before repo_lock so a dry run takes no
+    # lock and cannot block a concurrent writer.
+    if args.dry_run:
+        print(json.dumps(ev, ensure_ascii=False, indent=1))
+        print(f"dry-run: VALID — {len(line.encode())} B, would append to "
+              f"{M.HOST}.ndjson as {ev['id']}. Nothing written.", file=sys.stderr)
+        return 0
 
     # One write() of one line — a torn append is a torn LINE, which the fold
     # holds out as unparseable rather than corrupting neighbors (drill 3).

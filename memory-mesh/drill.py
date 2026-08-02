@@ -18,6 +18,13 @@ from pathlib import Path
 
 CODE = Path(__file__).resolve().parent
 FAILS = []
+# A skipped drill is an UNMET PROOF OBLIGATION, not a pass. Drills 6 and 11 —
+# the two that prove signature authority, i.e. that an agent cannot sign as
+# Craig — return early when signing or ssh-agent is unavailable. They did so
+# silently, and main() then printed "all selected drills pass": on a host with a
+# broken signing environment the suite reported green precisely where its most
+# security-relevant proof had not run. Found by an outside review, 2026-07-31.
+SKIPS = []
 
 
 def check(name, cond, detail=""):
@@ -25,6 +32,12 @@ def check(name, cond, detail=""):
     print(f"  {tag}: {name}" + ("" if cond else f" — {detail}"))
     if not cond:
         FAILS.append(name)
+
+
+def skip(name, why):
+    """Record a proof obligation that could not be attempted here."""
+    print(f"  SKIP: {name} — {why}")
+    SKIPS.append(f"{name} ({why})")
 
 
 def run(cmd, env=None, cwd=None, check_rc=True):
@@ -101,9 +114,10 @@ class Mesh:
         pub = (self.root / "drillkey.pub").read_text().strip()
         (self.root / "drill_allowed_signers").write_text(f"craig@fleet {pub}\n")
 
-    def emit(self, h, *args):
+    def emit(self, h, *args, check_rc=True):
         return run([sys.executable, str(CODE / "emit.py"), "--no-nudge",
-                    "--session", f"drill-{h}", *args], env=self.env(h))
+                    "--session", f"drill-{h}", *args], env=self.env(h),
+                   check_rc=check_rc)
 
     def fold(self, h):
         return run([sys.executable, str(CODE / "fold.py")], env=self.env(h))
@@ -221,7 +235,8 @@ def drill_6(m):
              "--home", "SPEC.md", "--polarity", "exists"], env=m.env("hosta"),
             check_rc=False)
     if r.returncode != 0:
-        print(f"  SKIP: signing unavailable ({(r.stderr or r.stdout).strip()[:60]})")
+        skip("drill 6 signed-truth authority",
+             f"signing unavailable ({(r.stderr or r.stdout).strip()[:60]})")
         return
     # An unsigned session on hostb disagrees.
     m.emit("hostb", "--kind", "assert", "--subject", "policy/drill-signed",
@@ -260,7 +275,7 @@ def drill_11(m):
     # agent, must NOT be signable without a human.
     import shutil
     if not shutil.which("ssh-agent"):
-        print("  SKIP: no ssh-agent on this host")
+        skip("drill 11 agent-held key needs a human", "no ssh-agent on this host")
         return
     d = Path(m.root) / "agentprobe"
     d.mkdir(exist_ok=True)
@@ -290,7 +305,8 @@ def drill_11(m):
     out = run(["bash", "-c", script], check_rc=False).stdout.strip()
     vals = dict(p.split("=", 1) for p in out.split() if "=" in p)
     if vals.get("loaded") != "1":
-        print(f"  SKIP: could not load the probe key into an agent ({out})")
+        skip("drill 11 agent-held key needs a human",
+             f"could not load the probe key into an agent ({out})")
         return
     # The control that matters: with the socket stripped, signing must fail
     # even though the agent is running and holds the key.
@@ -794,8 +810,331 @@ print(json.dumps({
           pins_md.read_text()[:200] if pins_md.exists() else "missing")
 
 
+def drill_13(m):
+    """SPEC v4 — residency, projection, and the confidentiality boundary.
+
+    Every check here pairs a REFUSAL with the write that must still succeed:
+    a gate that refuses everything passes a one-sided test while breaking the
+    system, and 'no bad thing happened' is only evidence once the instrument
+    is shown able to let the good thing through.
+    """
+    print("\n== drill 13: SPEC v4 residency + projection ==")
+    sys.path.insert(0, str(CODE))
+    import mesh_lib as M
+
+    # --- the unsigned cap is applied at READ time, not just at write time
+    ev, _ = M.make_event("lesson", "lesson/x", "c", session="s",
+                         residency="doctrine", hook="h", body="b")
+    remote = dict(ev, host="some-other-host")
+    check("13.1 REMOTE unsigned doctrine READS as state",
+          M.effective_residency(remote) == "state", M.effective_residency(remote))
+    check("13.2 and is reported as capped, not silently downgraded",
+          M.residency_capped(remote))
+    check("13.3 POSITIVE CONTROL: LOCAL unsigned doctrine is allowed "
+          "(the local door is the trust boundary)",
+          M.effective_residency(ev) == "doctrine", M.effective_residency(ev))
+    check("13.3b POSITIVE CONTROL: signed remote doctrine travels",
+          M.effective_residency(dict(remote, _signed=True)) == "doctrine")
+    pin_remote = dict(ev, residency="pinned", host="some-other-host")
+    check("13.3c unsigned PINNED caps even locally (signature or nothing)",
+          M.effective_residency(dict(ev, residency="pinned")) == "state"
+          and M.effective_residency(pin_remote) == "state")
+
+    # --- hook bound: refuse, never truncate
+    r = m.emit("hosta", "--kind", "lesson", "--subject", "lesson/hooktest",
+               "--content", "c", "--body", "b", "--hook", "x" * 141,
+               check_rc=False)
+    check("13.4 over-long hook REFUSED (not truncated)",
+          r.returncode != 0 and "over the 140" in (r.stdout + r.stderr))
+    r = m.emit("hosta", "--kind", "lesson", "--subject", "lesson/hooktest",
+               "--content", "c", "--body", "b", "--hook", "x" * 140,
+               check_rc=False)
+    check("13.5 POSITIVE CONTROL: a 140-char hook is accepted",
+          r.returncode == 0, (r.stdout + r.stderr)[:120])
+
+    # --- A2: a family-audience body must never enter the replicated log
+    r = m.emit("hosta", "--kind", "lesson", "--subject", "lesson/privatetest",
+               "--content", "c", "--audience", "family", "--body", "SECRETBODY",
+               "--hook", "h", check_rc=False)
+    check("13.6 family-audience body REFUSED at the producer",
+          r.returncode != 0 and "may not carry a body" in (r.stdout + r.stderr))
+    log = m.dirs["hosta"] / "events" / "hosta.ndjson"
+    blob = log.read_text() if log.exists() else ""
+    check("13.7 and the secret is byte-level absent from the log",
+          "SECRETBODY" not in blob)
+
+    # --- ghost hole. Tested against the DECISION function with a real temp
+    # store: routing this through emit.py would exercise a gate the sandbox
+    # guard has switched off, and pass while proving nothing.
+    gstore = m.root / "store13g"
+    gstore.mkdir()
+    check("13.8 body-less lesson with no store file is refused (ghost)",
+          "GHOST" in (M.ghost_refusal_reason("lesson", "lesson/ghosttest",
+                                             None, gstore) or ""))
+    (gstore / "ghosttest.md").write_text("body lives here")
+    check("13.8b POSITIVE CONTROL: allowed once the store file exists",
+          M.ghost_refusal_reason("lesson", "lesson/ghosttest", None, gstore) is None)
+    check("13.8c POSITIVE CONTROL: allowed when the event carries a body",
+          M.ghost_refusal_reason("lesson", "lesson/other", "b", gstore) is None)
+    check("13.8d sandbox guard: no store resolved => gate stands down",
+          M.ghost_refusal_reason("lesson", "lesson/other", None, None) is None)
+
+    # --- projection asymmetry: create from grandfather, never overwrite
+    store = m.root / "store13"
+    store.mkdir()
+    grand, _ = M.make_event("lesson", "lesson/grand", "grandfathered text",
+                            session="s")
+    withbody, _ = M.make_event("lesson", "lesson/withbody", "desc",
+                               session="s", hook="h", body="BODY-IS-TRUTH")
+    fake = {"live": [grand, withbody], "quarantined": [], "parked": []}
+    keep = store / "grand.md"
+    keep.write_text("A FULL HAND-WRITTEN BODY")
+    out = M.project_store(fake, store, apply=True)
+    check("13.9 grandfathered event does NOT overwrite an existing file",
+          keep.read_text() == "A FULL HAND-WRITTEN BODY", keep.read_text()[:40])
+    check("13.10 POSITIVE CONTROL: body-carrying event DOES create its file",
+          (store / "withbody.md").read_text() == "BODY-IS-TRUTH")
+    # ghost repair: grandfather with NO file becomes a reconstructed stub
+    (store / "grand.md").unlink()
+    out = M.project_store(fake, store, apply=True)
+    check("13.11 grandfathered event with no file IS reconstructed",
+          (store / "grand.md").exists()
+          and M.RECONSTRUCTED_MARK in (store / "grand.md").read_text())
+    # OVERWRITE is the destructive branch, so it needs authority. An unsigned
+    # event must NOT be able to replace a memory's body: that would make "the
+    # event is canonical" a forge primitive (append a lesson on a victim slug,
+    # supersede the priors, wait for --project). Found by Grok's review of the
+    # implementation, 2026-07-31.
+    (store / "withbody.md").write_text("HAND-WRITTEN, NOT THE EVENT")
+    out = M.project_store(fake, store, apply=True)
+    check("13.12 UNSIGNED divergent event does NOT overwrite the file",
+          (store / "withbody.md").read_text() == "HAND-WRITTEN, NOT THE EVENT")
+    check("13.13 and the refusal ALARMS with both resolutions named",
+          any("LEFT ALONE" in a and "adopt" in a for a in out["alarms"]),
+          str(out["alarms"])[:160])
+    # 13.13a — the advice must name a command that EXISTS and ACCEPTS this
+    # case. From 2026-07-31 to 2026-08-01 the alarm told the operator to run
+    # `adopt <slug>`, which refuses any slug whose event already carries a
+    # body — i.e. every divergence it was printed for. Four alarms repeated
+    # every fold with a resolution that could not work, while the only other
+    # path (sign the event) would have overwritten a correction with the stale
+    # text it corrected. An alarm whose remedy is untested is a rumour.
+    _sp = subprocess
+    _mw = Path.home() / "Github/CC/cc-skills/improve/memory_write.py"
+    _advice = next((a for a in out["alarms"] if "LEFT ALONE" in a), "")
+    _flags = [t for t in _advice.split() if t.startswith("--")]
+    _help = _sp.run([sys.executable, str(_mw), "adopt", "--help"],
+                    capture_output=True, text=True, timeout=60).stdout
+    check("13.13a every flag the alarm prescribes is real in `adopt --help`",
+          bool(_flags) and all(f.rstrip(",.") in _help for f in _flags),
+          f"prescribed {_flags}, adopt accepts "
+          f"{[t for t in _help.split() if t.startswith('--')]}")
+    withbody["_signed"] = True
+    out = M.project_store(fake, store, apply=True)
+    check("13.13b POSITIVE CONTROL: a SIGNED tip does repair the file",
+          (store / "withbody.md").read_text() == "BODY-IS-TRUTH")
+    check("13.13c and the repair is alarmed, not silent",
+          any("diverged" in a for a in out["alarms"]))
+    withbody["_signed"] = False
+    # A2 at the projector: a family-audience body must never reach the
+    # operator store even if such an event somehow exists in the log.
+    leak = dict(withbody, subject="lesson/leaky", audience="family",
+                body="PRIVATE")
+    out = M.project_store({"live": [leak]}, store, apply=True)
+    check("13.16 projector REFUSES a body from a non-fleet audience",
+          not (store / "leaky.md").exists()
+          and any("refusing to project a body" in a for a in out["alarms"]))
+    # path safety: a subject is a slug, but this is where it becomes a path
+    esc = dict(withbody, subject="lesson/../escaped", body="X")
+    out = M.project_store({"live": [esc]}, store, apply=True)
+    check("13.17 projector REFUSES a slug that would escape the store",
+          not (store.parent / "escaped.md").exists()
+          and any("unsafe slug" in a for a in out["alarms"]))
+    (store / "orphan.md").write_text("keep me")
+    out = M.project_store(fake, store, apply=True)
+    check("13.14 projection NEVER deletes a file with no event",
+          (store / "orphan.md").exists()
+          and (store / "orphan.md").read_text() == "keep me")
+    check("13.15 the orphan is REPORTED as an inverse ghost, not removed",
+          "orphan" in out["inverse_ghosts"], str(out["inverse_ghosts"]))
+
+
+def drill_14(m):
+    """The residency gate and the admission gate — both halves, both directions.
+
+    A gate is only evidence when it is shown REFUSING the bad case AND passing
+    the good one; each check here is paired for that reason.
+    """
+    print("\n== drill 14: residency gate + admission gate ==")
+    sys.path.insert(0, str(CODE))
+    import mesh_lib as M
+
+    live = Path(m.root) / "MEMORY.md"
+    live.write_text("# h\n- [lesson/a] one\n- [lesson/b] two\n")
+    same = "# h\n- [lesson/a] one\n- [lesson/b] two\n"
+    check("14.1 identical row set is NOT a residency delta",
+          M.residency_delta(live, same) is None)
+    check("14.2 reworded row is NOT a residency delta (else the gate is routine)",
+          M.residency_delta(live, same.replace("one", "REWORDED")) is None)
+    check("14.3 an ADDED row is a residency delta",
+          (M.residency_delta(live, same + "- [lesson/c] three\n") or {}
+           ).get("added") == ["lesson/c"])
+    check("14.4 a DROPPED row is a residency delta",
+          (M.residency_delta(live, "# h\n- [lesson/a] one\n") or {}
+           ).get("dropped") == ["lesson/b"])
+    check("14.5 a fresh host with no live index is not blocked",
+          M.residency_delta(Path(m.root) / "absent.md", same) is None)
+
+    # --- admission: the refusals, and the write that must still get through
+    check("14.6 a rule that fits is ADMITTED",
+          M.admission_reject("a rule short enough to bind") is None)
+    check("14.7 content trailing off mid-sentence is REFUSED",
+          M.admission_reject("a rule that runs out of…") is not None)
+    check("14.8 ASCII ellipsis is refused too (the stumps used both)",
+          M.admission_reject("a rule that runs out of...") is not None)
+    check("14.9 content over the renderer's cut is REFUSED, not silently cut",
+          M.admission_reject("x" * (M.INDEX_CONTENT_CHARS + 1)) is not None)
+    check("14.10 content exactly at the cut is admitted (off-by-one)",
+          M.admission_reject("x" * M.INDEX_CONTENT_CHARS) is None)
+    check("14.11 empty content is REFUSED", M.admission_reject("") is not None)
+
+    # --- the producer gate at the funnel: refusal, carve-out, and scope
+    def _mk(content, **kw):
+        try:
+            M.make_event("lesson", "lesson/t", content, session="s", **kw)
+            return "made"
+        except ValueError:
+            return "refused"
+    check("14.12 make_event REFUSES a stumped lesson", _mk("trails off…") == "refused")
+    check("14.13 carry_forward=True re-emits a legacy stump (retag carve-out)",
+          _mk("trails off…", carry_forward=True) == "made")
+    check("14.14 clean lesson content still passes the funnel",
+          _mk("a rule short enough to bind") == "made")
+    check("14.15 non-lesson kinds are NOT gated (state/correct flow free)",
+          (lambda: (M.make_event("assert", "s/t", "x" * 300, session="s",
+                                 home="FLEET.md") and True))() is True)
+
+    # --- projection drift: all three classes, and the clean case
+    droot = Path(m.root) / "dstore"; droot.mkdir()
+    def _mem(slug, desc):
+        (droot / f"{slug}.md").write_text(
+            f"---\nname: {slug}\ndescription: {desc}\n---\nbody\n")
+    _mem("clean", "same essence")
+    _mem("richer", "Short stump plus the tail the derivative lost")
+    _mem("poorer", "Short")
+    _mem("forked", "an entirely different story")
+    fake = {"live": [
+        {"kind": "lesson", "subject": "lesson/clean", "content": "same essence"},
+        {"kind": "lesson", "subject": "lesson/richer", "content": "Richer: Short stump…"},
+        {"kind": "lesson", "subject": "lesson/poorer", "content": "Short plus more than the file has"},
+        {"kind": "lesson", "subject": "lesson/forked", "content": "the event's own tale"},
+        {"kind": "lesson", "subject": "lesson/v4", "content": "stump…", "body": "full"},
+        {"kind": "lesson", "subject": "lesson/ghost", "content": "no file at all"},
+    ]}
+    d = M.projection_drift(fake, droot)
+    check("14.16 identical essence is NOT drift", "lesson/clean" not in sum(d.values(), []))
+    check("14.17 file extending the event = FILE-RICHER (even past a Title: head)",
+          d["file_richer"] == ["lesson/richer"])
+    check("14.18 event extending the file = EVENT-RICHER",
+          d["event_richer"] == ["lesson/poorer"])
+    check("14.19 two stories = DISJOINT", d["disjoint"] == ["lesson/forked"])
+    check("14.20 v4 body-carrying tips are exempt (projection repairs those)",
+          "lesson/v4" not in sum(d.values(), []))
+    check("14.21 a missing file is the ghost repair's problem, not drift",
+          "lesson/ghost" not in sum(d.values(), []))
+
+    # --- the claim made to the operator 2026-07-31 and then corrected: verify
+    # the CORRECTED version stays true. project_store must never replace an
+    # existing file from a grandfathered (body-less) event — that file may be
+    # the only lossless copy ([[assert-every-promise-not-the-convenient-one]]).
+    before = (droot / "richer.md").read_text()
+    M.project_store({"live": [{"kind": "lesson", "subject": "lesson/richer",
+                               "content": "Richer: Short stump…", "id": "x",
+                               "ts": "2026-07-31T00:00:00Z"}]}, droot, apply=True)
+    check("14.22 projection leaves a grandfathered tip's existing file ALONE",
+          (droot / "richer.md").read_text() == before)
+
+
+def drill_15(m):
+    """The DELIVERY seam: what retrieval actually serves.
+
+    Every other drill stops at the fold's verdict. This one runs the production
+    consumer, because the verdict being right is not the property that matters —
+    the property is that nothing the fold retired reaches a turn.
+
+    That gap was not hypothetical. Until 2026-07-31 `retrieve.py` globbed the
+    store and consulted no lifecycle state at all: quarantined untrusted-lineage
+    facts and superseded doctrine both rode in labelled "STANDING RULES", and a
+    live session was served a quarantined subject while reviewing this very
+    system. Every drill passed throughout, because `grep -c retrieve drill.py`
+    was 0 — the suite proved the fold and never proved the delivery.
+
+    Deliberately NOT using Mesh.env: those subprocesses get a temp MESH_ROOT so
+    `harness_store()` returns None and the real store is unreachable by
+    construction. That sandbox guard is correct, and it is also exactly why this
+    seam was untestable. So the store is passed in directly instead.
+    """
+    print("drill 15 — retrieval serves ONLY what the fold still stands behind")
+    sys.path.insert(0, str(CODE))
+    import retrieve as R
+
+    droot = Path(m.root) / "store15"
+    droot.mkdir(exist_ok=True)
+    body = ("---\nname: {n}\ndescription: {d}\n---\n\n{d}\n")
+    # Same distinctive term in all four, so scoring cannot be what separates
+    # them — only the manifest can. Without this the test could pass by luck.
+    TERM = "zorbfeed"
+    for name, desc in [
+            ("live-rule", f"{TERM} handling is governed by this live rule"),
+            ("quarantined-rule", f"{TERM} handling per an untrusted ingested page"),
+            ("superseded-rule", f"{TERM} handling by a rule that was corrected"),
+            ("parked-rule", f"{TERM} handling, contradicted and parked")]:
+        (droot / f"{name}.md").write_text(body.format(n=name, d=desc))
+
+    # The manifest the fold would publish: only the live subject survives.
+    # Passed EXPLICITLY: `servable()` must not fall back to the host's real
+    # manifest, or 15.6 would pass for the wrong reason (this query matches
+    # nothing in the real corpus either, so "empty" would prove nothing).
+    man = droot / "servable.json"
+    man.write_text(json.dumps(
+        {"version": 1, "view_version": "drill", "generated": "2026-07-31T00:00:00Z",
+         "slugs": ["live-rule"]}))
+
+    hits = R.retrieve(f"how should I handle {TERM} today", store=droot, k=5,
+                      manifest=man)
+    slugs = {s for _, s, _ in hits}
+    check("15.1 the live rule IS served (positive control)", "live-rule" in slugs,
+          f"got {slugs}")
+    check("15.2 a QUARANTINED rule is never served", "quarantined-rule" not in slugs,
+          f"got {slugs}")
+    check("15.3 a SUPERSEDED rule is never served", "superseded-rule" not in slugs,
+          f"got {slugs}")
+    check("15.4 a PARKED rule is never served", "parked-rule" not in slugs,
+          f"got {slugs}")
+
+    # Held-out docs must not reach the SCORER either: idf is computed over the
+    # corpus, so a doc that is merely dropped at render time still perturbs
+    # ranking and can displace a legitimate hit without ever appearing.
+    docs = R.corpus(droot, R.servable(path=man))
+    check("15.5 held-out docs are absent from the scored corpus",
+          {d[0] for d in docs} == {"live-rule"}, f"got {[d[0] for d in docs]}")
+
+    # No manifest => the fold's verdict is UNKNOWN. Serving unfiltered is the
+    # defect this drill exists to prevent, so the closed direction is the safe
+    # one here — unlike the module's outer exception handler, which fails open.
+    man.unlink()
+    check("15.6 a MISSING manifest suppresses recall (fails closed)",
+          R.retrieve(f"how should I handle {TERM} today", store=droot, k=5,
+                     manifest=man) == [])
+
+    # And the suppression must be legible: a silently-empty channel and a
+    # deliberately-withheld one must not look identical.
+    check("15.7 suppression is advertised, not silent",
+          R.servable(path=man) is None)
+
+
 def main():
-    sel = sys.argv[1:] or ["1", "2", "3", "5", "7", "8", "9", "10", "11", "12", "6", "4"]  # 4 last (diverges hosta)
+    sel = sys.argv[1:] or ["1", "2", "3", "5", "7", "8", "9", "10", "11", "12", "13", "14", "15", "6", "4"]  # 4 last (diverges hosta)
     with tempfile.TemporaryDirectory() as root:
         m = Mesh(root)
         for d in sel:
@@ -803,6 +1142,14 @@ def main():
     if FAILS:
         print(f"\nDRILLS FAILED: {len(FAILS)} — " + ", ".join(FAILS))
         return 1
+    if SKIPS:
+        # NOT a pass. An unattempted proof is an open obligation, and saying so
+        # is the whole difference between "verified" and "nothing went wrong".
+        print(f"\nDRILLS INCOMPLETE: {len(SKIPS)} proof obligation(s) not "
+              "attempted on this host —")
+        for s in SKIPS:
+            print(f"  · {s}")
+        return 2
     print("\n✓ all selected drills pass")
     return 0
 

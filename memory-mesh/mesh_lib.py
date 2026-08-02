@@ -52,6 +52,45 @@ LINEAGES = {"operator-direct", "contains-untrusted"}
 AUDIENCES = {"operator", "family", "shared"}
 CONFIDENCES = {"operator-stated", "verified-live", "inferred"}
 
+# --- residency (SPEC v4) -----------------------------------------------------
+# WHICH TIER a memory occupies, DECLARED at write time by the human at the
+# /improve gate — never derived from a score. This replaces the v3 ranking as
+# the residency authority because the ranking could not carry the load:
+# measured 2026-07-31, `score_for_index`'s correction term fired on 2 of 142
+# rows and its breadth term on ZERO, so 122 of 142 rows shared one sort key and
+# ordering collapsed to `ts`. Stable doctrine was evicted by whatever was
+# written most recently, which no amount of curation could fix.
+#
+#   pinned   — Craig-signed. Hard floor, existing PIN_DELIVERY_SHARE hard cap.
+#   doctrine — behavioural rules that must be resident to fire. Leaves the
+#              always-on tier ONLY by a human event (supersede / demote),
+#              never by ranking.
+#   state    — project/reference/pointer facts and notices. NEVER always-on;
+#              /recall reaches them. A notice is state + `expires`, not a
+#              fourth class (every class is a migration, a conflict rule, a
+#              drill case and a wrong-tag target — Grok round 1).
+RESIDENCIES = {"pinned", "doctrine", "state"}
+# Unset means "not yet declared" — the migration retag has not reached this
+# memory. The renderer treats undeclared rows exactly as v3 did, so the field
+# is inert until Craig declares it (see fit_harness_memory).
+RESIDENCY_UNSET = None
+# Only an operator-SIGNED event may carry doctrine/pinned across the mesh; an
+# unsigned event from any host caps here. This is what makes cross-host
+# residency conflict impossible by construction rather than by a merge rule:
+# a peer that re-derives a fact and calls it doctrine cannot outrank the
+# signed tip, and two hosts can never hold two residencies for one slug.
+MAX_UNSIGNED_RESIDENCY = "state"
+# The served index line. Craig approves this string at the /improve gate, and
+# it is what every session reads — so it is bounded by REWRITE at the door, not
+# by truncation at render. The old path collected an approved `--hook`, threw
+# it away, and rendered `content[:200]` instead: a machine-cut rule whose
+# qualifier ("...only when X") could land past the cut.
+HOOK_MAX_CHARS = 140
+# Which audiences may carry a body IN THE EVENT. Bodies replicate to every peer
+# through the shared git transport, so this is a confidentiality boundary, not
+# a preference (SPEC v4 A2). family/host-private memories emit hook-only.
+BODY_AUDIENCES = {"operator", "shared"}
+
 # Audience visibility: which event audiences each view folds in.
 VIEW_INCLUDES = {"operator": {"operator", "shared"}, "family": {"family", "shared"}}
 
@@ -76,6 +115,14 @@ INDEX_BUDGET = 20_480          # bytes, per SPEC — the MESH's own views only.
 # the rest of the file; the appendix alone was 6,078 B. The cushion was already
 # false when the constant was picked, because nobody measured the composition.
 LOADER_BYTE_CEILING = 24_986
+# The on-demand slug appendix's OWN budget, inside the ceiling above. Declared
+# 2026-08-01: MEMORY.md's objective is a SMALLER file, not a fixed-size one
+# allocated differently, so bytes freed by re-homing a fact must leave the file
+# instead of being respent on slug names. See
+# `decisions/index-byte-objective-2026-08-01.md`. Raising this is a real
+# decision — it spends always-on context on advertisement, and the measurement
+# in fit_harness_memory says advertisement is not what drives retrieval.
+APPENDIX_BYTES = 2_000
 LOADER_LINE_CEILING = 200
 # Share of the DELIVERED file (not the loader ceiling — the delivered file is
 # what a session actually gets) that the pinned tier may hold. Unsigned pins
@@ -160,7 +207,26 @@ def event_id(host, session, ts, content, kind="", subject=""):
 
 def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                lineage="operator-direct", audience="operator",
-               confidence="inferred", supersedes=None, pin=False, ts=None):
+               confidence="inferred", supersedes=None, pin=False, ts=None,
+               residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
+               carry_forward=False):
+    # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
+    # this is the one place a stump can be refused before it becomes doctrine —
+    # backfill.py was gated first and the same week five more stumps arrived
+    # through emit (the retag verb re-emitting legacy content), proving that
+    # gating one producer is gating none of them
+    # ([[trust-gates-cover-all-read-channels]], pointed at writes).
+    #
+    # `carry_forward=True` is the retag/supersede carve-out: lineage work must
+    # re-emit an OLD event's content verbatim, and refusing that would make the
+    # 62 legacy stumps un-retaggable — perpetuating an existing stump adds no
+    # new loss, only MINTING one does. A per-call argument on purpose, the
+    # _lib/mail.py authorized=True pattern: no env var a caller can flip once
+    # and forget.
+    if kind == "lesson" and not carry_forward:
+        why = admission_reject(content)
+        if why:
+            raise ValueError(f"make_event refused {subject}: {why}")
     ts = ts or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ev = {"id": event_id(HOST, session, ts, content, kind, subject), "ts": ts, "host": HOST,
           "session": session, "kind": kind, "subject": subject,
@@ -169,6 +235,18 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
           "supersedes": supersedes, "sig": None}
     if pin:
         ev["pin"] = True
+    # SPEC v4 fields are OMITTED when unset rather than written as null: every
+    # byte here is replicated forever, and an absent key reads the same as a
+    # null to `.get()` while costing nothing. Grandfathered events simply lack
+    # them, which is exactly how `event_carries_body` tells old from new.
+    if residency is not None:
+        ev["residency"] = residency
+    if hook is not None:
+        ev["hook"] = hook
+    if body is not None:
+        ev["body"] = body
+    if expires is not None:
+        ev["expires"] = expires
     problems = validate_event(ev)
     if problems:
         raise ValueError("invalid event: " + "; ".join(problems))
@@ -193,12 +271,234 @@ def validate_event(ev):
         p.append(f"bad audience {ev.get('audience')!r}")
     if ev.get("confidence") not in CONFIDENCES:
         p.append(f"bad confidence {ev.get('confidence')!r}")
+    if ev.get("residency") is not None and ev.get("residency") not in RESIDENCIES:
+        p.append(f"bad residency {ev.get('residency')!r}")
+    # A2 at the schema level: an event carrying a body for a non-fleet audience
+    # is INVALID, not merely refused by one producer. This makes the boundary a
+    # property of the event rather than of the door it came through.
+    if ev.get("body") and ev.get("audience") not in BODY_AUDIENCES:
+        p.append(f"audience {ev.get('audience')!r} may not carry a body")
     if ev.get("kind") == "assert" and not ev.get("home"):
         # One home per fact: an assertion without a home is a fact-copy trying
         # to be born. The home pointer is what keeps memory out of the truth
         # business (FLEET.md seam rule 1).
         p.append("assert requires home (one home per fact)")
     return p
+
+
+# ── SPEC v4: residency, bodies, projection ───────────────────────────────────
+def effective_residency(ev):
+    """The residency this event may actually claim (SPEC v4 A1).
+
+    The cap is applied HERE, at read time, and never at write time alone. A
+    write-side check only constrains events this host produced through the
+    sanctioned door; the fold also consumes events fetched from peers, replayed
+    from history, and hand-written by anything with a shell. Enforcing at
+    selection means an unsigned event CANNOT be read as doctrine no matter how
+    it entered the log — the same reasoning that put the data-class gate in
+    `route.py` rather than in each caller.
+    """
+    r = ev.get("residency")
+    if r is None:
+        return RESIDENCY_UNSET
+    if r == "pinned" and not ev.get("_signed"):
+        # `pinned` is the tier that outranks everything and is capped as a
+        # share of the delivered file. It is Craig's signature or nothing,
+        # local or not.
+        return MAX_UNSIGNED_RESIDENCY
+    if r == "doctrine" and not ev.get("_signed") and ev.get("host") != HOST:
+        # REMOTE unsigned doctrine caps at state — that is what makes
+        # cross-host residency conflict impossible (a peer that re-derives a
+        # fact cannot outrank the local declaration, so two hosts can never
+        # hold two residencies for one slug).
+        #
+        # LOCAL unsigned doctrine is allowed, and the distinction is the whole
+        # trust model rather than a convenience: `host` is bound to the log
+        # filename and single-writer-enforced (read_all_events holds out any
+        # mismatch), so host == HOST means the event came through this host's
+        # own sanctioned door under Craig's /improve approval — exactly the
+        # authority that writes the always-on index today. Requiring a
+        # signature here instead would have demanded ~113 passphrase-gated
+        # signings to declare the existing corpus, which is not a security
+        # control anyone completes; it is a control everyone routes around.
+        # Signing remains what makes a doctrine row TRAVEL to peers.
+        return MAX_UNSIGNED_RESIDENCY
+    return r
+
+
+def residency_capped(ev):
+    """True when this event asked for a tier it may not hold (and was demoted)."""
+    return (ev.get("residency") in ("doctrine", "pinned")
+            and effective_residency(ev) != ev.get("residency"))
+
+
+RECONSTRUCTED_MARK = "reconstructed_from_event: true"
+
+
+def ghost_refusal_reason(kind, subject, body, store_root):
+    """Why this emit would create a ghost, or None if it is safe.
+
+    A pure function ON PURPOSE. The live gate resolves `store_root` through
+    harness_store(), whose sandbox guard returns None inside a drill — so a
+    drill that exercised the gate through emit.py would exercise a gate that
+    is switched off, and pass while proving nothing. Splitting the DECISION
+    from the LOOKUP lets the drill test the decision with a real temp store,
+    and the sandbox guard keep doing its job.
+    """
+    if kind != "lesson" or body or store_root is None:
+        return None
+    slug = subject.split("/", 1)[1] if "/" in subject else subject
+    f = store_root / f"{slug}.md"
+    if f.exists():
+        return None
+    return (f"lesson {subject!r} has no --body and no store file at {f}.\n"
+            f"  That combination is a GHOST: an always-on index row whose body "
+            f"/recall can never reach.\n"
+            f"  Either pass --body/--body-file, or write it through the one "
+            f"door:\n"
+            f"    memory_write.py write --slug {slug} ... --commit")
+
+
+def project_store(fold, store, apply=False):
+    """Materialise/repair store files from the event log (SPEC v4 A1/A3).
+
+    The tip of a subject's supersede lineage is the fact's one home; store files
+    are disposable projections of it. `fold['live']` already IS the tip set —
+    superseded events are resolved out by fold_events — so tip selection here is
+    a filter, not a second resolution pass that could disagree with the fold.
+
+    Three cases, and the asymmetry between them is the whole safety argument:
+
+    * tip carries a `body`  -> CREATE or OVERWRITE. The event is authoritative,
+      so a divergent file is a hand-edit or tamper: replace it and alarm. The
+      content is not lost — it is in git, and the event says what it should be.
+    * tip is GRANDFATHERED (pre-v4, no body) and NO file exists -> CREATE a
+      stub from the event's `content`, marked reconstructed. This is the ghost
+      repair: measured 2026-07-31, 11 index rows had no file and /recall
+      returned nothing for an exact-title query, while their events carried
+      298-915 chars of real content. Recovering that beats serving a row whose
+      body cannot be reached.
+    * tip is grandfathered and a file EXISTS -> LEAVE IT ALONE. Overwriting a
+      full body with a 200-char event content would destroy the very content
+      the projection exists to protect (Grok round 3, A3).
+
+    The fold NEVER deletes a store file. A file with no event at all is an
+    inverse ghost: reported for `memory_write adopt`, never removed — deletion
+    on a detection heuristic is how a bug becomes data loss.
+    """
+    if store is None:
+        return {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
+    out = {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
+    seen = set()
+    for e in fold["live"]:
+        if e["kind"] != "lesson" or not e["subject"].startswith("lesson/"):
+            continue
+        # A body may only be projected for audiences allowed to carry one; a
+        # family-audience event has no body by construction (A2), so this loop
+        # cannot write private content into the operator store.
+        slug = e["subject"].split("/", 1)[1]
+        # Path safety: a subject is a controlled-vocabulary slug, but this is
+        # the one place a subject string becomes a FILESYSTEM PATH, and the
+        # registry is not a security boundary. `lesson/../../x` must never
+        # escape the store.
+        if "/" in slug or "\\" in slug or slug in ("", ".", ".."):
+            out["alarms"].append(f"refusing to project unsafe slug {slug!r}")
+            continue
+        seen.add(slug)
+        f = store / f"{slug}.md"
+        if event_carries_body(e):
+            # A2 enforced AT THE PROJECTOR, not only at the producer. emit.py
+            # refuses a family-audience body, but the projector consumes events
+            # from peers, replay and anything with a shell — so a hand-crafted
+            # family event carrying a body would otherwise land in the
+            # OPERATOR's store. A confidentiality boundary checked on one side
+            # of the wire is not a boundary.
+            if e.get("audience") not in BODY_AUDIENCES:
+                out["alarms"].append(
+                    f"refusing to project a body from audience "
+                    f"{e.get('audience')!r}: {slug} (bodies are operator/shared "
+                    f"only — this event should not exist)")
+                continue
+            want = e["body"]
+            if not f.exists():
+                if apply:
+                    f.write_text(want, encoding="utf-8")
+                out["created"].append(slug)
+            elif f.read_text(encoding="utf-8") != want:
+                # OVERWRITE IS THE DESTRUCTIVE BRANCH, so it is the one that
+                # needs authority. An unsigned event can be appended by any
+                # peer, any replay, anything with a shell; letting it silently
+                # replace a memory's body would make "the event is canonical"
+                # into a forge primitive — write a lesson event on a victim
+                # slug, supersede the prior ids, and the next --project
+                # rewrites the store. So: repair only from a SIGNED tip, or
+                # when the file on disk is a fold-written reconstruction stub
+                # (upgrading a stub to a real body loses nothing).
+                stub = RECONSTRUCTED_MARK in f.read_text(encoding="utf-8")
+                if e.get("_signed") or stub:
+                    if apply:
+                        f.write_text(want, encoding="utf-8")
+                    out["repaired"].append(slug)
+                    out["alarms"].append(
+                        f"store file diverged from its event and was rewritten: "
+                        f"{slug} ({'stub upgraded' if stub else 'signed tip'})")
+                else:
+                    out["alarms"].append(
+                        f"store file diverges from its UNSIGNED event and was "
+                        f"LEFT ALONE: {slug} — hand-edit, or an event claiming "
+                        f"a body it should not. Resolve deliberately: "
+                        f"memory_write.py adopt {slug} --reconcile --commit "
+                        f"(file wins) or sign the event (event wins). "
+                        f"--reconcile is REQUIRED here: plain adopt refuses a "
+                        f"slug whose event already carries a body, which is "
+                        f"every divergence, so the advice without it was a "
+                        f"dead end (2026-08-01 audit).")
+        elif not f.exists():
+            content = (e.get("content") or "").strip()
+            if not content:
+                continue
+            stub = (f"---\nname: {slug}\n"
+                    f"description: {content.splitlines()[0][:200]}\n"
+                    f"lineage: {'craig-direct' if e.get('lineage') == 'operator-direct' else 'contains-untrusted'}\n"
+                    f"{RECONSTRUCTED_MARK}\n"
+                    f"metadata:\n  node_type: memory\n  type: feedback\n---\n\n"
+                    f"{content}\n\n"
+                    f"> Reconstructed by the fold from event {e['id']} "
+                    f"({e['ts']}). The original write never created a store "
+                    f"file, so this is the full surviving text — there is no "
+                    f"richer body behind it.\n")
+            if apply:
+                f.write_text(stub, encoding="utf-8")
+            out["created"].append(slug)
+    for f in sorted(store.glob("*.md")):
+        slug = f.stem
+        if slug in seen or slug.startswith("_") or f.name in ("MEMORY.md", "QUARANTINE.md"):
+            continue
+        out["inverse_ghosts"].append(slug)
+    # Inverse ghosts are NOT alarmed while the v4 backfill is still running:
+    # 239 of them is the expected pre-migration state (the whole store predates
+    # the mesh), and an alarm that fires on every fold for a known condition
+    # trains the operator to ignore the channel — which is the same failure as
+    # silently shedding, aimed at attention instead of data. After the backfill
+    # marker exists, a file with no event is a real defect and alarms.
+    if out["inverse_ghosts"] and (MESH_ROOT / "state" / "v4-backfill-complete").exists():
+        out["alarms"].append(
+            f"{len(out['inverse_ghosts'])} store file(s) have no event — the "
+            f"mesh cannot replicate them and peers will never see them. "
+            f"Repair: memory_write.py adopt <slug> --commit "
+            f"(e.g. {' '.join(out['inverse_ghosts'][:3])})")
+    return out
+
+
+def event_carries_body(ev):
+    """True for a SPEC-v4 lesson event that can drive projection.
+
+    Grandfathered pre-v4 events carry no `body`, and projecting from one would
+    materialise an EMPTY store file over a good one — destroying the very
+    content the projection exists to protect (Grok round 3, A3). Absence of the
+    key is the whole test: v4 events always set it, old ones never can.
+    """
+    return bool(ev.get("body"))
 
 
 # ── signatures (v1.3) ────────────────────────────────────────────────────────
@@ -829,7 +1129,7 @@ def index_row(e):
     available that costs no coverage, since the subject slug is a load-bearing
     pointer and row prose is already tight (median content 117 chars).
     """
-    return (f"- [{e['subject']}] {e['content'][:200]}"
+    return (f"- [{e['subject']}] {e['content'][:INDEX_CONTENT_CHARS]}"
             f"{' → ' + e['home'] if e.get('home') else ''}"
             # .get, not [] — `_suspect` is stamped by read_all_events, so a
             # caller holding events built any other way (fold_events is public
@@ -1034,6 +1334,27 @@ def ondemand_slugs(store):
 ONDEMAND_HEADING = "## On-demand memories — not always-loaded; /recall reaches them"
 
 
+def index_excluded(ev, exclude):
+    """Is this event held OUT of the always-on index by the exclude manifest?
+
+    THE ONE HOME for that question. It was previously implemented twice — once
+    inside `residency_partition` and again inside `render_harness_memory` — as
+    a private `lesson_slug(e) not in exclude`. Two writers of one rule, and on
+    2026-08-01 fixing only the first left `home/*` rows still published: the
+    partition agreed they were demoted while the renderer, which actually
+    decides what lands in MEMORY.md, never asked. One home per fact applies to
+    the code that implements a rule, not just to the facts the rule is about.
+
+    Matches EITHER the bare lesson slug (`one-home-per-fact`) or the full
+    subject (`home/cc-claude-md`). Non-lesson subjects have no bare slug, so
+    without the second form nothing in `_index-exclude.txt` could ever demote
+    them — an always-on row that structurally could not leave the tier.
+    """
+    subject = ev["subject"]
+    slug = subject.split("/", 1)[1] if subject.startswith("lesson/") else None
+    return slug in exclude or subject in exclude
+
+
 def delivery_breach(text, byte_cap=LOADER_BYTE_CEILING,
                     line_cap=LOADER_LINE_CEILING):
     """Reasons `text` violates the CONSUMER's limits; [] means it loads whole.
@@ -1108,6 +1429,33 @@ def fit_harness_memory(head, ranked, slugs, byte_cap=DELIVERY_BYTES,
     pass strictly decreases n_slugs or n_rows.
     """
     n_rows, n_slugs = len(ranked), len(slugs)
+    # THE APPENDIX GETS ITS OWN CAP, so freed rule bytes are RECLAIMED rather
+    # than silently respent on slug names (Craig's declaration, 2026-08-01,
+    # `decisions/index-byte-objective-2026-08-01.md`). Without this the loop
+    # below only ever shrinks the appendix under breach, so it grows to fill
+    # whatever the rules give back: the 2026-08-01 re-homing pass dropped 13
+    # rows (-2,329 B of rules) and the file shrank by 315 B, because the
+    # appendix took 2,014 B of it. A ceiling the fitter treats as a target is
+    # not a ceiling.
+    #
+    # Capping is safe because the appendix does NOT gate access. retrieve.py is
+    # a UserPromptSubmit hook that scores the WHOLE corpus and auto-injects;
+    # being named here is advertisement, not reachability. Measured over 1,847
+    # logged turns: 373 distinct slugs served, and 241 of them (65%) are never
+    # named in the appendix — including the most-served slug in the estate
+    # (`soft-failure-exit-zero-with-stderr`, 847 hits). 17 slugs the appendix
+    # does name have never been served at all.
+    if n_slugs:
+        base = len(_assemble_harness_memory(
+            head, ranked, n_rows, slugs, 0).encode("utf-8"))
+        for _ in range(len(slugs) + 1):
+            if not n_slugs:
+                break
+            grown = len(_assemble_harness_memory(
+                head, ranked, n_rows, slugs, n_slugs).encode("utf-8")) - base
+            if grown <= APPENDIX_BYTES:
+                break
+            n_slugs = max(0, n_slugs - max(1, n_slugs // 16))
     for _ in range(len(ranked) + len(slugs) + 2):
         text = _assemble_harness_memory(head, ranked, n_rows, slugs, n_slugs)
         if not delivery_breach(text, byte_cap, line_cap):
@@ -1131,16 +1479,78 @@ def fit_harness_memory(head, ranked, slugs, byte_cap=DELIVERY_BYTES,
                   "reason": "does not fit even at the minimum stub"}
 
 
+def residency_partition(fold, store):
+    """Split the operator's live rows by DECLARED residency (SPEC v4).
+
+    Returns (always_on, on_demand, undeclared, report). During migration most
+    rows are undeclared and keep exactly their v3 treatment — this is what lets
+    the law ship before the retag, and what makes the shadow render a true
+    no-op diff until Craig starts declaring.
+    """
+    def lesson_slug(e):
+        return (e["subject"].split("/", 1)[1]
+                if e["subject"].startswith("lesson/") else None)
+
+    exclude = ondemand_slugs(store) if store else set()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    always, demand, undeclared, expired = [], [], [], []
+    for e in ranked_index(fold, "operator"):
+        if index_excluded(e, exclude):
+            continue
+        r = effective_residency(e)
+        # Expiry is a RENDER concern only — no fold-generated events, so replay
+        # stays a pure function of human-origin input (Grok round 1, F3).
+        if e.get("expires") and e["expires"] < today:
+            expired.append(e)
+            continue
+        if r in ("pinned", "doctrine"):
+            always.append(e)
+        elif r == "state":
+            demand.append(e)
+        else:
+            undeclared.append(e)
+    return always, demand, undeclared, {
+        "always_on": len(always), "on_demand": len(demand),
+        "undeclared": len(undeclared), "expired_hidden": len(expired)}
+
+
+def render_harness_memory_v4(fold, store):
+    """The SPEC-v4 index: declared residency decides, ranking only orders.
+
+    Doctrine and pinned rows are rendered in STABLE SLUG ORDER, not by recency.
+    That is the whole point: measured 2026-07-31, `score_for_index` collapsed to
+    `ts` for 122 of 142 rows, so a memory's survival depended on when it was
+    written rather than on what it was for. Stable order is also non-gameable —
+    nothing an agent controls moves a row up.
+    """
+    always, demand, undeclared, rep = residency_partition(fold, store)
+    always_sorted = sorted(always, key=lambda e: (
+        0 if (e.get("pin") or e.get("_pin")) else 1,
+        0 if e.get("_signed") else 1,
+        e["subject"]))
+    # Undeclared rows keep v3 ranking and sit AFTER declared doctrine: during
+    # migration they are the ones that should shed first, because an undeclared
+    # row is one nobody has yet said must be resident.
+    ranked = always_sorted + undeclared
+    slugs = sorted({e["subject"].split("/", 1)[1] for e in demand
+                    if e["subject"].startswith("lesson/")})
+    head = [
+        "# MEMORY — GENERATED by memory-mesh fold (SPEC v4 SHADOW); never hand-edit",
+        f"# residency: {rep['always_on']} always-on, {rep['on_demand']} on-demand, "
+        f"{rep['undeclared']} undeclared, {rep['expired_hidden']} expiry-hidden",
+        ""]
+    text, report = fit_harness_memory(head, ranked, slugs)
+    report.update(rep)
+    return text, report
+
+
 def render_harness_memory(fold, store):
     """The harness-loaded MEMORY.md: the operator INDEX minus on-demand slugs,
     plus an appendix naming what /recall can reach — sized so the WHOLE file
     clears the loader's ceilings. Returns (text, report)."""
-    def lesson_slug(e):
-        return (e["subject"].split("/", 1)[1]
-                if e["subject"].startswith("lesson/") else None)
     exclude = ondemand_slugs(store)
     ranked = [e for e in ranked_index(fold, "operator")
-              if lesson_slug(e) not in exclude]
+              if not index_excluded(e, exclude)]
     # The on-demand appendix advertises slugs as reachable by /recall. A
     # quarantined slug advertised there was the standing index pointing every
     # session at withheld material — and until the same day's recall fix, /recall
@@ -1220,6 +1630,72 @@ def render_store_quarantine(fold):
     return "\n".join(lines) + "\n"
 
 
+def servable_slugs(fold):
+    """The slugs a delivery channel may serve: live, non-superseded,
+    non-quarantined, non-parked.
+
+    `fold["live"]` is already the tip set — supersedes resolved out, quarantine
+    held out, denial/propose-correct/retract excluded — so this is that set
+    minus parked subjects, expressed in the store's filename vocabulary.
+    """
+    parked = set(fold.get("parked") or {})
+    out = set()
+    for e in fold["live"]:
+        subj = e["subject"]
+        if subj in parked or not subj.startswith("lesson/"):
+            continue
+        slug = subj.split("/", 1)[1]
+        if "/" in slug or "\\" in slug or slug in ("", ".", ".."):
+            continue
+        out.add(slug)
+    return sorted(out)
+
+
+def servable_manifest_path():
+    """Where the delivery manifest lives — mesh state, not the operator's store."""
+    return MESH_ROOT / "state" / "servable.json"
+
+
+def write_servable_manifest(fold):
+    """Publish the delivery manifest the RETRIEVAL tier filters against.
+
+    Why this exists (2026-07-31, found by an outside review and then verified
+    live): `retrieve.py` globbed the store directly and consulted no lifecycle
+    state whatsoever, so it served QUARANTINED untrusted-lineage facts and
+    SUPERSEDED doctrine as "STANDING RULES" — a memory and its own correction
+    could ride into the same turn as co-equal rules. The always-on tier honored
+    the fold's verdict; the retrieval tier never saw it. Story 029's gate was
+    shipped write-side and index-side and simply had no third half.
+
+    The manifest is PRECOMPUTED here rather than derived at retrieval time on
+    purpose: retrieval runs on every turn, and a fold is git reads plus an
+    ssh-keygen subprocess per signed event — nothing that belongs on the hot
+    path.
+
+    It lives in the mesh's own `state/` (already gitignored, already where
+    retrieve.py writes its injection log), NOT in the operator's memory store.
+    The store is human-owned and write-guarded; a fold that drops derived files
+    into it creates untracked noise the guard then refuses to let anyone clean
+    up. Derived state belongs with the deriver.
+
+    Never raises: a broken state dir must not fail the fold.
+    """
+    try:
+        doc = {"version": 1, "view_version": view_version(fold),
+               "generated": datetime.datetime.now(
+                   datetime.timezone.utc).isoformat(timespec="seconds"),
+               "slugs": servable_slugs(fold)}
+        path = servable_manifest_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+        return {"status": "written", "entries": len(doc["slugs"]), "alarms": []}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "failed", "error": str(e),
+                "alarms": [f"servable manifest write failed: {e}"]}
+
+
 def write_store_quarantine(fold):
     """Atomically publish the store's quarantine projection. Opt-in like the
     index (same `.mesh-generated` marker, same sandbox guard via harness_store).
@@ -1239,7 +1715,134 @@ def write_store_quarantine(fold):
                 "alarms": [f"store quarantine projection write failed: {e}"]}
 
 
-def write_harness_memory(fold):
+# The renderer's own cut, named so the ADMISSION GATE and the RENDERER can never
+# disagree about what fits. A content string longer than this does not become a
+# longer row; it becomes a row that stops mid-clause.
+INDEX_CONTENT_CHARS = 200
+
+# A row that trails off is a FAILED ADMISSION, not a compact one. Measured
+# 2026-07-31: 87 events carry content ending in an ellipsis, 62 of them resident
+# in the always-on index — inherited from a pre-mesh authoring loop that wrote a
+# teaser, truncated it to fit, and appended "…". backfill.py then read that
+# derivative as if it were the source. Both halves are now refused at admission:
+# a rule the operator cannot read to the end cannot bind, and re-emitting the
+# stumps is not a repair anyone can make cheaply once the tail is gone
+# ([[bound-the-composed-artifact-not-a-section]]).
+_TRAILS_OFF = re.compile(r"(…|\.\.\.)\s*$")
+
+
+def admission_reject(content):
+    """Why this content may not enter the always-on index, or None if it may.
+
+    A REFUSAL, not an alarm. An earlier bound on this channel only appended to a
+    warning list while the write proceeded, which is how 62 stumps became
+    resident doctrine without anyone deciding they should be
+    ([[alarm-only-bound-is-not-a-bound]]).
+    """
+    text = (content or "").strip()
+    if not text:
+        return "empty content"
+    if _TRAILS_OFF.search(text):
+        return ("content trails off mid-sentence — write a rule that fits, "
+                f"do not truncate one that does not (ceiling "
+                f"{INDEX_CONTENT_CHARS} chars)")
+    if len(text) > INDEX_CONTENT_CHARS:
+        return (f"content is {len(text)} chars; the renderer cuts at "
+                f"{INDEX_CONTENT_CHARS}, so {len(text) - INDEX_CONTENT_CHARS} "
+                f"chars would be silently lost — shorten it at the source")
+    return None
+
+
+_STORE_DESC = re.compile(r"^description:\s*(.*)$", re.M)
+
+
+def projection_drift(fold, store):
+    """Where an event's `content` and its store file's `description:` disagree.
+
+    Every memory has two renderings of its one-line essence, and until this
+    check existed nothing compared them — the 2026-07-31 stumps (a producer
+    composing content from an already-truncated derivative while the lossless
+    text sat in the same file) were invisible until someone counted ellipses.
+
+    Classification, not repair — the fold detects, the operator decides:
+    * FILE-RICHER: the file's description extends the event's content. The
+      smoking gun that a producer read a derivative again (or a legacy stump
+      whose repair is still pending).
+    * EVENT-RICHER: the event extends the file. Projection lag or a hand-edit.
+    * DISJOINT: neither extends the other — two writers told two stories.
+
+    v4 tips carrying a `body` are exempt: for those the event is the declared
+    home and `project_store` already repairs the file from it. Grandfathered
+    tips are exactly the era where the FILE was the source (backfill read it),
+    which is why the comparison is worth a timer slot at all.
+    """
+    out = {"file_richer": [], "event_richer": [], "disjoint": []}
+    if store is None:
+        return out
+    norm = lambda s: " ".join((s or "").split()).rstrip("….").rstrip()
+    for e in fold["live"]:
+        if e.get("body") or e["kind"] != "lesson":
+            continue
+        f = store / (e["subject"].split("/")[-1] + ".md")
+        if not f.exists():
+            continue                      # ghost repair's problem, not drift
+        m = _STORE_DESC.search(f.read_text(encoding="utf-8"))
+        if not m:
+            continue
+        desc, cont = norm(m.group(1).strip().strip('"')), norm(e["content"])
+        if desc == cont:
+            continue
+        # Strip a "Title: " head before comparing: the legacy composer prepended
+        # one, and flagging every stump as DISJOINT because of its own prefix
+        # would bury the real disjoints in 62 rows of known history.
+        bare = cont.split(": ", 1)[-1] if ": " in cont[:70] else cont
+        if desc.startswith(bare) or desc.startswith(cont):
+            out["file_richer"].append(e["subject"])
+        elif cont.startswith(desc):
+            out["event_richer"].append(e["subject"])
+        else:
+            out["disjoint"].append(e["subject"])
+    return out
+
+
+_ROW_SUBJECT = re.compile(r"^- \[([^\]]+)\]")
+
+
+def index_subjects(text):
+    """The ordered subject slugs of an index render — its residency set."""
+    return [m.group(1) for m in
+            (_ROW_SUBJECT.match(l) for l in text.splitlines()) if m]
+
+
+def residency_delta(live_path, new_text):
+    """What this render would ADD to / DROP from always-on, or None if neither.
+
+    Membership only. A row whose prose changed is not a residency change: the
+    memory is still resident and the operator still lives with it. Conflating
+    the two would stage on every content refresh, the gate would be routine, and
+    a routine gate is one the operator clicks through — which is how a control
+    becomes a rubber stamp instead of a decision.
+    """
+    if not live_path.exists():
+        return None                      # first write on a fresh host
+    old = set(index_subjects(live_path.read_text(encoding="utf-8")))
+    new = set(index_subjects(new_text))
+    added, dropped = sorted(new - old), sorted(old - new)
+    if not added and not dropped:
+        return None
+    return {"added": added, "dropped": dropped}
+
+
+def render_residency_diff(delta):
+    out = ["# STAGED always-on residency change — needs the operator's word.",
+           "# Nothing below is live. Promote with: fold.py --promote-residency",
+           ""]
+    out += [f"  + {s}" for s in delta["added"]]
+    out += [f"  - {s}" for s in delta["dropped"]]
+    return "\n".join(out) + "\n"
+
+
+def write_harness_memory(fold, allow_residency_delta=False):
     """Atomically regenerate <store>/MEMORY.md if this host has opted in.
 
     THE WRITE GATE. A derived view whose consumer hard-truncates is not
@@ -1275,9 +1878,38 @@ def write_harness_memory(fold):
                 f"harness MEMORY.md is dropping always-on index rows: "
                 f"{report['rows']}/{report['rows_total']} kept — the index has "
                 f"outgrown its ceiling, curate (merge/delete)")
+        # THE RESIDENCY GATE. Residency is the operator's data; a scheduler may
+        # not change it on his behalf. On 2026-07-31 a renderer edit freed bytes,
+        # the 5-minute timer folded, and 15 rows were promoted into always-on
+        # four minutes before the author could show the operator the diff he had
+        # promised. The review step was on the CONSUMER path and the machine path
+        # is faster than a human, every time — so the fix is here, at the
+        # producer, not in a resolution to be careful
+        # ([[fix-human-loop-races-at-the-producer]]).
+        #
+        # Asymmetric, not blanket: a fold that keeps the SAME row set is a
+        # refresh of rows the operator already lives with, and blocking it would
+        # freeze the index and call that safety. A fold that ADDS or DROPS a row
+        # is a residency change, and that one stages and waits.
+        live = store / "MEMORY.md"
+        delta = residency_delta(live, text)
+        if delta and not allow_residency_delta:
+            staged = store / "MEMORY.md.staged"
+            staged.write_text(text, encoding="utf-8")
+            (store / "MEMORY.md.staged.diff").write_text(
+                render_residency_diff(delta), encoding="utf-8")
+            alarms.append(
+                f"harness MEMORY.md HELD: residency delta needs the operator's "
+                f"word (+{len(delta['added'])} / -{len(delta['dropped'])} rows). "
+                f"Staged at {staged}; review the .diff, then promote.")
+            report.update(status="staged", path=str(staged), alarms=alarms,
+                          residency_delta=delta)
+            return report
         tmp = store / f"MEMORY.md.tmp.{os.getpid()}"
         tmp.write_text(text, encoding="utf-8")
         os.replace(tmp, store / "MEMORY.md")
+        for leftover in ("MEMORY.md.staged", "MEMORY.md.staged.diff"):
+            (store / leftover).unlink(missing_ok=True)
         # Post-write verification: measure what is actually on disk, not what we
         # think we rendered. An atomic replace publishes a known-bad artifact
         # just as reliably as a good one.

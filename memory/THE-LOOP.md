@@ -11,13 +11,20 @@ standing rule instead of a lesson re-learned on the next false alarm).
 
 ## The five arrows, and which shipped piece is which
 
+(Plus a sixth, added in v0.2.6: memory keeps a *history*, not just a
+current state — `memory-mesh/replay.py` reconstructs the exact view an
+agent had at any past instant, which is the difference between "it got
+that wrong" and "it was working from what it knew at the time.")
+
 ```
    jobs run  ──log_run.py──▶  runs.db  ──/status──▶  operator
                                   │
                                   ▼
                           weekly.py (facts → NOW.md)
 
-   incident / correction  ──/improve──▶  memory notes  ──/recall──▶  session
+   incident / correction  ──/improve──▶  event log  ──fold──▶  memory notes
+                                       (memory-mesh)              │
+                                                        ──/recall──▶  session
 ```
 
 - **jobs → runs.db** (`observability/log_run.py`) — every scheduled run
@@ -25,9 +32,14 @@ standing rule instead of a lesson re-learned on the next false alarm).
   else stands on.
 - **runs.db → operator** (`/status`) — the one-verb answer to "how is my
   system doing", read-only, distrust-green by default.
-- **incident → memory** (`/improve`) — a correction or a taught lesson
-  this session becomes a note in `memory/`, not something re-explained
-  next time.
+- **incident → memory** (`/improve` → `memory-mesh/emit.py`) — a
+  correction or a taught lesson this session becomes an *event* appended
+  to the log, not something re-explained next time. Once the mesh is
+  bootstrapped, `MEMORY.md` is regenerated from that log by the fold
+  (every five minutes) and carries a `GENERATED` header; don't hand-edit
+  it. Re-teaching the same subject supersedes the old wording rather than
+  adding a second copy, and two live claims that disagree park instead of
+  both being served — which is the part a rewritten-file memory can't do.
 - **memory → session** (`/recall`) — a later session asks "what do I know
   about X" and gets an answer with citations, not a shrug.
 - **facts → derived views** (`views/weekly.py`) — a deterministic weekly

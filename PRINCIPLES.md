@@ -51,10 +51,14 @@ covered by a specific convention, reason from here.
 11. **First-party for sensitive; never a third party.** One data-class taxonomy
     everywhere — `public` < `internal` < `sensitive`. Sensitive data (e.g. {{REDACTED}}
     work email/calendar) may reach only **first-party** providers: the local Ollama
-    node and Claude/Anthropic (decided 2026-07-08 — Claude counts as trusted first-party,
-    so a `.21` outage falls back to Claude rather than going dark). It NEVER reaches a
+    node, Claude/Anthropic (decided 2026-07-08 — so a `.21` outage falls back to Claude
+    rather than going dark), xAI/Grok (2026-07-27) and OpenAI (2026-07-31). It NEVER reaches a
     third party (DeepSeek, Gemini, OpenRouter), even under an explicit pin. Unknown
-    data-class fails loud, never open.
+    data-class fails loud, never open. **Who is first-party is Craig's call, not a
+    fixed property of a vendor** — each revision gets a dated record in `decisions/`
+    AND is encoded in `_lib/merit_policy.CANDIDATES`, the one authority every other
+    layer derives from. A decision recorded but not encoded is the failure mode: the
+    Grok ruling sat unapplied in code for four days.
 
 ## Architecture
 12. **Small sharp tools on a shared spine.** Independent repos, one concern each,
@@ -84,6 +88,23 @@ covered by a specific convention, reason from here.
     This is why the fleet survives a harness swap the same way it survives a
     connectivity loss: audit + backlog at
     `audits/2026-07-20-harness-portability/BACKLOG.md`.
+
+## Audit
+18. **Always be prepared for an audit.** Every load-bearing claim must arrive
+    with what is needed to CHECK it — the measurement, the command, and for
+    relayed evidence the framing the other party was given. A verdict without
+    its assumptions is unauditable: the operator cannot check reasoning he was
+    never shown, and will reason from your summary as if it were the evidence.
+    Where you would say "verified", say what you ran and what it returned;
+    where you have not, say UNVERIFIED and name the instrument you lack. Keep
+    the artifact, not just the conclusion — reviews to `<repo>/reviews/`,
+    rulings to `decisions/`, unfinished work to a brief — because an audit that
+    depends on a session transcript has already failed. Being audit-ready is
+    not a mode you enter when asked; the evidence has to exist before anyone
+    asks, which means producing it at the moment of the claim. Origin:
+    2026-08-01, a rival-model verdict relayed without the prompt that produced
+    it, so the operator was "corrected" for an inference my own summary had
+    licensed — one of several claims that session which outran their evidence.
 
 ## Consent
 17. **Show what you're asking to approve.** An approval gate proves only what the

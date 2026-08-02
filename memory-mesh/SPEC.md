@@ -59,6 +59,29 @@ pointers*. Not a vector DB, not a graph DB, not millions of items.
   Cross-host display order = `(ts, host, line)`; `SUSPECT` flag on future
   timestamps; ordering is never load-bearing (invariant 4).
 
+### Canonical direction — which copy is the fact (2026-07-31)
+
+Every memory's one-line essence exists twice: the event's `content` and the
+store file's `description:`. One home per fact requires a declared direction:
+
+- **v4 events (carry `body`): the EVENT is the source.** The store file is a
+  projection `project_store` may rewrite. `description:` in the file is a
+  rendering of the event, never an input to one.
+- **Grandfathered events (no `body`): the FILE was the source.** These were
+  backfilled *from* store files, so for this era only, the file's
+  `description:` outranks the event's `content` — which is exactly why
+  `project_store` refuses to overwrite an existing file from a grandfathered
+  event, and why repair of the 62 stumped events reads `description:`.
+- **No producer may compose event content from a derivative** (an index row, a
+  legacy hook, another event's stump). Enforced at the funnel: `make_event`
+  refuses stumped/over-length lesson content (`admission_reject`); verbatim
+  lineage re-emission passes `carry_forward=True`, a per-call argument on the
+  `_lib/mail.py authorized=True` pattern.
+- **Drift is watched, not assumed absent:** `projection_drift` compares both
+  copies on every fold and edge-reports when the divergence SET changes.
+  `file_richer` after the legacy repair completes = a producer read a
+  derivative again.
+
 ## Subject registry
 
 `subjects.toml`, in this repo, with a test suite. Controlled vocabulary of
@@ -181,6 +204,13 @@ live and serve that — the copy is never the answer. Parked subjects:
 PreToolUse hook compares `view.version` mtime/hash against a threshold and
 triggers a re-fold when stale. Closes the mid-session window mechanically;
 "agents should re-read" is not a mechanism.
+
+**Two tiers, one store.** Behavioural rules, who-Craig-is and standing facts get
+a `MEMORY.md` index line and are always in context. Project, skill and infra
+reference is listed in `_index-exclude.txt` and reached on demand by `/recall`
+and the retrieve hook. Residency is Craig's data: a new memory defaults to
+on-demand, and promotion into the always-on tier needs his explicit word plus a
+named displacement (`decisions/memory-admission-policy-2026-07-31.md`).
 
 ## The three differentiators
 

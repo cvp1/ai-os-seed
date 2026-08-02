@@ -22,7 +22,7 @@ one — the part that makes the other two dependable.
 | Layer | What it does | Who ships it |
 |---|---|---|
 | **Your system** | the jobs, adapters and skills you build for your own life | you |
-| **Substrate** | secrets vault · scheduler · run history · freshness backstop · memory discipline · skills conventions | **AI-OS Seed** (this repo) |
+| **Substrate** | secrets vault · scheduler · run history · freshness backstop · event-sourced memory · skills conventions | **AI-OS Seed** (this repo) |
 | **Assistant** | the agent you actually talk to — mail, calendar, questions | [AI-OS Core](https://craigvandeputte.com), or whatever you already use |
 
 In one sentence: **AI-OS Seed turns a machine with an AI coding agent on
@@ -85,7 +85,7 @@ second directory is literally a second brain that can't see the first.
 Open Claude Code on that machine and paste this:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.5-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.6-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Show me every command before you run it.
 
@@ -99,7 +99,8 @@ That's the whole install. Your agent then works through
 | **2 · Install** | runs `install.py` — the only thing that moves bytes |
 | **3 · Verify** | selftest, then the demo job through the real run logger |
 | **4 · Personalize** | writes you a `CLAUDE.md` — the one file it authors |
-| **5 · Memory** | writes your first memory note, by doing it rather than describing it |
+| **5 · Memory** | writes your first memory note by doing it rather than describing it, then starts the memory mesh underneath it (`memory-mesh/install.sh`) so the index becomes generated rather than hand-kept |
+| **5.5 · Governance** | nothing to run — the permission-matrix layer is withheld in this release, and the phase says why rather than pretending it was never there |
 | **6 · First win** | schedules the demo job for real, on crontab or launchd |
 | **7 · Hand back** | tells you what you now have and what to build next |
 
@@ -112,7 +113,7 @@ this repo, never agent-transcribed.
 `AGENT-INSTALL.md` is written for an agent, but every step is a plain
 command. The short version:
 
-    git clone --branch v0.2.5-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
+    git clone --branch v0.2.6-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
     cd ~/tools/ai-os-seed
     python3 install.py --detect                      # read-only: any prior install?
 
@@ -126,8 +127,8 @@ command. The short version:
     python3 <ROOT>/observability/freshness.py --all              # [OK] hello-fleet
 
 Then read Phases 4–6 of `AGENT-INSTALL.md` for the parts worth doing by
-hand: your `CLAUDE.md`, your first memory note, and scheduling the demo
-job for real.
+hand: your `CLAUDE.md`, your first memory note, `bash <ROOT>/memory-mesh/install.sh`
+to start the event log under it, and scheduling the demo job for real.
 
 ### Undo
 
@@ -150,16 +151,58 @@ refuses to touch a tree that isn't ours.
 | `observability/` | one SQLite row per scheduled run, plus a freshness backstop that catches jobs that silently stop |
 | `demo/hello_fleet.py` | the first win: one heartbeat job proving the whole spine end to end |
 | `memory/` | two-tier memory scaffold — `MEMORY.md` index, one fact per note |
+| `memory-mesh/` | the layer underneath the notes: an append-only event log (plain git, your machine only) that folds into the index, parks contradictions instead of letting them coexist, and can replay the exact view your agent had at any past instant |
 | `skills/improve` | corrections and preferences you teach become durable memory notes |
 | `skills/recall` | "what do I know about X" over your notes and run history, with citations |
 | `skills/status` | one honest screen answering "how is my system doing" — read-only, distrust-green by design |
 | `skills/skill-center` | authoring conventions plus a scaffold/audit tool, for the skills you build |
 | `views/weekly.py` | a weekly `NOW.md` derived from your own run history and git activity — "store facts, derive views," made concrete |
 
-The last five rows are **the cognitive spine**: the loop that makes this an
+The last six rows are **the cognitive spine**: the loop that makes this an
 operating system rather than cron with logging. Jobs produce facts, facts
 become memory, memory makes the next session smarter.
 `memory/THE-LOOP.md` maps which piece serves which arrow.
+
+### Memory that has a history, not just a current state
+
+Most agent memory is a file the agent rewrites. That loses the thing you
+most want during an incident: *when did it start believing this, and what
+did it believe before?* Since v0.2.6 the seed ships `memory-mesh/`
+underneath the notes, and Phase 5 of the install turns it on.
+
+What changes for you:
+
+- **Lessons are emitted, not hand-edited.** `/improve` appends an event;
+  a fold every five minutes regenerates `MEMORY.md` from the log. The
+  index carries a `GENERATED` header from then on — edit it by hand and
+  the next fold overwrites you. (Your pre-mesh index is preserved at
+  `MEMORY.md.pre-mesh`.)
+- **Re-teaching supersedes rather than duplicates.** Say it differently
+  next month and the new event replaces the old wording on that subject,
+  so the index doesn't silt up with three versions of one rule.
+- **Contradictions park loudly.** Two live claims that disagree about the
+  same subject stop being served and get flagged, instead of the agent
+  quietly picking one.
+- **You can replay.** `replay.py` reconstructs the exact view any agent
+  had at any past timestamp — the difference between "the agent got that
+  wrong" and "the agent was working from what it knew at 03:14."
+
+It runs **solo by default** — one machine, a local git repo at
+`~/memory-events`, no server, no network, nothing to enroll in. If you
+later run a second machine, `memory-mesh/ENROLL.md` walks you through
+making them share one set of beliefs peer-to-peer over ssh (fetch-only,
+still no server). The design contract and its proof obligations are
+`memory-mesh/SPEC.md` and `memory-mesh/drill.py` — the drill stands up a
+three-node mesh in a temp directory against real git and runs the spec's
+guarantees as tests, so you can check the claims above rather than trust
+them.
+
+One honest edge: the mesh's **signed-event** path — where an operator
+signature makes a claim authoritative and clears a park — is built around
+the upstream fleet's key layout (an Ed25519 key in `~/.key/signing/` and a
+signer registry). Solo installs never need it, and everything above works
+without signing. If you go multi-machine and want it, read `sign.py` and
+`ENROLL.md` first; expect to adapt paths.
 
 ### If you already run AI-OS Core, this is its upgrade
 
@@ -176,11 +219,27 @@ The seed composes into the workspace you have (`install.py --target
   use, fail-closed when locked.
 - **New ops verbs.** `/status` answers honestly in one screen; `/improve`
   and `/recall` now ground themselves in run history as well as memory.
+- **Its memory gains a history.** The mesh folds your notes from an
+  append-only log, so re-teaching supersedes instead of duplicating and
+  you can replay what it believed on any past day.
 
-Your memory, your `CLAUDE.md`, your files are left exactly as they are.
-The install refuses rather than touch anything of yours, and an existing
-`memory/` counts as *satisfied*, not colliding — your live memory already
-is the thing the empty scaffold exists to start.
+Your `CLAUDE.md` and your files are left exactly as they are. The install
+refuses rather than touch anything of yours, and an existing `memory/`
+counts as *satisfied*, not colliding — your live memory already is the
+thing the empty scaffold exists to start.
+
+**The one exception, stated plainly:** the Phase 5 mesh bootstrap does
+change how your memory index is maintained. It copies your existing
+`MEMORY.md` to `MEMORY.md.pre-mesh`, backfills its entries into the event
+log, and from then on regenerates the index from that log — so it is no
+longer a file you edit by hand. Your notes and their content are kept;
+the *authoring* moves to `/improve` and `emit.py`. It is one marker file
+to undo (`rm <store>/.mesh-generated`, restore the `.pre-mesh` copy), and
+if you'd rather keep hand-authored memory, skip Phase 5 step 3 entirely —
+everything else in the seed works without the mesh. Note also that the
+mesh schedules its own fold and home-watch timers directly on systemd /
+launchd; those are separate from `scheduler/manifest.yml` and won't show
+up in `/status`.
 
 ---
 
@@ -205,6 +264,33 @@ note via `/improve`, `/recall` found and cited that note from a
 plain-language question, and `views/weekly.py` wrote a `NOW.md` whose
 numbers matched `report.py --stats` by hand. Every skill passes this
 repo's own `skill-center/audit.py`.
+
+**The memory mesh is drilled, not just tested.** `memory-mesh/drill.py`
+stands up a three-node mesh in a temp directory against real git and runs
+the `SPEC.md` guarantees as executable drills — single-writer append,
+deterministic fold, contradiction parking, non-fast-forward refusal,
+supersede chains, torn-tail healing, replay. Run it yourself; it needs
+nothing but Python and git. Its bootstrap on a fresh install (log created,
+index flipped to generated, existing notes backfilled, `/improve`'s event
+landing in the next fold) was verified end to end in a sandbox. **Not yet
+verified:** a real multi-machine mesh installed from *this repo* by
+someone other than the author. The upstream fleet runs one; your enrollment
+is the unproven path, and `ENROLL.md` is where to start if you try it.
+
+**A control was withheld from this release, deliberately.** A governance
+layer — a permission matrix your agent is held to, compiled into a
+PreToolUse hook, with a conformance suite — was built and then pulled
+before shipping. Its informed-approval control (Principle 17: show what
+you're asking to approve) did not hold: an *allowed* `Bash` call could
+rewrite both a staged proposal and the audit record it was checked
+against, and the verifier still reported the proposal unchanged. Three
+rounds of fixes failed the same way, because the protection was bound to
+the spelling of a write rather than to "an agent wrote governance state."
+A control that reads stronger than it is, shipped to strangers, is worse
+than no control — so Principle 17 still ships as doctrine, and the
+enforcement does not ship at all. Phase 5.5 of the install says the same
+thing. It comes back when the binding rests on a boundary an agent cannot
+cross from inside the same user account.
 
 **Live-verified beyond CI**, in an isolated sandbox: STALE detection
 (backdate a run, confirm `freshness.py` flags it); crontab content-drift
