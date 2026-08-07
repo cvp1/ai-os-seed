@@ -1,9 +1,20 @@
 name: install test
 
-# Runs the AGENT-INSTALL.md phase sequence for real, on a throwaway runner —
-# no secrets, no network calls beyond checkout, nothing that touches an
-# operator's real machine. This is the thing a "public alpha" README claims
-# to be true; CI is what keeps that claim honest between releases.
+# Runs AGENT-INSTALL.md's DETERMINISTIC phases (install.py + the shipped
+# scripts it drives) directly, on a throwaway runner — no secrets, no network
+# calls beyond checkout, nothing that touches an operator's real machine.
+# This is NOT an agent reading AGENT-INSTALL.md and deciding what to run: it
+# exercises install.py's substrate guarantees (fresh/--into/collision/
+# uninstall) plus, as of Wave 2H (SEED-068/069/070), the receipt/approve/
+# audit chain for real — a live memory-mesh/install.sh run, a real
+# --approve claude-md write, --audit against this checkout, and negative
+# fixtures proving each check actually detects the tamper it claims to (not
+# just clean-path smoke tests, which prove nothing about detection). It
+# still does NOT exercise the primary path's real trust boundary (an agent
+# obeying "show every mutating command," "stop means stop," and choosing to
+# stage+approve rather than write directly). The README's honest ledger
+# states that gap plainly — read it before treating a green badge as
+# agent-obedience coverage.
 on:
   push:
     branches: [main]
@@ -85,6 +96,16 @@ jobs:
           # collision refusal: a second --into must refuse, not merge
           if python3 install.py --target "$WS" --into; then
             echo "second --into should refuse"; exit 1; fi
+          # pre-existing content silently modified, no gated-write record ->
+          # check 1 FLAGS it (Wave 2H: the baseline captured before Phase 2
+          # wrote anything catches this even though the path was never
+          # shipped by the package)
+          echo "tampered without approval" > "$WS/my-project/notes.txt"
+          python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" | grep -q "\[FLAGGED\] check 1:" || \
+            (echo "expected check 1 to flag a tampered pre-existing file"; exit 1)
+          echo "user note" > "$WS/my-project/notes.txt"
+          python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit once the tamper is reverted"; exit 1)
           # surgical uninstall: seed components go, user content AND memory stay
           python3 install.py --target "$WS" --uninstall
           test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
@@ -102,9 +123,161 @@ jobs:
           bash "$ROOT/scheduler/sync.sh" --check
           # with a job scheduled for real, --detect must now find this install
           python3 install.py --detect | grep -q "install root" || (echo "--detect missed a live install" && exit 1)
+          # scheduler drift: the job vanishes from the manifest while the
+          # real crontab/launchd entry still exists -> orphan, check 2 FLAGS
+          cp "$ROOT/scheduler/manifest.yml" "${{ runner.temp }}/manifest.yml.bak"
+          printf 'jobs: []\n' > "$ROOT/scheduler/manifest.yml"
+          python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" | grep -q "\[FLAGGED\] check 2:" || \
+            (echo "expected check 2 to flag an orphaned scheduler unit"; exit 1)
+          cp "${{ runner.temp }}/manifest.yml.bak" "$ROOT/scheduler/manifest.yml"
+          python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit once the manifest is restored"; exit 1)
 
       - name: uninstall removes the whole footprint (Phase 7 undo path)
         run: |
           ROOT="${{ runner.temp }}/aios-target"
           python3 install.py --target "$ROOT" --uninstall
           if [ -d "$ROOT" ]; then echo "uninstall left the tree behind"; exit 1; fi
+
+      - name: install-audit — clean chain (Wave 2H, SEED-068/069)
+        # Never invoked before this wave: a real memory-mesh/install.sh run,
+        # a real --approve claude-md write, and --audit against this
+        # checkout as --package. Green here means the receipt/approve/audit
+        # chain works end to end, not just the deterministic substrate.
+        run: |
+          ROOT="${{ runner.temp }}/aios-audit-target"
+          PKG="$GITHUB_WORKSPACE"
+          python3 install.py --target "$ROOT"
+          python3 install.py --target "$ROOT" --audit --package "$PKG"
+
+          mkdir -p "$ROOT/.cc-seed/staged"
+          printf '# CLAUDE.md\n\nCI test workspace.\n' > "$ROOT/.cc-seed/staged/claude-md.proposed"
+          python3 install.py --target "$ROOT" --approve claude-md
+          grep -q "CI test workspace" "$ROOT/CLAUDE.md"
+          python3 install.py --target "$ROOT" --audit --package "$PKG"
+
+          python3 install.py --target "$ROOT" --approve mesh-bootstrap
+          python3 install.py --target "$ROOT" --audit --package "$PKG"
+          python3 install.py --target "$ROOT" --audit --package "$PKG" --json | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['result']=='PASS', r"
+
+      - name: install-audit — empty pre-existing CLAUDE.md must not false-flag (F5 fix, 2026-08-06 Gemini review)
+        # A 0-byte pre-existing CLAUDE.md still gets a baseline entry (hash
+        # of b""), but _approve_claude_md never prepends the "\n\n"
+        # separator to nothing — before check 3's fix, a byte-perfect
+        # --into install over an empty CLAUDE.md incorrectly FLAGGED
+        # "content outside the region does not match the pre-install
+        # baseline".
+        run: |
+          WS="${{ runner.temp }}/f5-empty-claude-md"
+          PKG="$GITHUB_WORKSPACE"
+          mkdir -p "$WS"
+          touch "$WS/CLAUDE.md"
+          python3 install.py --target "$WS" --into
+          mkdir -p "$WS/.cc-seed/staged"
+          printf 'proposed addition\n' > "$WS/.cc-seed/staged/claude-md.proposed"
+          python3 install.py --target "$WS" --approve claude-md
+          python3 install.py --target "$WS" --audit --package "$PKG" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit for a byte-perfect install over a 0-byte pre-existing CLAUDE.md"; \
+             python3 install.py --target "$WS" --audit --package "$PKG"; exit 1)
+
+      - name: install-audit — refuses a dirty --package as reference
+        run: |
+          ROOT="${{ runner.temp }}/aios-audit-dirty-pkg"
+          DIRTY="${{ runner.temp }}/dirty-pkg"
+          cp -a "$GITHUB_WORKSPACE" "$DIRTY"
+          echo "tampered" >> "$DIRTY/install.py"
+          python3 install.py --target "$ROOT"
+          if python3 install.py --target "$ROOT" --audit --package "$DIRTY"; then
+            echo "expected --audit to refuse a dirty --package"; exit 1; fi
+          python3 install.py --target "$ROOT" --audit --package "$DIRTY" 2>&1 | grep -qi "dirty" || \
+            (echo "dirty-package refusal reason not reported"; exit 1)
+
+      - name: install-audit — negative fixtures (each must FLAG the right check, not just exit nonzero)
+        run: |
+          ROOT="${{ runner.temp }}/aios-audit-neg"
+          PKG="$GITHUB_WORKSPACE"
+          python3 install.py --target "$ROOT"
+
+          # F6 fix (2026-08-06 Gemini review): assert_flagged used to check
+          # only the check ID, so a check FLAGGED for the WRONG reason (e.g.
+          # a false-positive on an unrelated fixture) still passed CI. An
+          # optional third arg now requires that specific reason text appear
+          # in the flag's own detail line, not just any FLAGGED under the
+          # right ID.
+          assert_flagged() {
+            CHECK="$1"
+            REASON="${2:-}"
+            OUT="$(python3 install.py --target "$ROOT" --audit --package "$PKG" || true)"
+            echo "$OUT" | grep -q "\[FLAGGED\] check $CHECK:" || \
+              (echo "expected check $CHECK to be FLAGGED; got:"; echo "$OUT"; exit 1)
+            if [ -n "$REASON" ]; then
+              echo "$OUT" | grep -qi -- "$REASON" || \
+                (echo "expected check $CHECK's flag to mention '$REASON'; got:"; echo "$OUT"; exit 1)
+            fi
+          }
+
+          assert_passed() {
+            CHECK="$1"
+            OUT="$(python3 install.py --target "$ROOT" --audit --package "$PKG" || true)"
+            echo "$OUT" | grep -Eq "\[ *PASS\] check $CHECK:" || \
+              (echo "expected check $CHECK to PASS; got:"; echo "$OUT"; exit 1)
+          }
+
+          # 1a. modified shipped file -> check 1
+          cp "$ROOT/_lib/secrets.py" "${{ runner.temp }}/secrets.py.orig"
+          echo "# tampered" >> "$ROOT/_lib/secrets.py"
+          assert_flagged 1 "content differs"
+          cp "${{ runner.temp }}/secrets.py.orig" "$ROOT/_lib/secrets.py"
+
+          # 1b. mode bit changed on a shipped file -> check 1
+          chmod +x "$ROOT/_lib/secrets.py"
+          assert_flagged 1 "mode changed"
+          chmod 644 "$ROOT/_lib/secrets.py"
+
+          # 1c. shipped file replaced by a symlink -> check 1
+          rm "$ROOT/_lib/secrets.py"
+          ln -s /etc/hostname "$ROOT/_lib/secrets.py"
+          assert_flagged 1 "type changed"
+          rm "$ROOT/_lib/secrets.py"
+          cp "${{ runner.temp }}/secrets.py.orig" "$ROOT/_lib/secrets.py"
+
+          # 1d. unexpected extra file with no source -> check 1
+          echo "surprise" > "$ROOT/not_shipped_by_anyone.txt"
+          assert_flagged 1 "UNEXPECTED"
+          rm "$ROOT/not_shipped_by_anyone.txt"
+
+          python3 install.py --target "$ROOT" --audit --package "$PKG" | grep -q "RESULT: PASS" || \
+            (echo "fixtures did not fully revert to a clean state"; exit 1)
+
+          # 3a. malformed/duplicate CLAUDE.md markers -> check 3
+          printf '<!-- cc-seed:start -->\nx\n<!-- cc-seed:end -->\n<!-- cc-seed:start -->\ny\n<!-- cc-seed:end -->\n' > "$ROOT/CLAUDE.md"
+          assert_flagged 3 "malformed markers"
+          rm "$ROOT/CLAUDE.md"
+
+          # 3b. approved region tampered after approval -> check 3
+          mkdir -p "$ROOT/.cc-seed/staged"
+          printf 'original approved content\n' > "$ROOT/.cc-seed/staged/claude-md.proposed"
+          python3 install.py --target "$ROOT" --approve claude-md
+          python3 -c "t = open('$ROOT/CLAUDE.md').read().replace('original approved content', 'original approved content\ninjected'); open('$ROOT/CLAUDE.md', 'w').write(t)"
+          assert_flagged 3 "does not match the approved hash"
+
+          # 2. scheduler/sync.py edited directly -> check 2 refuses to execute
+          # it rather than running unverified code as part of a read-only
+          # audit (Wave 2H-2, F2 fix — the flag message itself, not just a
+          # nonzero exit, must prove this was a refusal, not an executed-and-
+          # then-diffed drift report)
+          cp "$ROOT/scheduler/sync.py" "${{ runner.temp }}/sync.py.orig"
+          echo "# tampered" >> "$ROOT/scheduler/sync.py"
+          assert_flagged 2 "refusing to execute"
+          cp "${{ runner.temp }}/sync.py.orig" "$ROOT/scheduler/sync.py"
+          assert_passed 2
+
+          # 7. receipt.json edited directly on disk (bypassing install.py,
+          # e.g. an agent forging its own baseline entry) -> check 7 (Wave
+          # 2H-2, F1 fix). The out-of-target anchor a same-uid --target-
+          # scoped agent can't also write is what catches this.
+          cp "$ROOT/.cc-seed/receipt.json" "${{ runner.temp }}/receipt.json.orig"
+          python3 -c "import json; p='$ROOT/.cc-seed/receipt.json'; r=json.load(open(p)); r['baseline']['forged-by-agent.txt']={'type':'file','mode':'0o644','size':0,'hash':'sha256:'+'0'*64}; json.dump(r, open(p,'w'), indent=2, sort_keys=True)"
+          assert_flagged 7 "edited directly rather than through install.py"
+          cp "${{ runner.temp }}/receipt.json.orig" "$ROOT/.cc-seed/receipt.json"
+          assert_passed 7

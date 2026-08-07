@@ -9,12 +9,134 @@ Exit codes: 0 ok (incl. found-work with FINDINGS line), 1 real breakage.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mesh_lib as M
+
+TG_ENV = os.path.expanduser("~/.claude/channels/telegram/.env")
+TG_CHAT_ID = os.environ.get("OWNER_TG_CHAT_ID", "8795620728")
+HELD_MARK = ("# STALE-INDEX: a residency delta is HELD awaiting "
+             "`fold.py --promote-residency`")
+
+
+def _tg_token():
+    try:
+        with open(TG_ENV) as fh:
+            for line in fh:
+                if line.startswith("TELEGRAM_BOT_TOKEN="):
+                    return line.split("=", 1)[1].strip()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def _tg_push(text):
+    """Send `text` to Craig's Telegram; True on confirmed delivery, False
+    otherwise (never raises — a notify failure must not fail the fold).
+    Fleet convention: each self-notifying job owns its own small copy of this
+    helper (per connector-drift/notify.py, which checked for a shared _lib
+    module before writing its copy). NO parse_mode: memory slugs carry
+    underscores/hyphens, and Telegram's legacy Markdown parser 400s on odd
+    underscore counts (live-tested by connector-drift 2026-08-06)."""
+    tok = _tg_token()
+    if not tok:
+        print("fold: no telegram token — held-residency notice stays in the "
+              "journal:\n" + text, file=sys.stderr)
+        return False
+    data = urllib.parse.urlencode({
+        "chat_id": TG_CHAT_ID, "text": text,
+        "disable_web_page_preview": "true"}).encode()
+    try:
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % tok, data=data)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.load(r).get("ok", False)
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        print("fold: telegram push failed: %s" % e, file=sys.stderr)
+        return False
+
+
+def notify_held_residency(harness):
+    """Edge-triggered operator notification for a HELD residency delta.
+
+    Origin (R1, audits/2026-08-05-continuous-verification): the residency gate
+    held a +2-row delta on every 6-minute fold from 2026-08-02 to 2026-08-05
+    and the only trace was the systemd journal — three days of every session
+    loading a stale index. The gate is correct
+    (decisions/residency-autonomy-2026-07-31.md); the silence was the defect.
+    One Telegram when a delta BECOMES held (keyed by its row content, so a
+    changed delta re-pages), one reminder per 24h while it stays held, state
+    cleared the moment the hold clears.
+    """
+    state_f = M.MESH_ROOT / "state" / "held-notify.json"
+    if harness.get("status") != "staged":
+        state_f.unlink(missing_ok=True)
+        return
+    delta = harness.get("residency_delta") or {}
+    key = {"added": sorted(delta.get("added", [])),
+           "dropped": sorted(delta.get("dropped", []))}
+    now = int(time.time())
+    try:
+        prev = json.loads(state_f.read_text())
+    except (OSError, ValueError):
+        prev = {}
+    fresh = prev.get("key") != key
+    if not fresh and now - prev.get("notified_at", 0) < 24 * 3600:
+        return
+    since = now if fresh else prev.get("since", now)
+    head = ("memory-fold: residency delta HELD — your word needed" if fresh
+            else "memory-fold: residency delta STILL held "
+                 f"({(now - since) // 86400}d) — your word needed")
+    lines = [head,
+             f"+{len(key['added'])} / -{len(key['dropped'])} always-on rows:"]
+    lines += ["  + " + s for s in key["added"]]
+    lines += ["  - " + s for s in key["dropped"]]
+    lines += ["Every session loads the pre-hold index until you decide.",
+              "Run: python3 ~/Github/CC/memory-mesh/fold.py "
+              "--promote-residency"]
+    _tg_push("\n".join(lines)[:3500])
+    state_f.parent.mkdir(parents=True, exist_ok=True)
+    state_f.write_text(json.dumps(
+        {"key": key, "since": since, "notified_at": now}, indent=1))
+
+
+def mark_live_index_held(harness):
+    """While a delta is held, the live MEMORY.md keeps serving pre-hold rows.
+    Put that fact in the file's own header so a session reading it knows it is
+    stale, instead of trusting a fresh-looking index (R1 part b —
+    [[no-data-must-not-render-as-positive-data]] applied to the index itself).
+    Idempotent; the marker vanishes on the next full write because that
+    regenerates the whole file. Skips rather than breaching the loader
+    ceiling: a truncated index is worse than an unmarked one.
+    """
+    if harness.get("status") != "staged":
+        return
+    store = M.harness_store()
+    live = (store / "MEMORY.md") if store else None
+    if live is None or not live.exists():
+        return
+    text = live.read_text(encoding="utf-8")
+    if HELD_MARK in text:
+        return
+    d = harness.get("residency_delta") or {}
+    mark = (f"{HELD_MARK} (+{len(d.get('added', []))} / "
+            f"-{len(d.get('dropped', []))} rows staged)\n")
+    lines = text.splitlines(keepends=True)
+    out = "".join([lines[0], mark] + lines[1:]) if lines else mark
+    if (len(out.encode("utf-8")) >= M.LOADER_BYTE_CEILING
+            or out.count("\n") > M.LOADER_LINE_CEILING):
+        return
+    tmp = live.parent / f"MEMORY.md.tmp.{os.getpid()}"
+    tmp.write_text(out, encoding="utf-8")
+    os.replace(tmp, live)
 
 
 def fetch_peers():
@@ -190,6 +312,15 @@ def main():
     harness = M.write_harness_memory(
         fold, allow_residency_delta=args.promote_residency)
     alarms.extend(harness.get("alarms", []))
+
+    # R1: a held promotion is a decision waiting on the operator — page him
+    # and stamp the live index as stale, instead of leaving both facts in the
+    # journal. Neither may ever fail the fold.
+    try:
+        notify_held_residency(harness)
+        mark_live_index_held(harness)
+    except Exception as e:  # noqa: BLE001
+        alarms.append(f"held-residency notify/mark failed: {e}")
 
     # One fact, one answer, on both surfaces (Craig's ruling 2026-07-30: "if I
     # promote it, that must be fact everywhere"). The store's quarantine list is

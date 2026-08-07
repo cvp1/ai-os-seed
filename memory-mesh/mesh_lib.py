@@ -205,11 +205,32 @@ def event_id(host, session, ts, content, kind="", subject=""):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
+# B3 (continuous-verification audit, 2026-08-06, Grok-reviewed —
+# memory-mesh/reviews/2026-08-06-grok-b3-plan-review.md): a signed promotion
+# used to bind a short --content description string, not the store file's
+# actual bytes -- so has_signed_promotion() (cc-skills/improve/
+# memory_write.py) could not tell a promoted memory's real content from a
+# later overwrite. This binds the signature to the file.
+_FM_LINEAGE_STRIP = re.compile(r"^lineage:[ \t]*.*$\n?", re.M)
+
+
+def content_fingerprint(text):
+    """sha256 of a memory file's text with its `lineage:` frontmatter line
+    stripped — invariant under retag's ONE sanctioned mutation
+    (memory_write.py's set_lineage(), which byte-preserves everything else),
+    sensitive to any other change (body, description, any other frontmatter
+    field). Mirrors memory_write.py's own `_FM_LINEAGE` regex deliberately —
+    same duplicate-with-an-equality-comment posture as HOOK_MAX_CHARS below,
+    because this file predates the mesh being mandatory and callers must
+    keep working with mesh_lib absent."""
+    return hashlib.sha256(_FM_LINEAGE_STRIP.sub("", text).encode()).hexdigest()
+
+
 def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                lineage="operator-direct", audience="operator",
                confidence="inferred", supersedes=None, pin=False, ts=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
-               carry_forward=False):
+               carry_forward=False, body_sha256=None):
     # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
     # this is the one place a stump can be refused before it becomes doctrine —
     # backfill.py was gated first and the same week five more stumps arrived
@@ -245,6 +266,16 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
         ev["hook"] = hook
     if body is not None:
         ev["body"] = body
+    # B3 (2026-08-06): the fingerprint of the store file this signature
+    # actually vouches for. A plain dict key like every other optional field
+    # here — covered automatically by canonical_bytes()'s signature scope
+    # (excludes only sig/signer/underscore-prefixed keys), so the hash is
+    # part of what Craig's signature attests to, not a side-channel a
+    # forger could swap after the fact. Grandfathered events (signed before
+    # this existed) simply lack it — has_signed_promotion() treats absence
+    # as "no content binding on record", not as a failure.
+    if body_sha256 is not None:
+        ev["body_sha256"] = body_sha256
     if expires is not None:
         ev["expires"] = expires
     problems = validate_event(ev)

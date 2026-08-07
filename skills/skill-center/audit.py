@@ -15,8 +15,23 @@ Best-practice checks (Anthropic skill-authoring guide):
   - description not vague ("helps with", "processes data", ...)
   - SKILL.md body < 500 lines (progressive disclosure)
   - symlink resolves to a real file inside a git repo
+  - a vendored (`provenance: third-party`) skill has had its supervised first
+    run recorded (`observed: true`) — see --mark-observed below
 The why: the description is the ONLY thing the runtime matches against a user
 prompt, so a vague or first-person one silently fails to trigger.
+
+Supply-chain note (audits/2026-08-05-continuous-verification Epic D, D1/D2):
+a static SKILL.md review cannot see what a skill's referenced scripts do at
+runtime (SkillCloak-class payloads defeat >90% of static scanners). D1's
+2026-08-05 audit found zero third-party skills installed via this path — the
+cheapest point to land a control is before the first one arrives, not after.
+So: `--vendor NAME` marks a freshly-vendored skill `provenance: third-party`
++ `observed: false`; the audit flags it FIX until a human has supervised one
+real run and checked it against D1's own checklist (dynamic-context `!`
+lines, eval/exec/os.system, curl|sh, decode-then-execute) and run
+`--mark-observed NAME`. This is a lint gate, not a runtime sandbox — Claude
+Code has no per-skill execution jail to hook here; a real sandboxed-execution
+control is D3 (routed to ai-os-pm, not built in this repo).
 """
 import argparse
 import os
@@ -48,12 +63,12 @@ def parse_frontmatter(text):
     return meta, body.splitlines()
 
 
-def load_skills():
+def load_skills(skills_dir=SKILLS_DIR):
     out = []
-    if not os.path.isdir(SKILLS_DIR):
+    if not os.path.isdir(skills_dir):
         return out
-    for name in sorted(os.listdir(SKILLS_DIR)):
-        path = os.path.join(SKILLS_DIR, name, "SKILL.md")
+    for name in sorted(os.listdir(skills_dir)):
+        path = os.path.join(skills_dir, name, "SKILL.md")
         rec = {"name": name, "path": path, "exists": os.path.exists(path),
                "real": os.path.realpath(path) if os.path.exists(path) else None}
         if rec["exists"]:
@@ -92,7 +107,83 @@ def lint(rec):
         issues.append(f"body {rec['body_lines']} lines > 500 — split via progressive disclosure")
     if rec["real"] and "/Github/" not in rec["real"]:
         issues.append("canonical file not in a git repo under ~/Github (not version-controlled)")
+    if rec["meta"].get("provenance") == "third-party" and rec["meta"].get("observed") != "true":
+        issues.append("UNOBSERVED third-party skill — supervise one real run (check "
+                       "dynamic-context `!` lines, eval/exec/os.system, curl|sh, "
+                       "decode-then-execute per D1's checklist), then run "
+                       f"`audit.py --mark-observed {rec['name']}`")
     return issues
+
+
+def _set_frontmatter_key(text, key, value):
+    """Set a top-level `key: value` in a SKILL.md's frontmatter, byte-preserving
+    everything else (same rewrite-not-regenerate discipline as
+    memory_write.py's set_lineage() — a vendoring/observation stamp must never
+    become an excuse to touch the body a reviewer is about to read)."""
+    if not text.startswith("---"):
+        raise ValueError("no `---` frontmatter block — refusing to guess")
+    end = text.find("\n---", 3)
+    if end == -1:
+        raise ValueError("frontmatter block never closes — refusing to guess")
+    fm, rest = text[3:end], text[end:]
+    pattern = re.compile(rf"^{re.escape(key)}:.*$", re.M)
+    line = f"{key}: {value}"
+    if pattern.search(fm):
+        fm = pattern.sub(line, fm, count=1)
+    else:
+        # After `name:` if present, else at the top of the block.
+        anchor = re.search(r"^name:.*$", fm, re.M)
+        fm = (fm[: anchor.end()] + "\n" + line + fm[anchor.end():]
+              if anchor else "\n" + line + fm)
+    return "---" + fm + rest
+
+
+def _find_skill(skills, name):
+    for rec in skills:
+        if rec["name"] == name:
+            return rec
+    return None
+
+
+def cmd_vendor(skills, name):
+    rec = _find_skill(skills, name)
+    if rec is None or not rec["exists"]:
+        print(f"error: no skill '{name}' at ~/.claude/skills/{name}/SKILL.md — "
+              "vendor it in first (repo + symlink, per the FIND-mode convention), "
+              "then run --vendor to stamp it.", file=sys.stderr)
+        return 1
+    if rec["meta"].get("provenance") == "third-party":
+        print(f"'{name}' is already marked provenance: third-party "
+              f"(observed: {rec['meta'].get('observed', 'false')})")
+        return 0
+    new_text = _set_frontmatter_key(rec["text"], "provenance", "third-party")
+    new_text = _set_frontmatter_key(new_text, "observed", "false")
+    with open(rec["real"], "w", encoding="utf-8") as f:
+        f.write(new_text)
+    print(f"marked '{name}' provenance: third-party, observed: false -> {rec['real']}")
+    print("Before unrestricted use: supervise one real run (dynamic-context `!` "
+          "lines, eval/exec/os.system, curl|sh, decode-then-execute — D1's "
+          f"checklist), then: audit.py --mark-observed {name}")
+    return 0
+
+
+def cmd_mark_observed(skills, name):
+    rec = _find_skill(skills, name)
+    if rec is None or not rec["exists"]:
+        print(f"error: no skill '{name}' at ~/.claude/skills/{name}/SKILL.md", file=sys.stderr)
+        return 1
+    if rec["meta"].get("provenance") != "third-party":
+        print(f"error: '{name}' is not marked provenance: third-party — "
+              "nothing to observe (run --vendor first if it should be)", file=sys.stderr)
+        return 1
+    if rec["meta"].get("observed") == "true":
+        print(f"'{name}' is already marked observed: true — nothing to do")
+        return 0
+    new_text = _set_frontmatter_key(rec["text"], "observed", "true")
+    with open(rec["real"], "w", encoding="utf-8") as f:
+        f.write(new_text)
+    print(f"marked '{name}' observed: true -> {rec['real']}")
+    return 0
 
 
 def cmd_audit(skills):
@@ -139,10 +230,20 @@ def cmd_find(skills, query):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--find", metavar="QUERY", help="rank local skills by relevance")
+    ap.add_argument("--vendor", metavar="NAME",
+                     help="stamp a freshly-vendored skill provenance: third-party, observed: false")
+    ap.add_argument("--mark-observed", metavar="NAME",
+                     help="record that a third-party skill's supervised first run is done")
+    ap.add_argument("--dir", metavar="PATH", default=SKILLS_DIR,
+                     help="skills directory to audit (default: ~/.claude/skills)")
     args = ap.parse_args()
-    skills = load_skills()
+    skills = load_skills(os.path.expanduser(args.dir))
     if args.find:
         return cmd_find(skills, args.find)
+    if args.vendor:
+        return cmd_vendor(skills, args.vendor)
+    if args.mark_observed:
+        return cmd_mark_observed(skills, args.mark_observed)
     return cmd_audit(skills)
 
 

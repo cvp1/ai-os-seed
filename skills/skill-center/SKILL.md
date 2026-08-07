@@ -58,6 +58,23 @@ When Craig describes a need, **search before building**:
 Don't build what already exists. Vendoring a public skill still follows the
 repo+symlink convention so it stays version-controlled.
 
+**Vendored skills get a supervised first run before unrestricted use.** A
+static SKILL.md review can't see what a referenced script does at runtime —
+D1's 2026-08-05 audit (`audits/2026-08-05-continuous-verification/`) found
+zero third-party skills installed, which is exactly the cheap window to land
+this before the first one arrives. After the repo+symlink vendor step:
+1. `audit.py --vendor <name>` — stamps `provenance: third-party` +
+   `observed: false` in the skill's frontmatter. `audit.py`'s lint now flags
+   it FIX until observed.
+2. Run it once, supervised, on non-sensitive input, and check it against D1's
+   checklist: dynamic-context `!` lines, `eval`/`exec`/`os.system`, `curl|sh`,
+   decode-then-execute payloads, unexpected secrets/network reach.
+3. Clean → `audit.py --mark-observed <name>`. Something looks wrong → don't
+   mark it; fix or drop the skill instead.
+This is a lint gate, not a runtime sandbox — Claude Code has no per-skill
+execution jail to hook here. Real sandboxed execution is a product bet
+(Epic D3, routed to ai-os-pm), not something this repo can build.
+
 ---
 
 ## Mode: CREATE — scaffold a new skill

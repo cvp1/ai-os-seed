@@ -147,10 +147,33 @@ def main():
     if not subject or not content:
         sys.exit("sign: --subject and --content required (or --promote)")
 
+    # B3 (2026-08-06, Grok-reviewed — memory-mesh/reviews/2026-08-06-grok-b3
+    # -plan-review.md): bind the signature to the store file's ACTUAL bytes,
+    # not just the short --content description. Covers both --promote and a
+    # direct --subject/--content call, since both land here before
+    # make_event(). A lesson subject with no store file to hash would sign
+    # an unbound promotion — refused rather than silently signed without a
+    # body_sha256, so no lesson/* promotion event is ever created that
+    # nothing can be checked against later.
+    body_sha256 = None
+    if subject.startswith("lesson/"):
+        slug = subject.split("/", 1)[1]
+        store_file = Path(M.store_dir()) / f"{slug}.md"
+        if not store_file.exists():
+            sys.exit(
+                f"sign: refusing to promote {subject!r} — no store file at "
+                f"{store_file}.\n"
+                "  A lesson subject with nothing to hash would sign an "
+                "unbound promotion (B3). If this is a mesh-only subject "
+                "with no store-file counterpart, that's expected — but it "
+                "can't be promoted through this path.")
+        body_sha256 = M.content_fingerprint(store_file.read_text())
+
     ev, _ = M.make_event("correct", subject, content, session=args.session,
                          polarity=polarity, home=home, audience=args.audience,
                          confidence="operator-stated",
-                         supersedes=supersedes or None)
+                         supersedes=supersedes or None,
+                         body_sha256=body_sha256)
     M.sign_event(ev, args.signer)          # raises loudly if vault locked
     if not M.verify_sig(ev):
         sys.exit("sign: signature did not verify against allowed_signers — "

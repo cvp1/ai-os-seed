@@ -268,7 +268,31 @@ on a daily-driver Linux box.
 `freshness.py` reporting OK, a real crontab/launchd install with
 drift-check, then `--uninstall` removing the entire footprint. Green badge
 means the install worked on both OSes as of the last push — observed, not
-"should work."
+"should work." **What it doesn't cover:** CI calls `install.py` directly —
+it never drives `AGENT-INSTALL.md` through an actual LLM agent, so the
+primary install path's real trust boundary (an agent reading and obeying
+"show every mutating command," "only scripts move bytes," "stop means
+stop") has no automated coverage. One live sandbox pass with a real agent
+is recorded above; that's the only data point, not a standing check.
+
+**The two highest-stakes agent-authored writes are now bytes-bound, not
+just instructed.** `install.py` writes a receipt at every state-changing
+step (a pre-write baseline of anything already at your target, and a record
+of the two gated writes below); the agent never has an Edit/Write call on
+`CLAUDE.md` or runs the memory-mesh bootstrap directly — `install.py
+--approve` does, in one atomic step with the human. `install.py --audit
+--package <clone>` then compares live state against the receipt and this
+repo's own manifest (never against the installed tree — a same-uid agent
+rewriting the tree can't rewrite what the audit compares against). Live
+regression-tested: content, mode-bit, and symlink tamper on shipped files;
+a tampered CLAUDE.md region after approval; an unexpected file; pre-existing
+content modified without an approval record — all correctly flagged.
+**What it still doesn't cover:** a determined adversarial agent (same
+residual as memory-mesh signing's "one honest edge" — this raises the bar
+against drift and confusion, not against compromise), and CI does not yet
+run this chain end to end (tracked, not yet built). It also does not audit
+your whole machine — see the audit's own perimeter disclaimer, printed at
+the top of every run.
 
 **The cognitive spine is live-verified end to end.** In one fresh sandbox:
 the demo job logged its row, `/status` reported it honestly — and in a

@@ -50,8 +50,10 @@ TARGET_JOBS = [
     "starlink_watch", "meshtastic_health", "panel_health", "rain_watch",
     "vivint_ha_watchdog", "unifi_links", "fleet_sweep",
     "telegram_bridge_healthcheck", "notes_backup", "cognizant_brief",
-    "energy_advisor", "signal_scan", "signal_scan_eval", "home_digest",
+    "signal_scan", "signal_scan_eval", "home_digest",
 ]
+# energy_advisor removed 2026-08-04 — the 06:30 daily push was retired, so a
+# staleness monitor on it would alarm on the retirement, not on a fault.
 
 cfg_jobs = freshness.json.loads(freshness._CONFIG.read_text())["jobs"]
 
@@ -59,7 +61,7 @@ for job in TARGET_JOBS:
     check("%s: configured in freshness.json" % job, job in cfg_jobs)
 
 # --- every target evaluates against the REAL runs.db as a real status,
-# never MISSING (all 18 have live run history — a MISSING result here means
+# never MISSING (all 17 have live run history — a MISSING result here means
 # the freshness.json job name doesn't match the wrapper's real --job string)
 conn = obs_db.connect()
 now = datetime.now(timezone.utc)

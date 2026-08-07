@@ -7,13 +7,19 @@ Binding rules for the whole install:
 1. **Show every mutating command before you run it**, and run it only after
    the user can see it. Read-only checks may run freely.
 2. **Only deterministic tools move bytes.** Every file that lands in the
-   user's install comes from `git clone` or `install.py` — never type out
-   file contents yourself. (Exception: Phase 4's personalized CLAUDE.md,
-   which is new content you author *for this user*, clearly labeled.)
+   user's install comes from `git clone`, `install.py`, or a shipped script
+   you show and then run (`memory-mesh/install.sh`, `scheduler/sync.sh`) —
+   never type out file contents yourself, with two labeled exceptions: Phase
+   4's personalized `CLAUDE.md` and Phase 5's first memory note + its
+   `MEMORY.md` index bullet — both new content you author *for this user*,
+   both shown before you write them.
 3. **Never fabricate.** If something is missing or fails, stop, show the
    real error, and say what the user can do — do not improvise around it.
 4. **Stop means stop.** A failed readiness check ends the install with a
    clear message; don't push through.
+5. **`<ROOT>` below is a placeholder.** Substitute the literal resolved
+   path, quoted, in every command you actually run — an unquoted path with
+   a space breaks the command and Rule 4 then applies.
 
 ## Phase 0 — Readiness (read-only)
 
@@ -121,16 +127,33 @@ Any other outcome: stop and show it.
 
 ## Phase 4 — Personalize (the one thing you author)
 
-Draft `<ROOT>/CLAUDE.md` fresh for this user: who they are (Phase 1), what
-this workspace is, and pointers to `PRINCIPLES.md` and the component READMEs.
-Keep it short — it will grow with their system. Mark it clearly as
-generated-at-install so they know it's theirs to rewrite. Do NOT copy
+Draft the CLAUDE.md content fresh for this user: who they are (Phase 1),
+what this workspace is, and pointers to `PRINCIPLES.md` and the component
+READMEs. Keep it short — it will grow with their system. Do NOT copy
 `CLAUDE.md.template` — it's a leak-scrubbed export kept only as a
 structural reference.
 
-**If this was an `--into` install, `<ROOT>/CLAUDE.md` already exists and
-is theirs.** Don't replace it — propose a short addition (what the seed
-added, where the ops verbs live) and let the user approve the edit.
+**If this was an `--into` install, `<ROOT>/CLAUDE.md` already exists and is
+theirs.** Draft a short addition instead (what the seed added, where the
+ops verbs live) — same stage-then-approve flow below, just shorter content.
+
+**You do not write `<ROOT>/CLAUDE.md` yourself.** Stage the exact content,
+show it to the user verbatim (not narrated), and only `install.py --approve`
+moves it into place — this binds what the user saw to what actually lands,
+closing a real gap in the old "show it, then write it" flow where nothing
+checked the two matched (Wave 2H/SEED-069):
+
+    mkdir -p <ROOT>/.cc-seed/staged
+    # write the exact drafted content to <ROOT>/.cc-seed/staged/claude-md.proposed
+    # show the user that file's content, then:
+    python3 install.py --target <ROOT> --approve claude-md
+
+`--approve` hashes the staged bytes, records that hash in the install
+receipt, and moves them into `<ROOT>/CLAUDE.md` wrapped in
+`<!-- cc-seed:start -->`/`<!-- cc-seed:end -->` markers, in the same step —
+you never get an Edit/Write call on `<ROOT>/CLAUDE.md`. It prints the hash
+back; if a second `--approve claude-md` refuses because a region already
+exists, that's the "no nesting, no silent overwrite" guard — resolve by hand.
 
 ## Phase 5 — Memory (the first note, demonstrated not described)
 
@@ -139,8 +162,13 @@ added, where the ops verbs live) and let the user approve the edit.
 file, frontmatter schema — read it if you haven't). **If Phase 2 skipped
 `memory/` because the workspace already had one:** the user's existing
 memory conventions govern, not the seed's — read *their* index, follow
-*their* format for the note below, and change nothing about how their
-memory works. Two things now:
+*their* format for the note below, and change nothing else about how
+their memory works. **One exception, stated plainly, same as the README:**
+step 3 below (the mesh bootstrap) converts `MEMORY.md` from a file the
+user hand-edits into one this fold regenerates — a real, visible change if
+they don't want it. Tell them that before running it, and if they'd rather
+keep hand-authored memory, skip step 3 entirely; steps 1-2 and everything
+else in this install still stand without it. Three things now:
 
 1. Tell the user plainly: this only works if *your* memory (the agent
    running this install) is actually configured to read from
@@ -156,17 +184,21 @@ memory works. Two things now:
    `MEMORY.md` in the same step.
 3. Bootstrap the memory mesh — the event-sourced layer underneath the
    notes (append-only history, contradiction detection, replay; spec in
-   `<ROOT>/memory-mesh/SPEC.md`). Show, then run:
+   `<ROOT>/memory-mesh/SPEC.md`). This is the other gated write
+   (Wave 2H/SEED-069) — show the user the exact command below and have
+   *them* run it, rather than running it yourself:
 
-       bash <ROOT>/memory-mesh/install.sh
+       python3 install.py --target <ROOT> --approve mesh-bootstrap
 
-   This starts a local event log (plain git, this machine only), schedules
-   a 5-minute fold, backfills the index bullet from step 2 as the first
-   event, and flips `MEMORY.md` to fold-generated (the pre-flip index is
-   kept at `MEMORY.md.pre-mesh`). Verify: `MEMORY.md` now opens with a
-   GENERATED header and carries the step-2 note. From here, new durable
-   lessons are emitted (`/improve` does this), never hand-indexed. More
-   machines later: `<ROOT>/memory-mesh/ENROLL.md`.
+   `--approve` runs `memory-mesh/install.sh` itself (never you directly)
+   and records the approval plus a before/after hash in the install
+   receipt. Verify: the workspace's memory store now opens with a
+   GENERATED header and carries the step-2 note — that store lives at
+   `~/.claude/projects/<ROOT with / replaced by ->/memory/`, **not**
+   `<ROOT>/memory/`. `<ROOT>/memory/` is the shipped scaffold/doc copy and
+   this step never touches it — a real distinction, easy to assume away.
+   From here, new durable lessons are emitted (`/improve` does this),
+   never hand-indexed. More machines later: `<ROOT>/memory-mesh/ENROLL.md`.
 
 ## Phase 5.5 — Governance (withheld in this release)
 
@@ -200,6 +232,31 @@ freshness is green now and the scheduler keeps it green from here —
 that's the whole spine live: **scheduler → job → runs.db → freshness.**
 
 ## Phase 7 — Hand back
+
+**Tell the user to open a fresh terminal and run the auditor themselves —
+that, not anything you paste into this chat, is the completion signal**
+(Wave 2H/SEED-068):
+
+    python3 install.py --target <ROOT> --audit --package <path to this clone>
+
+This compares the live install against the receipt `install.py` kept at
+every state-changing step and against this clone's own manifest — never
+against the installed tree, so it isn't grading its own homework. Show them
+the command; you may run it yourself first if useful, but say plainly that
+your own run doesn't count — an agent pasting audit output into chat is not
+the completion signal, a human reading it themselves in a fresh terminal is.
+A clean run prints `RESULT: PASS` and exits 0; anything else prints exactly
+what it found and exits nonzero.
+
+**Quote this to them — it's the audit's own perimeter disclaimer, and it
+matters more than the PASS/FAIL line:** *"This audit verified `<ROOT>`, the
+managed scheduler block/plists, (partially) keyvault's shipped scripts, and
+— if mesh-bootstrap was approved — the one Claude Code memory-store path
+that write deterministically targets. It did not scan shell rc files, SSH
+config, other applications' config, or anything else outside `<ROOT>`. A
+confused install session can still write there; this audit cannot see it."*
+A clean audit means the install matches what was approved — it does not
+mean the machine is safe.
 
 Tell the user, concretely:
 
