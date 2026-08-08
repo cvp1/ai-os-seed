@@ -34,7 +34,7 @@ sys.path.insert(0, str(HERE))
 import db as obs_db  # noqa: E402
 import freshness  # noqa: E402
 
-HERMES_JOBS = Path("~/.hermes/cron/jobs.json").expanduser()
+HERMES_JOBS = Path("~/.{{REDACTED}}/cron/jobs.json").expanduser()
 
 FAILS = []
 

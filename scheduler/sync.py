@@ -2,7 +2,7 @@
 """Reconcile the real OS scheduler (crontab on Linux, launchd on macOS) to
 match scheduler/manifest.yml — the portable re-target of CC's own
 cron/sync.sh (manifest-as-source-of-truth + drift-check) at plain
-crontab/launchd instead of the hermes gateway (SEED-014).
+crontab/launchd instead of the {{REDACTED}} gateway (SEED-014).
 
     scheduler/sync.py            install/reconcile every manifest.yml job (idempotent)
     scheduler/sync.py --check    report drift only, change nothing; exit 1 on drift

@@ -18,7 +18,7 @@ reinvention (find before you build) and to make every new skill trigger reliably
 and land in the right place (best-practices + Craig's conventions, enforced by
 scripts so they aren't re-derived each time).
 
-Two dependency-free scripts under `~/Github/CC/cc-skills/skill-center/`, run with
+Two dependency-free scripts under `~/{{REDACTED}}/cc-skills/skill-center/`, run with
 `/usr/bin/python3`:
 - `audit.py` — lints local skills; `--find "query"` ranks them by relevance.
 - `scaffold.py` — plan-validate-execute creation of a new skill (dry-run default).
@@ -26,16 +26,16 @@ Two dependency-free scripts under `~/Github/CC/cc-skills/skill-center/`, run wit
 ## Craig's conventions (every created skill must follow these)
 
 - **Canonical-in-repo + symlink.** The real `SKILL.md` lives in a git repo under
-  `~/Github/CC` (private, {{REDACTED}}, HTTPS). `~/.claude/skills/<name>/SKILL.md` is a
+  `~/{{REDACTED}}` (private, {{REDACTED}}, HTTPS). `~/.claude/skills/<name>/SKILL.md` is a
   **symlink** to it. Simple/workflow skills go in the shared `{{REDACTED}}/cc-skills`
   repo; skills with real code get their own repo.
 - **Scripts stay in the repo**, referenced by absolute path:
-  `/usr/bin/python3 ~/Github/CC/<repo>/run.py "…"`. The skill dir only holds the
+  `/usr/bin/python3 ~/{{REDACTED}}/<repo>/run.py "…"`. The skill dir only holds the
   symlinked `SKILL.md`.
 - **Secrets from `~/.key/`** (fscrypt vault, locked after reboot) — never
   hardcode or echo. Shared secrets/ha/mail helpers via `_lib`/cc-lib bootstrap.
-- **Scheduled skills** register a hermes cron shim — a **real file** in
-  `~/.hermes/scripts/` (the scheduler rejects symlinks/abs paths).
+- **Scheduled skills** register a {{REDACTED}} cron shim — a **real file** in
+  `~/.{{REDACTED}}/scripts/` (the scheduler rejects symlinks/abs paths).
 - **Hot-load:** a new `SKILL.md` is usable this session; a new *agent* needs a
   restart. Validate the underlying pipeline, not the dispatch.
 
@@ -45,7 +45,7 @@ Two dependency-free scripts under `~/Github/CC/cc-skills/skill-center/`, run wit
 
 When Craig describes a need, **search before building**:
 
-1. **Local inventory** — `/usr/bin/python3 ~/Github/CC/cc-skills/skill-center/audit.py --find "the need"`.
+1. **Local inventory** — `/usr/bin/python3 ~/{{REDACTED}}/cc-skills/skill-center/audit.py --find "the need"`.
    Also check the skills list in the session system-prompt.
 2. **Public ecosystem** — WebSearch the `anthropics/skills` repo and skill
    marketplaces (e.g. "anthropics skills <need>", "claude code skill <need>").
@@ -86,13 +86,13 @@ execution jail to hook here. Real sandboxed execution is a product bet
    - Output format? Read-only or does it change state (mail/cron/files)?
    - Does it need secrets/endpoints (→ `~/.key`, cc-lib) or its own repo (→ has
      real code) vs the shared cc-skills repo?
-   - Scheduled (→ hermes cron) or interactive-only?
+   - Scheduled (→ {{REDACTED}} cron) or interactive-only?
 
 2. **Plan + validate** (dry-run):
    ```
-   /usr/bin/python3 ~/Github/CC/cc-skills/skill-center/scaffold.py \
+   /usr/bin/python3 ~/{{REDACTED}}/cc-skills/skill-center/scaffold.py \
      --name <kebab> --desc "<what it does>. Use when Craig says \"/<name>\", …" \
-     [--repo-path ~/Github/CC/<name>] [--with-scripts]
+     [--repo-path ~/{{REDACTED}}/<name>] [--with-scripts]
    ```
    It validates the description (third-person, has triggers, not vague) and
    prints exactly what it will create. Fix any VALIDATION FAILED issues first.
@@ -107,16 +107,16 @@ execution jail to hook here. Real sandboxed execution is a product bet
 5. **Validate + register**:
    - `audit.py` — confirm the new skill lints clean.
    - Commit to the repo with Craig's identity:
-     `git -C ~/Github/CC/<repo> -c user.name='{{REDACTED}}' -c user.email='{{REDACTED}}@gmail.com' commit …`
+     `git -C ~/{{REDACTED}}/<repo> -c user.name='{{REDACTED}}' -c user.email='{{REDACTED}}@gmail.com' commit …`
    - Write an auto-memory file + a one-line `MEMORY.md` pointer.
-   - If scheduled: add the hermes cron shim (real file) + manifest entry.
+   - If scheduled: add the {{REDACTED}} cron shim (real file) + manifest entry.
    - **Validate live once** end-to-end before calling it done.
 
 ---
 
 ## Mode: AUDIT — lint existing skills
 
-`/usr/bin/python3 ~/Github/CC/cc-skills/skill-center/audit.py`
+`/usr/bin/python3 ~/{{REDACTED}}/cc-skills/skill-center/audit.py`
 
 Flags vague/first-person descriptions, missing triggers, bodies over 500 lines,
 and broken or non-version-controlled symlinks. Use periodically, or after editing

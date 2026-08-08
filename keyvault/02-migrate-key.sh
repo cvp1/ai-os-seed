@@ -3,7 +3,7 @@
 # Run as your NORMAL user (not root), in a real terminal — fscrypt will prompt
 # you to set the vault passphrase:
 #
-#   bash ~/Github/CC/keyvault/02-migrate-key.sh
+#   bash ~/{{REDACTED}}/keyvault/02-migrate-key.sh
 #
 # fscrypt can only encrypt an EMPTY dir, so this does a safe copy-swap:
 #   plaintext ~/.key  ->  temp backup  ->  fresh encrypted ~/.key  ->  copy back
@@ -55,12 +55,12 @@ cat <<EOF
 DONE — ~/.key is now an encrypted fscrypt vault (currently UNLOCKED).
 
 Verify a secret still reads, e.g.:
-  python3 -c "import sys;sys.path.insert(0,'$HOME/Github/CC');from _lib import secrets;print(bool(secrets.load_secret('X','~/.key/ha_token','ha token')))"
+  python3 -c "import sys;sys.path.insert(0,'$HOME/{{REDACTED}}');from _lib import secrets;print(bool(secrets.load_secret('X','~/.key/ha_token','ha token')))"
 
 Once you've confirmed jobs work, delete the safety tarball:
   shred -u $TAR
 
 AFTER EVERY REBOOT the vault starts LOCKED. Unlock it with:
-  bash ~/Github/CC/keyvault/unlock.sh
+  bash ~/{{REDACTED}}/keyvault/unlock.sh
 (The freshness check will flag any cron job that ran while it was still locked.)
 EOF

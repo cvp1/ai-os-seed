@@ -335,6 +335,15 @@ cross from inside the same user account.
 and orphan-job detection; and that your pre-existing crontab entries
 survive untouched.
 
+**Known issue: shipped skills aren't registered anywhere.** `install.py`
+copies the `skills/` component to disk, but nothing symlinks each
+`skills/<name>/SKILL.md` into `~/.claude/skills/<name>/SKILL.md` — the path
+Claude Code actually discovers skills from (and the same path
+`skill-center/audit.py`/`scaffold.py` already assume exists). On a fresh
+install, the shipped skills are present on disk but invisible to the agent
+until you register them by hand. Fix tracked for the F1 portability pass
+(context-build + skills-registration work) — not yet built.
+
 **What isn't covered:** your specific machine's quirks. The first
 real-hardware install found a genuine bug
 ([#1](https://github.com/cvp1/ai-os-seed/issues/1), fixed the same day) —

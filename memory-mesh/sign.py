@@ -35,7 +35,7 @@ def append(ev, line):
 
 
 MEMORY_WRITE = Path(os.path.expanduser(
-    "~/Github/CC/cc-skills/improve/memory_write.py"))
+    "~/{{REDACTED}}/cc-skills/improve/memory_write.py"))
 
 
 def reconcile_store(subject):

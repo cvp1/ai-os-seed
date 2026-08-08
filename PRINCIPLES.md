@@ -52,13 +52,16 @@ covered by a specific convention, reason from here.
     everywhere — `public` < `internal` < `sensitive`. Sensitive data (e.g. {{REDACTED}}
     work email/calendar) may reach only **first-party** providers: the local Ollama
     node, Claude/Anthropic (decided 2026-07-08 — so a `.21` outage falls back to Claude
-    rather than going dark), xAI/Grok (2026-07-27) and OpenAI (2026-07-31). It NEVER reaches a
-    third party (DeepSeek, Gemini, OpenRouter), even under an explicit pin. Unknown
-    data-class fails loud, never open. **Who is first-party is Craig's call, not a
-    fixed property of a vendor** — each revision gets a dated record in `decisions/`
-    AND is encoded in `_lib/merit_policy.CANDIDATES`, the one authority every other
-    layer derives from. A decision recorded but not encoded is the failure mode: the
-    Grok ruling sat unapplied in code for four days.
+    rather than going dark), xAI/Grok (2026-07-27), OpenAI (2026-07-31) and Gemini
+    (2026-08-07). It NEVER reaches a third party (DeepSeek, OpenRouter), even under
+    an explicit pin. Unknown data-class fails loud, never open. **Who is first-party
+    is Craig's call, not a fixed property of a vendor** — each revision gets a dated
+    record in `decisions/` AND is encoded in `_lib/merit_policy.CANDIDATES`, the one
+    authority every other layer derives from. A decision recorded but not encoded is
+    the failure mode: the Grok ruling sat unapplied in code for four days. A trust
+    promotion is also NOT a tool-security clearance: Gemini the API is first-party,
+    but Gemini CLI / Antigravity as agentic tools over sensitive repos remain a
+    separate, unresolved axis (`decisions/grok-build-gemini-cli-not-adopted-2026-08-06.md`).
 
 ## Architecture
 12. **Small sharp tools on a shared spine.** Independent repos, one concern each,

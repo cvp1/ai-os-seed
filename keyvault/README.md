@@ -29,8 +29,8 @@ useless without it.
 ## First-time setup (in a real terminal — these prompt for sudo + passphrase)
 
 ```bash
-sudo bash ~/Github/CC/keyvault/01-setup-fscrypt.sh
-bash      ~/Github/CC/keyvault/02-migrate-key.sh      # set a STRONG vault passphrase; store it in your password manager
+sudo bash ~/{{REDACTED}}/keyvault/01-setup-fscrypt.sh
+bash      ~/{{REDACTED}}/keyvault/02-migrate-key.sh      # set a STRONG vault passphrase; store it in your password manager
 # verify a job, then:  shred -u ~/.key.pre-fscrypt.*.tar
 ```
 
@@ -41,12 +41,12 @@ with a clear `🔒 ~/.key is locked` message (from `_lib/secrets.py`), and the
 **freshness check** (`cron` job `826de76e370d`) flags the stalled jobs.
 
 ```bash
-bash ~/Github/CC/keyvault/unlock.sh
+bash ~/{{REDACTED}}/keyvault/unlock.sh
 ```
 
 Reboots here are ~weekly, so this is a roughly-weekly chore. The key lands in the
 filesystem keyring (fscrypt **v2** policy on kernel 6.17), so a single unlock
-covers all of this user's processes — including hermes cron — until the next
+covers all of this user's processes — including {{REDACTED}} cron — until the next
 reboot. No per-job change needed.
 
 ## Login reminder (in `~/.bashrc`)
@@ -58,7 +58,7 @@ kept here for recovery:
 ```bash
 # --- keyvault: warn at login when the ~/.key fscrypt vault is locked ---
 if [[ $- == *i* ]] && [ -d "$HOME/.key" ] && [ ! -e "$HOME/.key/.vault_unlocked" ] && [ -n "$(ls -A "$HOME/.key" 2>/dev/null)" ]; then
-    printf '\033[33m🔒 ~/.key vault is LOCKED\033[0m — cron secrets unavailable until you run: \033[36mbash ~/Github/CC/keyvault/unlock.sh\033[0m\n'
+    printf '\033[33m🔒 ~/.key vault is LOCKED\033[0m — cron secrets unavailable until you run: \033[36mbash ~/{{REDACTED}}/keyvault/unlock.sh\033[0m\n'
 fi
 ```
 

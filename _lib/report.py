@@ -3,7 +3,7 @@
 
 Skills keep printing to the terminal as usual, and *additionally* call this to
 drop a self-contained, dated HTML artifact under
-``~/Github/CC/reports/<skill>/<date>.html`` — archived and served by cc-docs at
+``<repo-root>/reports/<skill>/<date>.html`` — archived and served by cc-docs at
 ``:8090/reports/<skill>/``. Stdlib only, so every skill that already imports
 from ``_lib`` can use it with no new deps.
 
@@ -18,7 +18,7 @@ Two ways to use it:
       print("archived:", info["url"])
 
   LLM / headless skills (emit markdown text) — pipe the answer in:
-      some_skill | python3 ~/Github/CC/_lib/report.py \\
+      some_skill | python3 _lib/report.py \\
           --skill triage --title "Inbox triage" --badge "3 need reply:warn"
   (prints the cc-docs URL of the saved report)
 

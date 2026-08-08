@@ -4,9 +4,9 @@
 Usage:
     log_run.py --job morning_brief -- /usr/bin/python3 /path/to/morning_brief.py [args...]
 
-Behaviour contract (so it can sit transparently between hermes cron and the real
+Behaviour contract (so it can sit transparently between {{REDACTED}} cron and the real
 script):
-  * The wrapped command's stdout is streamed to OUR stdout unchanged — hermes
+  * The wrapped command's stdout is streamed to OUR stdout unchanged — {{REDACTED}}
     decides delivery from stdout, so this preserves the "ping only on non-empty
     stdout" semantics of the failure-only jobs.
   * The wrapped command's stderr is streamed to OUR stderr unchanged.
@@ -72,7 +72,7 @@ def main() -> int:
 
     # Soft-disabled via the status-site control panel: skip instantly. We don't
     # run the child, don't write a run row (keeps the log clean), and emit nothing
-    # on stdout with exit 0 (so hermes sends no ping). freshness.py likewise
+    # on stdout with exit 0 (so {{REDACTED}} sends no ping). freshness.py likewise
     # ignores disabled jobs, so this won't page as STALE.
     if switches.is_disabled(args.job):
         return 0

@@ -7,7 +7,7 @@ wrong or lands in the wrong place is annoying to unwind, so we validate the one
 field that matters (description) before creating anything.
 
 Craig's conventions enforced here:
-  - canonical files live in a git repo under ~/Github/CC (version-controlled)
+  - canonical files live in a git repo under ~/{{REDACTED}} (version-controlled)
     * simple/workflow skills -> the shared {{REDACTED}}/cc-skills repo (default)
     * skills with real code   -> their own repo (pass --repo-path)
   - ~/.claude/skills/<name>/SKILL.md is a SYMLINK to the canonical file
@@ -17,7 +17,7 @@ Craig's conventions enforced here:
 Usage:
   scaffold.py --name solar-peek --desc "..."                 # dry-run plan
   scaffold.py --name solar-peek --desc "..." --with-scripts  # add scripts/ dir
-  scaffold.py --name solar-peek --desc "..." --repo-path ~/Github/CC/solar-peek
+  scaffold.py --name solar-peek --desc "..." --repo-path ~/{{REDACTED}}/solar-peek
   scaffold.py --name solar-peek --desc "..." --commit        # actually create
 """
 import argparse
@@ -26,7 +26,7 @@ import re
 import sys
 
 HOME = os.path.expanduser("~")
-CC_SKILLS = os.path.join(HOME, "Github/CC/cc-skills")
+CC_SKILLS = os.path.join(HOME, "{{REDACTED}}/cc-skills")
 SKILLS_DIR = os.path.join(HOME, ".claude/skills")
 
 SKELETON = '''---
@@ -88,9 +88,9 @@ def plan(name, desc, repo_dir, with_scripts, repo_label):
         "AFTER --commit, still TODO by hand:",
         "  - fill in the SKILL.md body",
         f"  - audit.py            (lint the new skill)",
-        f"  - git -C {os.path.dirname(repo_dir).replace(HOME,'~') if repo_label!='cc-skills' else '~/Github/CC/cc-skills'} add + commit (identity {{REDACTED}})",
+        f"  - git -C {os.path.dirname(repo_dir).replace(HOME,'~') if repo_label!='cc-skills' else '~/{{REDACTED}}/cc-skills'} add + commit (identity {{REDACTED}})",
         "  - write an auto-memory entry + MEMORY.md pointer",
-        "  - if scheduled: register a hermes cron shim (real file, not symlink)",
+        "  - if scheduled: register a {{REDACTED}} cron shim (real file, not symlink)",
     ]
     return "\n".join(lines)
 

@@ -15,6 +15,10 @@ import sys
 # vault is unlocked, so its absence is a reliable "vault is locked" signal.
 KEY_DIR = os.path.expanduser("~/.key")
 VAULT_CANARY = os.path.join(KEY_DIR, ".vault_unlocked")
+# Computed, not hardcoded: this file lives at <repo-root>/_lib/secrets.py on
+# every install, whatever the repo is checked out as or named.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+UNLOCK_SH = os.path.join(_REPO_ROOT, "keyvault", "unlock.sh")
 
 
 class SecretError(RuntimeError):
@@ -178,8 +182,9 @@ def load_secret(env_name, path, what="secret", required=True, exit_on_error=True
     if not required:
         return None
     if vault_locked():
-        msg = ("🔒 ~/.key is locked (fscrypt). Run `~/Github/CC/keyvault/unlock.sh` "
-               "to unlock the secret vault, then retry — needed %s." % what)
+        msg = ("🔒 ~/.key is locked (fscrypt). Run `%s` "
+               "to unlock the secret vault, then retry — needed %s."
+               % (UNLOCK_SH, what))
     else:
         msg = "No %s: set $%s or populate %s." % (what, env_name, path)
     if exit_on_error:

@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
 # Unlock the ~/.key fscrypt vault after a reboot. Prompts for the vault
-# passphrase. Run in a real terminal:  bash ~/Github/CC/keyvault/unlock.sh
+# passphrase. Run in a real terminal:  bash ~/{{REDACTED}}/keyvault/unlock.sh
 # Idempotent — a no-op if already unlocked.
 set -euo pipefail
 KEY="$HOME/.key"
 
-# The hermes gateway auto-starts at boot while the vault is still locked, so it
+# The {{REDACTED}} gateway auto-starts at boot while the vault is still locked, so it
 # comes up without HASS_TOKEN/TELEGRAM_BOT_TOKEN (now vault-only, see
-# /etc/systemd/system/hermes-gateway.service.d/vault-secrets.conf). Restart it
-# now that ~/.key/hermes.env is readable so HA + Telegram re-activate. Needs sudo.
+# /etc/systemd/system/{{REDACTED}}-gateway.service.d/vault-secrets.conf). Restart it
+# now that ~/.key/{{REDACTED}}.env is readable so HA + Telegram re-activate. Needs sudo.
 # Only on the real-unlock path: it costs a sudo prompt and a gateway blip, and
 # once the vault is open a fresh gateway already reads its secrets.
-restart_hermes_gateway() {
-  if systemctl list-unit-files hermes-gateway.service >/dev/null 2>&1; then
-    echo "Restarting hermes-gateway to load its vault secrets..."
-    if sudo systemctl restart hermes-gateway; then
+restart_{{REDACTED}}_gateway() {
+  if systemctl list-unit-files {{REDACTED}}-gateway.service >/dev/null 2>&1; then
+    echo "Restarting {{REDACTED}}-gateway to load its vault secrets..."
+    if sudo systemctl restart {{REDACTED}}-gateway; then
       echo "  gateway restarted."
     else
-      echo "  WARN: restart failed — run: sudo systemctl restart hermes-gateway" >&2
+      echo "  WARN: restart failed — run: sudo systemctl restart {{REDACTED}}-gateway" >&2
     fi
   fi
 }
@@ -80,7 +80,7 @@ fi
 fscrypt unlock "$KEY"
 if [ -f "$KEY/.vault_unlocked" ]; then
   echo "Unlocked. Secret-dependent cron jobs will work until the next reboot."
-  restart_hermes_gateway
+  restart_{{REDACTED}}_gateway
   restart_vault_containers
 else
   echo "WARNING: unlock reported success but canary missing — check the vault." >&2

@@ -32,7 +32,7 @@ import switches
 
 _HERE = Path(__file__).resolve().parent
 _CONFIG = _HERE / "freshness.json"
-# cron/ is CC's own hermes-shim sync script; scheduler/ is the plain
+# cron/ is CC's own {{REDACTED}}-shim sync script; scheduler/ is the plain
 # crontab/launchd equivalent shipped by cc-seed (SEED-014) — checked in that
 # order so this file's behavior here is byte-for-byte unchanged (cron/
 # exists on this host and matches first), while the same file, unmodified,

@@ -920,7 +920,7 @@ def drill_13(m):
     # path (sign the event) would have overwritten a correction with the stale
     # text it corrected. An alarm whose remedy is untested is a rumour.
     _sp = subprocess
-    _mw = Path.home() / "Github/CC/cc-skills/improve/memory_write.py"
+    _mw = Path.home() / "{{REDACTED}}/cc-skills/improve/memory_write.py"
     _advice = next((a for a in out["alarms"] if "LEFT ALONE" in a), "")
     _flags = [t for t in _advice.split() if t.startswith("--")]
     _help = _sp.run([sys.executable, str(_mw), "adopt", "--help"],

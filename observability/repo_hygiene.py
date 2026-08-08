@@ -2,7 +2,7 @@
 """Repo-hygiene guard (Story 008): keep the "everything committed + pushed" state
 that Stories 005–007 established from silently decaying.
 
-Sweeps every top-level git repo under ~/Github/CC and reports, edge-triggered:
+Sweeps every top-level git repo under ~/{{REDACTED}} and reports, edge-triggered:
   * missing remote            — a durability hole (flagged immediately; rare + bad)
   * ahead of upstream > N days — unpushed work, aged by the OLDEST unpushed commit's
                                  committer date (fresh work-in-flight stays quiet)
@@ -29,11 +29,11 @@ import time
 from pathlib import Path
 
 # CC_HYGIENE_ROOT lets a non-Craig install (cc-seed) point this at its own
-# workspace root instead of ~/Github/CC — unset default preserves this
+# workspace root instead of ~/{{REDACTED}} — unset default preserves this
 # host's exact behavior. Without the override, a root that doesn't exist
 # (any fresh seed install before the env var is set) degrades to "no repos
 # found" rather than crashing _repos()'s unconditional iterdir().
-CC = Path(os.path.expanduser(os.environ.get("CC_HYGIENE_ROOT", "~/Github/CC")))
+CC = Path(os.path.expanduser(os.environ.get("CC_HYGIENE_ROOT", "~/{{REDACTED}}")))
 DEFAULT_DAYS = 7
 
 # --- Catastrophic content loss (added 2026-07-27) ----------------------------
@@ -47,7 +47,7 @@ GUTTED_MIN_BYTES = 400   # under this, "90% smaller" is noise, not destruction
 GUTTED_KEEP_FRAC = 0.10  # keeping <=10% of the committed bytes = gutted
 GUTTED_MAX_FILES = 300   # bound the per-repo work (Principle 8)
 SASHA_CONFIG = Path(os.path.expanduser("~/.config/sasha/config.json"))
-HERMES_SCRIPTS = Path(os.path.expanduser("~/.hermes/scripts"))
+HERMES_SCRIPTS = Path(os.path.expanduser("~/.{{REDACTED}}/scripts"))
 
 
 def _git(repo: Path, *args) -> str:
@@ -210,8 +210,8 @@ def sweep_repos(days: int, now: float) -> list:
 
 
 def _exec_targets() -> set:
-    """CC .py paths exec'd by a hermes shim or the sasha dashboard config."""
-    pat = re.compile(r"(?:/home/{{REDACTED}}|~)/Github/CC/[A-Za-z0-9_./-]+\.py")
+    """CC .py paths exec'd by a {{REDACTED}} shim or the sasha dashboard config."""
+    pat = re.compile(r"(?:/home/{{REDACTED}}|~)/{{REDACTED}}/[A-Za-z0-9_./-]+\.py")
     found = set()
     if HERMES_SCRIPTS.is_dir():
         for sh in HERMES_SCRIPTS.glob("*.sh"):
@@ -239,7 +239,7 @@ def sweep_exec_targets() -> list:
             ["git", "-C", str(fp.parent), "ls-files", "--error-unmatch", fp.name],
             capture_output=True, text=True).returncode == 0
         if not tracked:
-            rel = t.replace(os.path.expanduser("~/Github/CC/"), "")
+            rel = t.replace(os.path.expanduser("~/{{REDACTED}}/"), "")
             problems.append({"repo": "-", "kind": "exec-untracked",
                              "detail": f"cron/dashboard execs an untracked file: {rel}"})
     return problems
@@ -251,7 +251,7 @@ def problems(days: int = DEFAULT_DAYS, now: float | None = None) -> list:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Repo-hygiene guard for ~/Github/CC.")
+    ap = argparse.ArgumentParser(description="Repo-hygiene guard for ~/{{REDACTED}}.")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
                     help=f"grace period before dirty/ahead pages (default {DEFAULT_DAYS})")
     ap.add_argument("--json", action="store_true")
@@ -262,7 +262,7 @@ def main() -> int:
         print(json.dumps({"problems": probs}, indent=2))
         return 1 if probs else 0
     if not probs:
-        return 0  # silent success — freshness/hermes send no ping
+        return 0  # silent success — freshness/{{REDACTED}} send no ping
     for p in probs:
         tag = p["kind"].upper()
         print(f"[{tag:14}] {p['repo']}: {p['detail']}")

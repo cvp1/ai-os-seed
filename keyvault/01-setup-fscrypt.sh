@@ -2,7 +2,7 @@
 # One-time, host-level fscrypt enablement. Run this FIRST, in a real terminal
 # (it needs sudo and may prompt). Idempotent: safe to re-run.
 #
-#   sudo bash ~/Github/CC/keyvault/01-setup-fscrypt.sh
+#   sudo bash ~/{{REDACTED}}/keyvault/01-setup-fscrypt.sh
 #
 # What it does:
 #   1. installs the `fscrypt` package
@@ -86,4 +86,4 @@ echo "   /.fscrypt perms: $(stat -c '%A %U' /.fscrypt)  (world-writable = all-us
 
 echo
 echo "DONE. fscrypt is ready. Next, as your normal user (NOT root):"
-echo "  bash ~/Github/CC/keyvault/02-migrate-key.sh"
+echo "  bash ~/{{REDACTED}}/keyvault/02-migrate-key.sh"

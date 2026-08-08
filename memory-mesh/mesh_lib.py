@@ -547,14 +547,14 @@ SIG_NAMESPACE = "memory-mesh"
 # throwaway keypair to exercise the verify path end-to-end.
 def _signers_file():
     """One signer registry for the fleet, but its checkout path differs by
-    host ({{REDACTED}}/cvptp: ~/Github/CC/cc-handoff; {{REDACTED}}: ~/cc-handoff).
+    host ({{REDACTED}}/cvptp: ~/{{REDACTED}}/cc-handoff; {{REDACTED}}: ~/cc-handoff).
     A host that can't find it treats every signature as unverified — which
     silently forked view.version fleet-wide (found 2026-07-28). Probe the
     known homes; env override wins (drills)."""
     if os.environ.get("MESH_ALLOWED_SIGNERS"):
         return Path(os.environ["MESH_ALLOWED_SIGNERS"])
     cands = [Path(os.path.expanduser(p)) for p in
-             ("~/Github/CC/cc-handoff/allowed_signers",
+             ("~/{{REDACTED}}/cc-handoff/allowed_signers",
               "~/cc-handoff/allowed_signers")]
     for c in cands:
         if c.exists():
@@ -1316,7 +1316,7 @@ def store_dir():
     """This workspace's auto-memory store path. The workspace root is
     wherever memory-mesh/ lives (CODE_DIR's parent) — true for the CC tree
     and for any seed recipient's chosen root — and the harness keys the
-    store by that path with / → - (e.g. {{HOME}}/Github/CC →
+    store by that path with / → - (e.g. {{HOME}}/{{REDACTED}} →
     -home-x-Github-CC)."""
     return (Path.home() / ".claude" / "projects"
             / str(CODE_DIR.parent).replace("/", "-") / "memory")

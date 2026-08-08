@@ -3,7 +3,7 @@
 Two rules make a plain-crontab/launchd scheduler behave like a fleet instead
 of a pile of unrelated jobs. Both are distilled from the conventions running
 the source fleet's own 81-job estate; neither is scheduler-specific — that
-estate has since moved from a hermes-backed scheduler to systemd user timers
+estate has since moved from a {{REDACTED}}-backed scheduler to systemd user timers
 and both rules carried over untouched, which is the point of stating them as
 conventions rather than as features of one scheduler.
 

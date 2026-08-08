@@ -5,9 +5,9 @@ A job whose name is in ``control/switches.json``'s ``disabled`` list is skipped 
 ``log_run.py`` (the wrapper every cron job routes through) and ignored by
 ``freshness.py`` (so a deliberately-off job doesn't page as STALE).
 
-This is deliberately decoupled from hermes' own enable/pause state: the
+This is deliberately decoupled from {{REDACTED}}' own enable/pause state: the
 status-site runs in a container and can write this file via a bind mount without
-racing the hermes scheduler that owns ``~/.hermes/cron/jobs.json``. The job name
+racing the {{REDACTED}} scheduler that owns ``~/.{{REDACTED}}/cron/jobs.json``. The job name
 is the log_run ``--job`` key, which equals the shim filename without ``.sh``
 (e.g. ``panel_health.sh`` -> ``panel_health``). Stdlib only; never raises on read.
 """

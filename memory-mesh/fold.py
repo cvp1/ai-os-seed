@@ -21,8 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mesh_lib as M
 
-TG_ENV = os.path.expanduser("~/.claude/channels/telegram/.env")
-TG_CHAT_ID = os.environ.get("OWNER_TG_CHAT_ID", "8795620728")
+TG_ENV = os.path.expanduser(
+    os.environ.get("TELEGRAM_ENV_PATH", "~/.claude/channels/telegram/.env"))
+# No hardcoded default: an operator's chat ID is theirs to set, not ours to ship.
+# Set OWNER_TG_CHAT_ID in the unit/environment that runs this job.
+TG_CHAT_ID = os.environ.get("OWNER_TG_CHAT_ID")
 HELD_MARK = ("# STALE-INDEX: a residency delta is HELD awaiting "
              "`fold.py --promote-residency`")
 
@@ -50,6 +53,10 @@ def _tg_push(text):
     if not tok:
         print("fold: no telegram token — held-residency notice stays in the "
               "journal:\n" + text, file=sys.stderr)
+        return False
+    if not TG_CHAT_ID:
+        print("fold: no OWNER_TG_CHAT_ID set — held-residency notice stays "
+              "in the journal:\n" + text, file=sys.stderr)
         return False
     data = urllib.parse.urlencode({
         "chat_id": TG_CHAT_ID, "text": text,
@@ -100,7 +107,7 @@ def notify_held_residency(harness):
     lines += ["  + " + s for s in key["added"]]
     lines += ["  - " + s for s in key["dropped"]]
     lines += ["Every session loads the pre-hold index until you decide.",
-              "Run: python3 ~/Github/CC/memory-mesh/fold.py "
+              "Run: python3 ~/{{REDACTED}}/memory-mesh/fold.py "
               "--promote-residency"]
     _tg_push("\n".join(lines)[:3500])
     state_f.parent.mkdir(parents=True, exist_ok=True)
@@ -155,9 +162,16 @@ def fetch_peers():
         if r.returncode != 0:
             notes.append(f"{host}: unreachable ({r.stderr.strip()[:80]})")
             continue
-        sha = M.git("rev-parse", f"{host}/master", check=False).strip()
+        refs = [ln for ln in M.git(
+            "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{host}",
+            check=False).splitlines() if ln.strip() and ln != f"{host}/HEAD"]
+        if len(refs) != 1:
+            notes.append(f"{host}: expected exactly one branch (single-writer "
+                         f"invariant), found {refs or 'none'}")
+            continue
+        sha = M.git("rev-parse", refs[0], check=False).strip()
         if not sha:
-            notes.append(f"{host}: no master ref yet")
+            notes.append(f"{host}: no ref yet")
             continue
         last = state.get(host)
         if last:
