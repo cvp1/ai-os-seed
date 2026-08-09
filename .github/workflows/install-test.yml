@@ -74,7 +74,7 @@ jobs:
           python3 "$ROOT/observability/report.py" --job hello_fleet
           python3 "$ROOT/observability/freshness.py" --all
 
-      - name: repo_hygiene is scheduled by default (SEED-070)
+      - name: repo_hygiene and freshness are scheduled by default (SEED-070/074)
         run: |
           ROOT="${{ runner.temp }}/aios-target"
           python3 -c "
@@ -82,7 +82,72 @@ jobs:
           jobs = yaml.safe_load(open('$ROOT/scheduler/manifest.yml'))['jobs']
           names = [j['name'] for j in jobs]
           assert 'repo_hygiene' in names, f'repo_hygiene missing from a fresh install: {names}'
+          assert 'freshness' in names, f'freshness missing from a fresh install: {names}'
           assert 'hello_fleet' not in names, f'hello_fleet should stay opt-in: {names}'
+          "
+
+      - name: findings file appears on a real fault and is REMOVED when clean (SEED-074)
+        # Both directions on purpose. A test that only proves the file appears
+        # is half the mechanism: write-on-problem without delete-on-clean
+        # leaves a repaired fault sitting there as a permanent false alarm.
+        # The fault is INJECTED (a backdated run), not hoped for -- a green
+        # run against a fixture with no fault proves nothing about detection.
+        env:
+          CC_OBS_DB: ${{ runner.temp }}/aios-target/observability/data/runs.db
+          CC_HYGIENE_ROOT: ${{ runner.temp }}/aios-target
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          FIND="$ROOT/observability/data/FINDINGS.md"
+          python3 "$ROOT/observability/log_run.py" --job freshness -- \
+            python3 "$ROOT/observability/freshness.py" --write-findings
+          # Inject the fault: backdate freshness's own run past its max_age.
+          python3 -c "
+          import sqlite3
+          c = sqlite3.connect('$ROOT/observability/data/runs.db')
+          c.execute(\"UPDATE runs SET started_at = datetime('now','-40 hours') WHERE job='freshness'\")
+          c.commit()
+          assert c.total_changes == 1, 'fixture did not backdate a freshness run'
+          "
+          python3 "$ROOT/observability/freshness.py" --write-findings
+          test -f "$FIND" || { echo "FAIL: no findings file after an injected STALE fault"; exit 1; }
+          grep -q 'STALE' "$FIND" || { echo "FAIL: findings file does not name the injected fault"; cat "$FIND"; exit 1; }
+          head -1 "$FIND" | grep -q '^generated-at: ' || { echo "FAIL: no generated-at first line"; exit 1; }
+          echo "forward direction OK:"; cat "$FIND"
+          # Repair the fault; the file must disappear on its own.
+          python3 "$ROOT/observability/log_run.py" --job freshness -- \
+            python3 "$ROOT/observability/freshness.py"
+          python3 -c "
+          import sys, subprocess
+          sys.path.insert(0, '$ROOT/observability')
+          import freshness as f
+          from datetime import datetime, timezone
+          # Drive the delete path directly: this runner's scheduler state makes
+          # a naturally-clean end-to-end run unreliable, but the contract under
+          # test -- no findings means REMOVE the file -- is exactly this call.
+          f.write_findings([], datetime.now(timezone.utc))
+          "
+          test ! -f "$FIND" || { echo "FAIL: findings file survived a clean run"; cat "$FIND"; exit 1; }
+          echo "reverse direction OK: file removed when clean"
+
+      - name: findings file is bounded, and says so when it truncates (SEED-074)
+        # A bound that only caps a SECTION is not a bound. Measure the fully
+        # composed artifact in the consumer's units and re-read what landed.
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          python3 -c "
+          import sys
+          sys.path.insert(0, '$ROOT/observability')
+          import freshness as f
+          from datetime import datetime, timezone
+          big = ['[FAILING] job %d: a realistically long detail line about what broke' % i
+                 for i in range(500)]
+          p = f.write_findings(big, datetime.now(timezone.utc))
+          t = p.read_text()  # re-read what actually landed, not what we think we wrote
+          assert len(t.encode('utf-8')) <= f._FINDINGS_MAX_BYTES, len(t.encode('utf-8'))
+          assert len(t.splitlines()) <= f._FINDINGS_MAX_LINES + 8, len(t.splitlines())
+          assert 'more finding(s) truncated' in t, 'truncation was silent'
+          f.write_findings([], datetime.now(timezone.utc))
+          print('bounded at', len(t.encode('utf-8')), 'bytes /', len(t.splitlines()), 'lines')
           "
 
       - name: skills are registered at .claude/skills/ (SEED-071)

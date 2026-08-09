@@ -49,6 +49,25 @@ specific convention below, reason from there.
   convention and why jobs must self-notify (neither scheduler pages you by
   default).
 
+## At the start of every session — check for findings
+
+- If **`observability/data/FINDINGS.md`** exists, read it and surface it to
+  the operator **before** starting other work. It is written by the daily
+  `freshness` job when something is wrong (a job went silent, failed, or
+  drifted) and **deleted automatically when everything is clean** — so if the
+  file is there, something is currently wrong. Do not treat it as a to-do
+  list to action silently; tell the operator what it says.
+- **Check its `generated-at` timestamp against the clock.** If it is older
+  than about a day, say so plainly: that means *the checker itself has
+  stopped running*, which is a bigger problem than anything listed inside the
+  file. A monitor that runs under the scheduler cannot report its own death —
+  you are the only observer that does not share that fate, which is precisely
+  why this instruction exists.
+- **Absence of the file is not proof of health.** It means either "nothing
+  wrong at the last run" or "the job never ran at all." If you have not seen
+  a `freshness` run in `runs.db`, say that rather than reporting all-clear —
+  a green report you cannot substantiate is worse than no report.
+
 ## Machine fleet (if you run more than one host)
 
 - Name this host here once you have a naming convention. If you run

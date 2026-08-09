@@ -40,6 +40,71 @@ _CONFIG = _HERE / "freshness.json"
 _SYNC_CANDIDATES = [_HERE.parent / "cron" / "sync.sh", _HERE.parent / "scheduler" / "sync.sh"]
 _DUR = re.compile(r"^\s*(\d+)\s*([dhm])\s*$")
 
+# --write-findings (SEED-074) — off by default, so this host's own scheduled
+# invocation and the /status import path are byte-for-byte unchanged.
+# data/ already holds runs.db and is already a declared runtime-writable path
+# in the seed's install audit, so writing here adds no new write-path class
+# for that checker to learn.
+_FINDINGS = _HERE / "data" / "FINDINGS.md"
+# Bound the COMPOSED file, not a section of it: a host with 80 failing jobs
+# must not produce an unbounded artifact for an agent to read at session start.
+_FINDINGS_MAX_LINES = 60
+_FINDINGS_MAX_BYTES = 16000
+
+
+def write_findings(lines, now):
+    """SEED-074: leave the finding somewhere a human's agent will see it.
+
+    A scheduled checker that only prints to stdout reaches a mail spool
+    nobody reads. This writes one derived artifact the agent is told (in
+    CLAUDE.md) to surface at session start — and DELETES it when everything
+    is clean, so a repaired problem cannot linger as a false alarm. Both
+    directions matter: write-on-problem alone would be half the mechanism.
+
+    Returns the path if a file was written, None if it was removed/absent.
+    Never raises: a findings-file failure must not fail the freshness run
+    itself, which has already done its real work by this point.
+    """
+    try:
+        if not lines:
+            _FINDINGS.unlink(missing_ok=True)
+            return None
+        _FINDINGS.parent.mkdir(parents=True, exist_ok=True)
+        stamp = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+        # generated-at goes FIRST and machine-readably: a reader that finds
+        # this file stale learns the checker itself stopped, which a
+        # cron-scheduled monitor can never report about its own death.
+        head = [f"generated-at: {stamp}", "",
+                f"# Findings — {len(lines)} item(s)", ""]
+        body, dropped = list(lines), 0
+        if len(body) > _FINDINGS_MAX_LINES:
+            dropped = len(body) - _FINDINGS_MAX_LINES
+            body = body[:_FINDINGS_MAX_LINES]
+        out = "\n".join(head + [f"- {ln}" for ln in body])
+        if dropped:
+            out += f"\n- …and {dropped} more finding(s) truncated"
+        out += "\n"
+        # Measure the fully composed artifact in the consumer's units, not a
+        # per-section estimate, and trim again if the byte cap still bites.
+        if len(out.encode("utf-8")) > _FINDINGS_MAX_BYTES:
+            keep, acc = [], len("\n".join(head).encode("utf-8"))
+            for ln in body:
+                enc = len(f"- {ln}\n".encode("utf-8"))
+                if acc + enc > _FINDINGS_MAX_BYTES - 200:
+                    break
+                keep.append(ln)
+                acc += enc
+            dropped = len(lines) - len(keep)
+            out = "\n".join(head + [f"- {ln}" for ln in keep])
+            out += f"\n- …and {dropped} more finding(s) truncated\n"
+        tmp = _FINDINGS.with_suffix(".tmp")
+        tmp.write_text(out, encoding="utf-8")
+        tmp.replace(_FINDINGS)
+        return _FINDINGS
+    except Exception as e:  # noqa: BLE001 — never fail the run over the sidecar
+        print(f"[WARN   ] could not write findings file: {e}", file=sys.stderr)
+        return None
+
 
 def repo_hygiene_problems():
     """Story 008: sweep every CC git repo for dirty/ahead-of-remote (aged past a
@@ -180,6 +245,9 @@ def main():
     ap.add_argument("--strict", action="store_true",
                     help="treat MISSING (never run) as a paging problem too")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--write-findings", action="store_true",
+                    help="also write/remove data/FINDINGS.md so an agent finds "
+                         "it at session start (SEED-074; off by default)")
     args = ap.parse_args()
 
     now = datetime.now(timezone.utc)
@@ -194,6 +262,16 @@ def main():
     paging = ({"STALE", "FAILING", "SOFTFAIL", "MISSING"} if args.strict
               else {"STALE", "FAILING", "SOFTFAIL"})
     problems = [r for r in results if r["status"] in paging]
+
+    # Compose the findings BEFORE any early return, so --write-findings is
+    # honoured on the clean path (where its job is to DELETE a stale file)
+    # and under --json, not only on the text-with-problems path.
+    if args.write_findings:
+        findings = [f"[{r['status']}] {r['label']}: {r['detail']}" for r in
+                    sorted(problems, key=lambda x: x["job"])]
+        findings += [f"[DRIFT] cron shim reconcile: {d}" for d in drift]
+        findings += [f"[REPO] git hygiene: {rp}" for rp in repo]
+        write_findings(findings, now)
 
     if args.json:
         print(json.dumps({"checked_at": now.isoformat(timespec="seconds"),

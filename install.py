@@ -93,6 +93,21 @@ JOB_REPO_HYGIENE = """\
       /usr/bin/python3 {root}/observability/repo_hygiene.py --root {root} --findings-exit0
 """
 
+# SEED-074: the backstop that watches every OTHER job was itself unscheduled
+# until now — it ran only when a human thought to ask /status, while the
+# narrower repo_hygiene sweep was already a default. A monitor nobody runs is
+# not monitoring. Scheduled 07:15, after repo_hygiene's 06:30, so the daily
+# sweep's own result is already in runs.db when freshness reads it.
+# --write-findings is what turns a printed report into one the agent can find
+# at session start (see freshness.py's findings_path()).
+JOB_FRESHNESS = """\
+  - name: freshness
+    schedule: "15 7 * * *"
+    command: >-
+      /usr/bin/python3 {root}/observability/log_run.py --job freshness --
+      /usr/bin/python3 {root}/observability/freshness.py --write-findings
+"""
+
 
 def _add_job(manifest: Path, job_name: str, block: str) -> bool:
     """Add one job's YAML block to scheduler/manifest.yml, idempotently.
@@ -756,14 +771,18 @@ def enable_demo(target: Path):
 
 
 def _install_default_jobs(target: Path) -> list:
-    """SEED-070: unlike hello_fleet (opt-in via --enable-demo), repo_hygiene
-    is written into a fresh install's manifest unconditionally — see
-    JOB_REPO_HYGIENE's own comment for why it's safe to default on. Returns
-    the list of job names installed this call (empty if already present,
-    e.g. a repeat run somehow reached this point)."""
+    """SEED-070/074: unlike hello_fleet (opt-in via --enable-demo), these are
+    written into a fresh install's manifest unconditionally — see each job
+    constant's own comment for why it's safe to default on. Returns the list
+    of job names installed this call (a name is omitted if it was already
+    present, e.g. a repeat run somehow reached this point)."""
     manifest = target / "scheduler" / "manifest.yml"
-    added = _add_job(manifest, "repo_hygiene", JOB_REPO_HYGIENE.format(root=target))
-    return ["repo_hygiene"] if added else []
+    installed = []
+    for name, block in (("repo_hygiene", JOB_REPO_HYGIENE),
+                        ("freshness", JOB_FRESHNESS)):
+        if _add_job(manifest, name, block.format(root=target)):
+            installed.append(name)
+    return installed
 
 
 def enable_governance(target: Path):
