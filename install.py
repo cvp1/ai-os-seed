@@ -10,6 +10,8 @@ byte-identical to this repo, never transcribed by a model.
     install.py --target ~/ai-os-seed --enable-demo # add hello_fleet to the scheduler manifest
     install.py --target ~/ai-os-seed --approve claude-md       # apply a staged CLAUDE.md addition
     install.py --target ~/ai-os-seed --approve mesh-bootstrap  # run memory-mesh/install.sh, recorded
+    install.py --target ~/ai-os-seed --apply-proposal SLUG     # apply an agent-written scheduler repair
+    install.py --target ~/ai-os-seed --revert-proposal SLUG    # undo one, if nothing's touched it since
     install.py --target ~/ai-os-seed --audit --package <clone> # deterministic post-install auditor
     install.py --target ~/ai-os-seed --uninstall   # de-schedule managed jobs, then remove the tree
 
@@ -28,6 +30,7 @@ the package's own manifest (never the installed tree) — see
 docs/install-audit.md for the full design and its stated residuals.
 """
 import argparse
+import contextlib
 import filecmp
 import hashlib
 import json
@@ -41,6 +44,11 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:  # non-POSIX (e.g. native Windows) — degrade to no lock, not a crash
+    fcntl = None
+
 HERE = Path(__file__).resolve().parent
 
 # What an install consists of — directories and files copied verbatim.
@@ -51,19 +59,70 @@ COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills"
 # NOT the default, but activation IS" opt-in, run only when the recipient
 # says yes in AGENT-INSTALL.md's governance phase.
 OPTIONAL_COMPONENTS = ["governance"]
-ROOT_FILES = ["PRINCIPLES.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
+ROOT_FILES = ["PRINCIPLES.md", "PROPOSALS.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
 # Components whose EXISTING presence in an --into workspace satisfies the
 # requirement instead of colliding (see the compose-mode comment in install()).
 SATISFIED_BY_EXISTING = {"memory"}
 
-DEMO_MANIFEST_ENTRY = """\
-jobs:
+# Job blocks are the list-item YAML only (no `jobs:` header) — _add_job()
+# decides whether that header still needs writing or a job is joining
+# others already there.
+JOB_HELLO_FLEET = """\
   - name: hello_fleet
     schedule: "*/15 * * * *"
     command: >-
       /usr/bin/python3 {root}/observability/log_run.py --job hello_fleet --
       /usr/bin/python3 {root}/demo/hello_fleet.py
 """
+
+# SEED-070: hello_fleet proves the spine works but gives an operator no
+# reason to come back tomorrow — a rival-model review of this backlog named
+# that gap directly. repo_hygiene is already shipped (it's freshness.py's
+# own dependency check, genericized in SEED-017/manifest.yml) and useful
+# from the moment the install root is a git repo, which SEED-002's meta-repo
+# pattern guarantees it always is — no history needs to accumulate first,
+# unlike views/weekly.py. --root pins the sweep to THIS workspace regardless
+# of CC_HYGIENE_ROOT; --findings-exit0 switches it to this seed's own
+# found-work-exits-0 convention (scheduler/CONVENTIONS.md rule 1) instead of
+# its default exit-1, which stays unchanged for the freshness.py import path.
+JOB_REPO_HYGIENE = """\
+  - name: repo_hygiene
+    schedule: "30 6 * * *"
+    command: >-
+      /usr/bin/python3 {root}/observability/log_run.py --job repo_hygiene --
+      /usr/bin/python3 {root}/observability/repo_hygiene.py --root {root} --findings-exit0
+"""
+
+
+def _add_job(manifest: Path, job_name: str, block: str) -> bool:
+    """Add one job's YAML block to scheduler/manifest.yml, idempotently.
+    Comment-excluded, EXACT line match (not startswith — a job named e.g.
+    `repo_hygiene_backup` must not read as `repo_hygiene` already being
+    present; the scaffold's own commented examples name real jobs too, so a
+    plain substring check reads as already-enabled either way — caught live
+    during SEED-017, sharpened to exact-match after the 2026-08-09 review
+    found the startswith version's false-positive class). Appends after any
+    jobs already present instead of requiring a pristine `jobs: []`, so
+    installing the SEED-070 default job first doesn't break a later
+    --enable-demo (or vice versa in an --into install where the recipient
+    enables the demo before this function ever runs). Atomic write, like
+    every other state-changing write in this file — the manifest is exactly
+    the kind of file a crash mid-write must never leave truncated, doubly so
+    now that SEED-072 hash-binds it as the sole proposal-allowlisted target.
+    Returns True if this call freshly added the job, False if it was
+    already present (caller decides what, if anything, to print)."""
+    text = manifest.read_text()
+    marker = f"- name: {job_name}"
+    if any(line.strip() == marker
+           for line in text.splitlines() if not line.strip().startswith("#")):
+        return False
+    if "jobs: []" in text:
+        new_text = text.replace("jobs: []", "jobs:\n" + block)
+    else:
+        sep = "" if text.endswith("\n") else "\n"
+        new_text = text + sep + block
+    _atomic_write(manifest, new_text.encode("utf-8"))
+    return True
 
 # --- Wave 2H: receipt / baseline / gated-write constants -------------------
 CC_SEED_DIR = ".cc-seed"
@@ -273,6 +332,118 @@ def _atomic_write(path: Path, data: bytes):
     os.replace(tmp, path)
 
 
+# --- TOCTOU hardening for apply_proposal/revert_proposal (wave2g2 review,
+# 2026-08-09, GPT+Gemini independently): the pre-existing code resolved
+# `dest = target / rel_target` once via pathlib (which follows symlinks at
+# every path component) and then read and wrote through that same path a
+# second time later — an agent scoped to --target could swap
+# `target/scheduler` for a symlink between those two path-walks and
+# redirect the read (information disclosure via the hash-check) or the
+# write. `_atomic_write`'s own O_EXCL/O_NOFOLLOW discipline only protects
+# the FINAL path component; it does nothing about a symlinked directory
+# earlier in the path. The functions below use descriptor-relative
+# (openat-style) resolution instead: every directory component between
+# `target` and the file is opened relative to its already-verified parent
+# fd, refusing with O_NOFOLLOW if that component is anything but a plain
+# directory, so there is no window between "checked" and "used" for a
+# symlink swap to land in.
+def _opendir_nofollow_at(dir_fd: int, name: str) -> int:
+    return os.open(name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+
+
+def _resolve_target_dir_fd(target: Path, rel_target: str):
+    """Descriptor-relative resolution of every directory component between
+    `target` and the final path segment of `rel_target` (e.g. "scheduler"
+    for "scheduler/manifest.yml"). Returns (dir_fd, filename); caller must
+    os.close(dir_fd) (a `with contextlib.closing(...)`-friendly int, not a
+    context manager itself, since callers need it open across a read AND
+    a later write)."""
+    parts = rel_target.split("/")
+    fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            try:
+                nxt = _opendir_nofollow_at(fd, part)
+            except OSError as e:
+                raise RuntimeError(
+                    f"refusing {target}/{rel_target} — a path component ({part!r}) is not "
+                    f"a plain directory ({e}); possible symlink swap") from e
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def _read_bytes_at(dir_fd: int, name: str) -> bytes:
+    """Read `name` relative to an already-verified directory fd, refusing
+    if `name` itself is a symlink (O_NOFOLLOW). Missing is treated as
+    empty, matching the `dest.read_bytes() if dest.exists() else b""`
+    behavior this replaces."""
+    try:
+        fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+    except FileNotFoundError:
+        return b""
+    except OSError as e:
+        raise RuntimeError(f"refusing to read {name} — {e} (possible symlink)") from e
+    with os.fdopen(fd, "rb") as f:
+        return f.read()
+
+
+def _atomic_write_at(dir_fd: int, name: str, data: bytes):
+    """Same O_EXCL/O_NOFOLLOW-tempfile-then-rename discipline as
+    _atomic_write() above, but every operation is relative to an
+    already-verified directory fd instead of a path re-walked from
+    scratch, so the write lands in the directory the caller already
+    checked, not wherever a symlink swap since then might point."""
+    tmp = f"{name}.tmp.{os.getpid()}"
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(tmp, flags, 0o600, dir_fd=dir_fd)
+    except FileExistsError:
+        try:
+            st = os.stat(tmp, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            st = None
+        if st is None or not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(
+                f"refusing to write {name} — {tmp} already exists and isn't a plain "
+                f"leftover file (possible symlink plant); remove it by hand after "
+                f"confirming what it is")
+        os.unlink(tmp, dir_fd=dir_fd)  # plain leftover from a crashed prior run — retry once
+        fd = os.open(tmp, flags, 0o600, dir_fd=dir_fd)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+@contextlib.contextmanager
+def _proposal_lock(target: Path):
+    """Serializes apply_proposal/revert_proposal against each other and
+    against a second concurrent install.py invocation, closing the window
+    GPT+Gemini also flagged: the hash-check and the write are two
+    operations, not one, so something could touch the target between them
+    even with the descriptor-relative resolution above (which defends
+    against a symlink SWAP, not a plain concurrent EDIT). flock is
+    advisory — it cannot stop a process that ignores it — but it makes two
+    honest install.py runs safe, which is the actual concurrency this
+    tool sees in practice. Degrades to no lock (not a crash) if fcntl is
+    unavailable."""
+    if fcntl is None:
+        yield
+        return
+    lock_dir = target / CC_SEED_DIR
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_dir / ".proposal.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
 def _receipt_path(target: Path) -> Path:
     return target / CC_SEED_DIR / RECEIPT_NAME
 
@@ -448,6 +619,23 @@ def install(target: Path, into: bool = False):
         skipped = [c for c in SATISFIED_BY_EXISTING if (target / c).is_dir()]
         collisions = [c for c in COMPONENTS + ROOT_FILES
                       if (target / c).exists() and c not in skipped]
+        # SEED-071: .claude/skills/<name> isn't a COMPONENTS entry (skills/
+        # is), so it needs its own pre-check here — same no-partial-merges
+        # guarantee, checked before target.mkdir()/any copytree below rather
+        # than discovered mid-registration after skills/ already landed.
+        if "skills" not in skipped:
+            # exists() OR is_symlink() — a dangling symlink left by a prior
+            # partial install/uninstall reads exists()==False but must still
+            # collide, matching _register_skills()'s own backstop predicate
+            # (2026-08-09 review: the two had drifted, which meant a dangling
+            # link passed this check only to trip the assert AFTER skills/
+            # was already copied).
+            skill_collisions = []
+            for n in _shipped_skill_names():
+                p = target / ".claude" / "skills" / n / "SKILL.md"
+                if p.exists() or p.is_symlink():
+                    skill_collisions.append(f".claude/skills/{n}")
+            collisions += skill_collisions
         if collisions:
             return die(f"--into {target}: these names already exist there: "
                        f"{', '.join(collisions)}. Refusing to merge or overwrite "
@@ -481,36 +669,101 @@ def install(target: Path, into: bool = False):
         shutil.copytree(HERE / comp, target / comp)
     for f in ROOT_FILES:
         shutil.copy2(HERE / f, target / f)
+    registered_skills = _register_skills(target) if "skills" in written else []
+    default_jobs = _install_default_jobs(target) if "scheduler" in written else []
     receipt["install"]["components"] = written
+    receipt["install"]["registered_skills"] = registered_skills
+    receipt["install"]["default_jobs"] = default_jobs
     _save_receipt(target, receipt)
 
     mode = "composed into your existing workspace at" if into else "->"
     print(f"installed {len(written)} components + {len(ROOT_FILES)} files {mode} {target}")
+    if registered_skills:
+        print(f"registered {len(registered_skills)} skill(s) at {target}/.claude/skills/ "
+              f"({', '.join(registered_skills)}) — discoverable immediately from any "
+              f"session whose working directory is under {target}")
+    if default_jobs:
+        print(f"scheduled by default: {', '.join(default_jobs)} (not yet synced to the "
+              f"real scheduler — run {target}/scheduler/sync.sh, or use --enable-demo "
+              f"first if you also want hello_fleet)")
     print(f"install receipt: {target}/{CC_SEED_DIR}/{RECEIPT_NAME}")
     print("next: run the Phase 3 verify commands from AGENT-INSTALL.md")
     return 0
+
+
+def _iter_skill_dirs(skills_root: Path):
+    """Yield (name, canonical SKILL.md path) for each real skill under a
+    skills/ tree — a directory containing SKILL.md, not a shared doc like
+    skills/LAYERS.md sitting at the top level."""
+    if not skills_root.is_dir():
+        return
+    for entry in sorted(skills_root.iterdir()):
+        canonical = entry / "SKILL.md"
+        if entry.is_dir() and canonical.is_file():
+            yield entry.name, canonical
+
+
+def _shipped_skill_names() -> list:
+    """Skill names this clone would install, read from the SOURCE tree
+    (HERE / "skills") — used for the pre-write --into collision check, since
+    at that point target/skills/ doesn't exist yet to enumerate instead."""
+    return [name for name, _ in _iter_skill_dirs(HERE / "skills")]
+
+
+def _register_skills(target: Path) -> list:
+    """SEED-071: shipping skills/<name>/SKILL.md is not enough — Claude Code
+    only discovers skills at ~/.claude/skills/ (user-level) or .claude/skills/
+    (project-level, searched upward from the working directory). Nothing
+    wrote either, so a fresh install's skills were invisible until an
+    operator registered them by hand. Project-level is the right home here:
+    it works the moment an agent's cwd is anywhere under --target, needs no
+    write to the recipient's global ~/.claude/, and composes cleanly with
+    --into (a recipient's own global skills are untouched).
+
+    Symlinks (not copies) so the canonical file — the one skill-center's
+    audit.py lints and scaffold.py's plan describes — stays the single
+    source of truth; relative targets so the whole tree can be moved without
+    breaking the link. Collisions are refused before this runs (install()'s
+    --into pre-check, alongside COMPONENTS/ROOT_FILES) — the assertion below
+    is a belt-and-suspenders backstop, not the primary guard: it must never
+    be the first place a collision is discovered, since skills/ and every
+    other component are already on disk by the time this function runs.
+    Returns the list of registered skill names."""
+    claude_skills = target / ".claude" / "skills"
+    registered = []
+    for name, canonical in _iter_skill_dirs(target / "skills"):
+        link_dir = claude_skills / name
+        link = link_dir / "SKILL.md"
+        assert not (link.exists() or link.is_symlink()), (
+            f"{link} already exists — install()'s pre-write collision check "
+            f"should have refused this install before skills/ was written")
+        link_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(os.path.relpath(canonical, link_dir))
+        registered.append(name)
+    return registered
 
 
 def enable_demo(target: Path):
     manifest = target / "scheduler" / "manifest.yml"
     if not manifest.exists():
         return die(f"{manifest} not found — is {target} an AI-OS Seed install?")
-    text = manifest.read_text()
-    # Line-wise, comments excluded — the scaffold's commented example also
-    # contains "name: hello_fleet" and must not read as already-enabled
-    # (caught live: substring check made --enable-demo a silent no-op).
-    if any(line.strip().startswith("- name: hello_fleet")
-           for line in text.splitlines() if not line.strip().startswith("#")):
+    if not _add_job(manifest, "hello_fleet", JOB_HELLO_FLEET.format(root=target)):
         print("hello_fleet already in the scheduler manifest — nothing to do.")
         return 0
-    if "jobs: []" not in text:
-        return die("scheduler/manifest.yml already has its own jobs — add the "
-                   "hello_fleet entry by hand (see the commented example in the "
-                   "file) rather than letting me rewrite your manifest.")
-    manifest.write_text(text.replace("jobs: []", DEMO_MANIFEST_ENTRY.format(root=target)))
     print(f"hello_fleet (every 15 min) written to {manifest}")
     print(f"next: bash {target}/scheduler/sync.sh")
     return 0
+
+
+def _install_default_jobs(target: Path) -> list:
+    """SEED-070: unlike hello_fleet (opt-in via --enable-demo), repo_hygiene
+    is written into a fresh install's manifest unconditionally — see
+    JOB_REPO_HYGIENE's own comment for why it's safe to default on. Returns
+    the list of job names installed this call (empty if already present,
+    e.g. a repeat run somehow reached this point)."""
+    manifest = target / "scheduler" / "manifest.yml"
+    added = _add_job(manifest, "repo_hygiene", JOB_REPO_HYGIENE.format(root=target))
+    return ["repo_hygiene"] if added else []
 
 
 def enable_governance(target: Path):
@@ -577,6 +830,27 @@ def uninstall(target: Path):
     if not (sync.exists() and manifest.exists() and (target / "PRINCIPLES.md").exists()):
         return die(f"{target} doesn't look like an AI-OS Seed install — refusing "
                    f"to delete it. Remove it yourself if you're sure.")
+    # SEED-071: undo exactly the symlinks _register_skills() created, before
+    # skills/ itself is removed below — otherwise .claude/skills/<name>/
+    # is left holding a dangling symlink into a now-deleted directory.
+    # Read from the receipt (what THIS installer actually registered), never
+    # blind-globbed off .claude/skills/, since that directory may also hold
+    # skills the recipient registered themselves, before or after installing.
+    receipt = _load_receipt(target)
+    registered = (receipt or {}).get("install", {}).get("registered_skills", [])
+    for name in registered:
+        link_dir = target / ".claude" / "skills" / name
+        link = link_dir / "SKILL.md"
+        if link.is_symlink():
+            link.unlink()
+            if not any(link_dir.iterdir()):
+                link_dir.rmdir()
+    claude_skills = target / ".claude" / "skills"
+    if claude_skills.is_dir() and not any(claude_skills.iterdir()):
+        claude_skills.rmdir()
+        claude_dir = target / ".claude"
+        if claude_dir.is_dir() and not any(claude_dir.iterdir()):
+            claude_dir.rmdir()
     # De-schedule first: empty the manifest, let sync reconcile (removes the
     # managed crontab block / launchd plists), then remove the seed's files.
     manifest.write_text("jobs: []\n")
@@ -749,6 +1023,216 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     if store:
         print(f"memory store: {store}")
     return 0
+
+
+# --- SEED-072 (2026-08-09): human-applied exact-diff proposal loop ---------
+# Both Grok and Gemini, reviewing this backlog's own third-party assessment,
+# independently proposed the same middle tier between "ambient cron" and a
+# governed action broker: the agent writes a canonical intent (exact bytes,
+# a hash binding what it saw, a rationale) to a file and stops; a human
+# applies it with one command. Same covenant as claude-md/mesh-bootstrap
+# above — the agent's role stops at writing the proposal file, install.py
+# performs the one write — generalized to an open-ended shape (any target,
+# not one bespoke flow per write) but deliberately allowlisted, not opened
+# wide: SEED-072's own AC scopes v1 to scheduler-entry changes only.
+# "Reversible filesystem actions" more broadly stays out of the allowlist
+# until this pattern has proven itself under real use — SEED-073 depends on
+# that, not on the class being wide from day one.
+PROPOSAL_ALLOWED_TARGETS = {"scheduler/manifest.yml"}
+
+
+def _proposals_dir(target: Path) -> Path:
+    return target / CC_SEED_DIR / STAGED_DIR / "proposals"
+
+
+def _load_proposal_file(path: Path):
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def _validate_slug(slug: str):
+    """A slug becomes a path component in three places (staged, applied,
+    the receipt key) — reject anything that isn't a plain filename-safe
+    token before it's ever joined onto a Path (Grok's review, 2026-08-09:
+    an unvalidated slug like '../x' or 'applied/foo' walks outside the
+    proposals directory)."""
+    if not _SLUG_RE.match(slug):
+        die(f"'{slug}' is not a valid proposal slug (must match {_SLUG_RE.pattern}) — "
+            f"refusing before it touches any path.")
+        raise SystemExit(2)
+
+
+def apply_proposal(target: Path, slug: str) -> int:
+    _validate_slug(slug)
+    with _proposal_lock(target):
+        receipt = _load_receipt(target)
+        if receipt is not None and slug in receipt.get("applied_proposals", {}):
+            return die(f"'{slug}' was already applied — reusing a slug would overwrite its "
+                       f"receipt history (before/after hashes, rationale) rather than "
+                       f"recording a new event. Pick a new slug for a new change.")
+        proposal = _load_proposal_file(_proposals_dir(target) / f"{slug}.json")
+        if proposal is None:
+            return die(f"no readable proposal at {_proposals_dir(target)}/{slug}.json — "
+                       f"the agent writes this file (see PROPOSALS.md), you don't.")
+        rel_target = proposal.get("target", "")
+        if rel_target not in PROPOSAL_ALLOWED_TARGETS:
+            return die(f"proposal targets {rel_target!r}, which is outside the allowed set "
+                       f"({', '.join(sorted(PROPOSAL_ALLOWED_TARGETS))}) — SEED-072 v1 is "
+                       f"scoped to scheduler-entry changes only. Refusing.")
+        before_content = proposal.get("before_content", "")
+        before_hash = proposal.get("before_sha256")
+        if _sha256_bytes(before_content.encode("utf-8")) != before_hash:
+            return die(f"proposal '{slug}' is malformed — its own before_content doesn't "
+                       f"hash to its own before_sha256. Refusing rather than trusting a "
+                       f"proposal that can't even check itself.")
+
+        try:
+            dir_fd, fname = _resolve_target_dir_fd(target, rel_target)
+        except RuntimeError as e:
+            return die(str(e))
+        try:
+            try:
+                current = _read_bytes_at(dir_fd, fname)
+            except RuntimeError as e:
+                return die(str(e))
+            current_hash = _sha256_bytes(current)
+            if before_hash != current_hash:
+                return die(f"{target / rel_target} has changed since this proposal was written "
+                           f"(expected {before_hash}, found {current_hash}) — the proposal is "
+                           f"stale. Refusing rather than overwriting a file that moved out from "
+                           f"under it; ask the agent to re-propose against the current content.")
+
+            if receipt is None:
+                return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — a proposal applied "
+                           f"with no receipt to record it in can never be reverted through this "
+                           f"mechanism. Refusing rather than making a change nothing can audit.")
+
+            after_bytes = proposal.get("after_content", "").encode("utf-8")
+            after_hash = _sha256_bytes(after_bytes)
+            _atomic_write_at(dir_fd, fname, after_bytes)
+        finally:
+            os.close(dir_fd)
+
+        receipt.setdefault("applied_proposals", {})[slug] = {
+            "target": rel_target, "applied_at": _now(),
+            "before_sha256": before_hash, "after_sha256": after_hash,
+            "rationale": proposal.get("rationale", ""),
+        }
+        _save_receipt(target, receipt)
+
+        # Archived, not deleted — revert_proposal() reads before_content back out
+        # of this exact file. Unlike the original comment here claimed, the
+        # RECEIPT IS NOT a self-sufficient record of truth for revert: it stores
+        # hashes, not bytes, so before_content lives ONLY in this archive (GPT-5.6
+        # review, 2026-08-09). A failed rename is therefore a real, loud problem,
+        # not a cosmetic one — the write to `dest` already succeeded and stays
+        # applied; what's lost is the ability to revert it through this command.
+        applied_dir = _proposals_dir(target) / "applied"
+        applied_dir.mkdir(parents=True, exist_ok=True)
+        src = _proposals_dir(target) / f"{slug}.json"
+        archived = False
+        try:
+            src.rename(applied_dir / f"{slug}.json")
+            archived = True
+        except OSError as e:
+            print(f"WARNING: applied successfully, but could not archive the proposal "
+                  f"file ({e}) — --revert-proposal {slug} will NOT be possible; the "
+                  f"receipt alone cannot supply before_content. Manually move {src} to "
+                  f"{applied_dir}/{slug}.json to restore revert capability.", file=sys.stderr)
+
+        print(f"applied proposal '{slug}' to {target / rel_target}")
+        print(f"  {before_hash} -> {after_hash}")
+        print(f"recorded in {target}/{CC_SEED_DIR}/{RECEIPT_NAME}")
+        if archived:
+            print(f"to undo: install.py --target {target} --revert-proposal {slug}")
+        return 0
+
+
+def revert_proposal(target: Path, slug: str) -> int:
+    """Undo exactly one --apply-proposal call, and only if nothing has
+    touched the target since — the same stale-state refusal apply_proposal
+    itself uses, run in the opposite direction. Reads before_content back
+    out of the archived proposal file apply_proposal() moved to applied/.
+
+    Hardened 2026-08-09 after convergent findings from Grok/GPT-5.6/Gemini
+    review: the receipt's `target` field and the archive's `before_content`
+    are both same-UID-writable state, exactly like the manifest itself, and
+    the original version trusted both without re-checking them against
+    anything — an asymmetry with apply_proposal, which validates every one
+    of these before writing. Revert now re-runs the SAME checks apply does,
+    in the opposite direction: target stays on the allowlist, the archived
+    proposal's own target must match the receipt's, and before_content must
+    hash to the value recorded at apply time — not just to whatever the
+    archive file happens to contain now. Same-day follow-up (wave2g2
+    review, GPT+Gemini): the actual read/write of `target` also goes
+    through the descriptor-relative resolution + flock apply_proposal
+    uses, closing the symlink-swap/concurrent-modification TOCTOU window
+    between the checks above and the restore."""
+    _validate_slug(slug)
+    with _proposal_lock(target):
+        receipt = _load_receipt(target)
+        if receipt is None:
+            return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found.")
+        record = receipt.get("applied_proposals", {}).get(slug)
+        if record is None:
+            return die(f"no applied proposal named '{slug}' in the receipt — nothing to "
+                       f"revert (already reverted, or never applied through this mechanism).")
+        if "reverted_at" in record:
+            return die(f"proposal '{slug}' was already reverted at {record['reverted_at']}.")
+        rel_target = record.get("target", "")
+        if rel_target not in PROPOSAL_ALLOWED_TARGETS:
+            return die(f"receipt records target {rel_target!r} for '{slug}', which is outside "
+                       f"the allowed set ({', '.join(sorted(PROPOSAL_ALLOWED_TARGETS))}) — "
+                       f"refusing. (The receipt should never have this recorded; treat this "
+                       f"as tampering, not a normal state.)")
+        proposal = _load_proposal_file(_proposals_dir(target) / "applied" / f"{slug}.json")
+        if proposal is None:
+            return die(f"the archived proposal file for '{slug}' is gone — cannot recover "
+                       f"the before-content to revert to. Receipt record for manual repair: "
+                       f"{record}")
+        if proposal.get("target") != rel_target:
+            return die(f"the archived proposal's target ({proposal.get('target')!r}) doesn't "
+                       f"match the receipt's ({rel_target!r}) for '{slug}' — refusing rather "
+                       f"than trusting whichever one is wrong.")
+        before_content = proposal.get("before_content", "")
+        before_bytes = before_content.encode("utf-8")
+        before_hash = _sha256_bytes(before_bytes)
+        if before_hash != record["before_sha256"]:
+            return die(f"the archived proposal's before_content no longer hashes to what "
+                       f"--apply-proposal recorded at apply time (expected "
+                       f"{record['before_sha256']}, found {before_hash}) — the archive file "
+                       f"has been modified since applying. Refusing to restore bytes that "
+                       f"don't match the audited record.")
+
+        try:
+            dir_fd, fname = _resolve_target_dir_fd(target, rel_target)
+        except RuntimeError as e:
+            return die(str(e))
+        try:
+            try:
+                current = _read_bytes_at(dir_fd, fname)
+            except RuntimeError as e:
+                return die(str(e))
+            current_hash = _sha256_bytes(current)
+            if current_hash != record["after_sha256"]:
+                return die(f"{target / rel_target} has changed since --apply-proposal ran (expected "
+                           f"{record['after_sha256']}, found {current_hash}) — refusing to "
+                           f"revert over a newer edit. Resolve by hand.")
+            _atomic_write_at(dir_fd, fname, before_bytes)
+        finally:
+            os.close(dir_fd)
+
+        record["reverted_at"] = _now()
+        _save_receipt(target, receipt)
+        print(f"reverted proposal '{slug}' — {target / rel_target} restored to {record['before_sha256']}")
+        return 0
 
 
 # --- P3 (2026-08-08): cc-pack import ----------------------------------------
@@ -1455,6 +1939,26 @@ def _compare_baseline_entry(live_p: Path, entry: dict):
     return None
 
 
+def _verify_registered_skill_link(target: Path, package: Path, name: str):
+    """Check 1 previously had no idea _register_skills() (SEED-071) puts
+    .claude/skills/<name>/SKILL.md symlinks on disk — every one of them fell
+    through to the live-tree walk's UNEXPECTED branch, so --audit FLAGGED
+    (and --audit's exit code is nonzero on FLAGGED) on every single install
+    with skills registered, i.e. every install since SEED-071 shipped.
+    Found 2026-08-09 while adding the CI coverage the wave2g2 review asked
+    for — the fix teaches check 1 the shape instead of exempting the path
+    unchecked, so it still catches the real threat: a same-uid agent
+    repointing the symlink at something other than the shipped skill file."""
+    link = target / ".claude" / "skills" / name / "SKILL.md"
+    if not link.is_symlink():
+        return "not a symlink" if (link.exists() or link.is_symlink()) else "missing"
+    canonical = (target / "skills" / name / "SKILL.md").resolve()
+    resolved = (link.parent / os.readlink(link)).resolve()
+    if resolved != canonical:
+        return f"symlink points at {resolved}, expected {canonical}"
+    return None
+
+
 def _check_1(target: Path, package: Path, receipt: dict) -> dict:
     written = receipt["install"].get("components", [])
     baseline = receipt.get("baseline", {})
@@ -1491,6 +1995,18 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         reason = _compare_entry(pkg_p, target / f)
         if reason:
             problems.append(f"{f}: {reason}")
+
+    registered_skills = receipt["install"].get("registered_skills", [])
+    if registered_skills:
+        checked_rel.add(".claude")
+        checked_rel.add(".claude/skills")
+    for name in registered_skills:
+        link_rel = f".claude/skills/{name}/SKILL.md"
+        checked_rel.add(f".claude/skills/{name}")
+        checked_rel.add(link_rel)
+        reason = _verify_registered_skill_link(target, package, name)
+        if reason:
+            problems.append(f"{link_rel}: {reason}")
 
     runtime_writable_prefixes = ("observability/data/",)
     for live_p in sorted(target.rglob("*")):
@@ -2020,12 +2536,20 @@ def main():
     ap.add_argument("--json", action="store_true", help="with --audit, emit the report as JSON")
     ap.add_argument("--uninstall", action="store_true",
                     help="de-schedule managed jobs and remove the install")
+    ap.add_argument("--apply-proposal", metavar="SLUG",
+                    help="SEED-072: apply an agent-written proposal at "
+                         ".cc-seed/staged/proposals/SLUG.json — hash-checked against the "
+                         "target's current content before anything is written, allowlisted "
+                         "to scheduler-entry changes in this build (PROPOSALS.md)")
+    ap.add_argument("--revert-proposal", metavar="SLUG",
+                    help="undo a previously-applied proposal, refusing if the target has "
+                         "changed since --apply-proposal ran")
     args = ap.parse_args()
 
     if args.detect:
         if (args.target or args.enable_demo or args.enable_governance or args.uninstall
                 or args.approve or args.audit or args.list_packs or args.remove_pack
-                or args.set_engagement):
+                or args.set_engagement or args.apply_proposal or args.revert_proposal):
             return die("--detect takes no other flags (it's a read-only report)")
         return detect()
     if not args.target:
@@ -2035,10 +2559,12 @@ def main():
     if not target.is_absolute():
         return die(f"--target must be an absolute path, got {args.target!r}")
     exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit,
-                 args.list_packs, bool(args.remove_pack), bool(args.set_engagement)]
+                 args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
+                 bool(args.apply_proposal), bool(args.revert_proposal)]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
-                   "--list-packs, --remove-pack, and --set-engagement are mutually exclusive")
+                   "--list-packs, --remove-pack, --set-engagement, --apply-proposal, and "
+                   "--revert-proposal are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.json and not args.audit:
@@ -2079,6 +2605,10 @@ def main():
         if not args.package:
             return die("--audit requires --package <clone-dir>")
         return do_audit(target, Path(args.package).expanduser(), args.json)
+    if args.apply_proposal:
+        return apply_proposal(target, args.apply_proposal)
+    if args.revert_proposal:
+        return revert_proposal(target, args.revert_proposal)
     return install(target, into=args.into)
 
 

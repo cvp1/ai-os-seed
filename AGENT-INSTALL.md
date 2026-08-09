@@ -118,12 +118,25 @@ Show, then run, in order:
 
     python3 <ROOT>/_lib/selftest.py
     python3 <ROOT>/observability/log_run.py --job hello_fleet -- python3 <ROOT>/demo/hello_fleet.py
+    python3 <ROOT>/observability/log_run.py --job repo_hygiene -- python3 <ROOT>/observability/repo_hygiene.py --root <ROOT> --findings-exit0
     python3 <ROOT>/observability/report.py --job hello_fleet
     python3 <ROOT>/observability/freshness.py --all
 
-Expected: selftest passes; the demo prints one alive-line; report shows
-exactly one `ok` row; freshness shows `[OK] hello-fleet demo heartbeat`.
-Any other outcome: stop and show it.
+Expected: selftest passes; the demo prints one alive-line; repo_hygiene
+prints nothing (a fresh `<ROOT>` starts clean — everything just got
+committed by nothing yet) or a `FINDINGS:` line if the user's own
+pre-existing content in an `--into` install has real drift; report shows
+exactly one `ok` row for hello_fleet; freshness shows both
+`[OK] hello-fleet demo heartbeat` and `[OK] repo-hygiene sweep`. Any other
+outcome: stop and show it.
+
+Why repo_hygiene runs here even though nothing scheduled it yet: SEED-070 —
+it's on by default in `scheduler/manifest.yml` from Phase 2, but the first
+scheduled run could be up to a day away (06:30 daily), and a job the
+operator can't see working yet gives them nothing to trust tomorrow. Running
+it once now, the same way hello_fleet's first run happens here rather than
+waiting for its own first cron tick, means `freshness.py --all` already
+shows real, current data by the time this phase ends.
 
 ## Phase 4 — Personalize (the one thing you author)
 
@@ -216,18 +229,21 @@ right and the enforcement that was not.
 
 ## Phase 6 — First win (scheduling for real)
 
-Show, then run:
+`repo_hygiene` is already in `<ROOT>/scheduler/manifest.yml` — Phase 2's
+install wrote it by default (SEED-070), nothing to enable. `hello_fleet` is
+still opt-in, because a demo heartbeat every 15 minutes is a choice, not a
+default. Ask if the user wants it; if yes, show, then run:
 
     python3 install.py --target <ROOT> --enable-demo
 
-This writes the `hello_fleet` entry (every 15 min) into
-`<ROOT>/scheduler/manifest.yml`. Then show, then run:
+This adds the `hello_fleet` entry (every 15 min) alongside `repo_hygiene`
+in the manifest. Either way, show, then run:
 
     bash <ROOT>/scheduler/sync.sh
 
 On Linux, confirm with the user via `crontab -l` that the marked cc-seed
 block now exists (their pre-existing entries are untouched). On macOS,
-`launchctl list | grep cc-seed`. The demo already ran once in Phase 3, so
+`launchctl list | grep cc-seed`. Both jobs already ran once in Phase 3, so
 freshness is green now and the scheduler keeps it green from here —
 that's the whole spine live: **scheduler → job → runs.db → freshness.**
 

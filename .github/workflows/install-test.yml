@@ -9,12 +9,18 @@ name: install test
 # audit chain for real — a live memory-mesh/install.sh run, a real
 # --approve claude-md write, --audit against this checkout, and negative
 # fixtures proving each check actually detects the tamper it claims to (not
-# just clean-path smoke tests, which prove nothing about detection). It
-# still does NOT exercise the primary path's real trust boundary (an agent
-# obeying "show every mutating command," "stop means stop," and choosing to
-# stage+approve rather than write directly). The README's honest ledger
-# states that gap plainly — read it before treating a green badge as
-# agent-obedience coverage.
+# just clean-path smoke tests, which prove nothing about detection). As of
+# the 2026-08-09 wave2g2 review's own CI-gap finding (Grok+GPT), it also
+# exercises: skill registration at .claude/skills/ (SEED-071), the
+# --apply-proposal/--revert-proposal happy and refusal paths including the
+# exact tampered-archive bug the review found (SEED-072), and a regression
+# test reproducing the symlinked-scheduler-directory TOCTOU attack the same
+# review flagged — proven to succeed against the pre-fix code and refused
+# by the fix. It still does NOT exercise the primary path's real trust
+# boundary (an agent obeying "show every mutating command," "stop means
+# stop," and choosing to stage+approve rather than write directly). The
+# README's honest ledger states that gap plainly — read it before treating
+# a green badge as agent-obedience coverage.
 on:
   push:
     branches: [main]
@@ -64,8 +70,271 @@ jobs:
           ROOT="${{ runner.temp }}/aios-target"
           python3 "$ROOT/_lib/selftest.py"
           python3 "$ROOT/observability/log_run.py" --job hello_fleet -- python3 "$ROOT/demo/hello_fleet.py"
+          python3 "$ROOT/observability/log_run.py" --job repo_hygiene -- python3 "$ROOT/observability/repo_hygiene.py" --root "$ROOT" --findings-exit0
           python3 "$ROOT/observability/report.py" --job hello_fleet
           python3 "$ROOT/observability/freshness.py" --all
+
+      - name: repo_hygiene is scheduled by default (SEED-070)
+        run: |
+          ROOT="${{ runner.temp }}/aios-target"
+          python3 -c "
+          import yaml
+          jobs = yaml.safe_load(open('$ROOT/scheduler/manifest.yml'))['jobs']
+          names = [j['name'] for j in jobs]
+          assert 'repo_hygiene' in names, f'repo_hygiene missing from a fresh install: {names}'
+          assert 'hello_fleet' not in names, f'hello_fleet should stay opt-in: {names}'
+          "
+
+      - name: skills are registered at .claude/skills/ (SEED-071)
+        # SEED-071: shipping skills/<name>/SKILL.md is not enough — Claude
+        # Code only discovers skills under .claude/skills/ (or ~/.claude/
+        # skills/). install.py symlinks each shipped skill in at install
+        # time; this was live-tested by hand but never asserted in CI.
+        run: |
+          ROOT="${{ runner.temp }}/skills-target"
+          python3 install.py --target "$ROOT"
+          for d in skills/*/; do
+            name="$(basename "$d")"
+            [ -f "${d}SKILL.md" ] || continue
+            LINK="$ROOT/.claude/skills/$name/SKILL.md"
+            test -L "$LINK" || (echo "expected $LINK to be a symlink"; exit 1)
+            test -f "$LINK" || (echo "expected $LINK to resolve to a real file"; exit 1)
+            grep -q "." "$LINK" || (echo "$LINK resolved to an empty file"; exit 1)
+          done
+
+      - name: apply-proposal / revert-proposal happy path (SEED-072)
+        run: |
+          ROOT="${{ runner.temp }}/proposal-target"
+          python3 install.py --target "$ROOT"
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          after = before + "# ci happy-path test\n"
+          d = root / ".cc-seed/staged/proposals"
+          d.mkdir(parents=True, exist_ok=True)
+          (d / "ci-happy.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before,
+              "after_content": after,
+              "rationale": "ci happy path",
+          }))
+          PYEOF
+          python3 install.py --target "$ROOT" --apply-proposal ci-happy
+          grep -q "ci happy-path test" "$ROOT/scheduler/manifest.yml" || \
+            (echo "apply-proposal did not write after_content"; exit 1)
+          test -f "$ROOT/.cc-seed/staged/proposals/applied/ci-happy.json" || \
+            (echo "apply-proposal did not archive the proposal file"; exit 1)
+          python3 -c "
+          import json
+          rec = json.load(open('$ROOT/.cc-seed/receipt.json'))['applied_proposals']['ci-happy']
+          assert 'reverted_at' not in rec, rec
+          "
+          python3 install.py --target "$ROOT" --revert-proposal ci-happy
+          grep -q "ci happy-path test" "$ROOT/scheduler/manifest.yml" && \
+            (echo "revert-proposal did not restore before_content"; exit 1)
+          python3 -c "
+          import json
+          rec = json.load(open('$ROOT/.cc-seed/receipt.json'))['applied_proposals']['ci-happy']
+          assert 'reverted_at' in rec, rec
+          "
+
+      - name: apply-proposal / revert-proposal refusal paths (SEED-072)
+        run: |
+          ROOT="${{ runner.temp }}/proposal-refusal-target"
+          python3 install.py --target "$ROOT"
+          mkdir -p "$ROOT/.cc-seed/staged/proposals"
+
+          # target outside the v1 allowlist
+          python3 <<PYEOF
+          import json, pathlib
+          d = pathlib.Path("$ROOT/.cc-seed/staged/proposals")
+          (d / "bad-target.json").write_text(json.dumps({
+              "target": "not/allowed.yml", "before_sha256": "sha256:" + "0" * 64,
+              "before_content": "", "after_content": "x", "rationale": "should be refused",
+          }))
+          PYEOF
+          if python3 install.py --target "$ROOT" --apply-proposal bad-target; then
+            echo "expected a disallowed-target proposal to be refused"; exit 1; fi
+
+          # malformed proposal: before_sha256 doesn't match before_content
+          python3 <<PYEOF
+          import json, pathlib
+          d = pathlib.Path("$ROOT/.cc-seed/staged/proposals")
+          (d / "malformed.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml", "before_sha256": "sha256:" + "0" * 64,
+              "before_content": "not what the hash says", "after_content": "x",
+              "rationale": "should be refused",
+          }))
+          PYEOF
+          if python3 install.py --target "$ROOT" --apply-proposal malformed; then
+            echo "expected a malformed proposal to be refused"; exit 1; fi
+
+          # stale: target file changed since the proposal was written
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          (d / "stale.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": before + "# should never land\n",
+              "rationale": "will go stale",
+          }))
+          PYEOF
+          echo "# drift" >> "$ROOT/scheduler/manifest.yml"
+          if python3 install.py --target "$ROOT" --apply-proposal stale; then
+            echo "expected a stale proposal to be refused"; exit 1; fi
+          grep -q "should never land" "$ROOT/scheduler/manifest.yml" && \
+            (echo "a refused stale proposal still wrote after_content"; exit 1)
+          python3 -c "
+          p = '$ROOT/scheduler/manifest.yml'
+          open(p, 'w').write(open(p).read().replace('# drift\n', ''))
+          "
+
+          # reused slug: apply once for real, then a second proposal under the same slug
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          (d / "reuse.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": before + "# applied once\n",
+              "rationale": "reuse test",
+          }))
+          PYEOF
+          python3 install.py --target "$ROOT" --apply-proposal reuse
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          (d / "reuse.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": before + "# should be refused\n",
+              "rationale": "reuse test 2",
+          }))
+          PYEOF
+          if python3 install.py --target "$ROOT" --apply-proposal reuse; then
+            echo "expected a reused slug to be refused"; exit 1; fi
+
+          # already-reverted
+          python3 install.py --target "$ROOT" --revert-proposal reuse
+          if python3 install.py --target "$ROOT" --revert-proposal reuse; then
+            echo "expected a second revert of the same slug to be refused"; exit 1; fi
+
+          # changed-since-apply: apply, tamper the target, then try to revert
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          (d / "driftrevert.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": before + "# will drift before revert\n",
+              "rationale": "drift-before-revert test",
+          }))
+          PYEOF
+          python3 install.py --target "$ROOT" --apply-proposal driftrevert
+          echo "# post-apply drift" >> "$ROOT/scheduler/manifest.yml"
+          if python3 install.py --target "$ROOT" --revert-proposal driftrevert; then
+            echo "expected revert to refuse over a post-apply edit"; exit 1; fi
+
+          # tampered archive: the exact bug the 2026-08-09 wave2g2 review found —
+          # revert_proposal trusted the archived before_content without
+          # re-hashing it against what apply recorded at apply time
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          (d / "tamperarchive.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": before + "# tamper-archive test\n",
+              "rationale": "tamper archive test",
+          }))
+          PYEOF
+          python3 install.py --target "$ROOT" --apply-proposal tamperarchive
+          python3 -c "
+          import json
+          p = '$ROOT/.cc-seed/staged/proposals/applied/tamperarchive.json'
+          d = json.load(open(p))
+          d['before_content'] = 'forged before content'
+          json.dump(d, open(p, 'w'))
+          "
+          if python3 install.py --target "$ROOT" --revert-proposal tamperarchive; then
+            echo "expected revert to refuse a tampered archive (SEC REGRESSION)"; exit 1; fi
+
+      - name: apply-proposal / revert-proposal refuse a symlinked scheduler/ (TOCTOU hardening, wave2g2 review 2026-08-09)
+        # GPT+Gemini independently: the hash-check and the write weren't a
+        # single locked operation resolved via descriptor-relative opens, so
+        # a symlinked scheduler/ directory could redirect the read/write
+        # outside --target. Reproduced against the pre-fix code as part of
+        # this fix (see cc-seed/BACKLOG.md SEED-073 2026-08-09 entry): the
+        # old code actually overwrote the victim file. This regression-locks
+        # the fix — an out-of-target victim file must survive both attempts
+        # untouched.
+        run: |
+          ROOT="${{ runner.temp }}/proposal-toctou-target"
+          VICTIM="${{ runner.temp }}/toctou-victim"
+
+          python3 install.py --target "$ROOT"
+          mkdir -p "$VICTIM"
+          printf 'SENSITIVE VICTIM CONTENT\n' > "$VICTIM/manifest.yml"
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          d.mkdir(parents=True, exist_ok=True)
+          (d / "toctou.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before, "after_content": "PWNED\n",
+              "rationale": "toctou apply regression test",
+          }))
+          PYEOF
+          rm -rf "$ROOT/scheduler"
+          ln -s "$VICTIM" "$ROOT/scheduler"
+          OUT="$(python3 install.py --target "$ROOT" --apply-proposal toctou 2>&1 || true)"
+          echo "$OUT" | grep -qi "symlink" || \
+            (echo "expected a symlink-swap refusal from apply-proposal; got:"; echo "$OUT"; exit 1)
+          grep -q "SENSITIVE VICTIM CONTENT" "$VICTIM/manifest.yml" || \
+            (echo "SECURITY REGRESSION: apply-proposal wrote through the symlinked scheduler/"; exit 1)
+
+          rm -rf "$ROOT" "$VICTIM"
+          python3 install.py --target "$ROOT"
+          mkdir -p "$VICTIM"
+          printf 'SENSITIVE VICTIM CONTENT 2\n' > "$VICTIM/manifest.yml"
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT")
+          before = (root / "scheduler/manifest.yml").read_text()
+          d = root / ".cc-seed/staged/proposals"
+          d.mkdir(parents=True, exist_ok=True)
+          (d / "toctou2.json").write_text(json.dumps({
+              "target": "scheduler/manifest.yml",
+              "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+              "before_content": before,
+              "after_content": before + "# will apply, then swap scheduler/ before revert\n",
+              "rationale": "toctou revert regression test",
+          }))
+          PYEOF
+          python3 install.py --target "$ROOT" --apply-proposal toctou2
+          rm -rf "$ROOT/scheduler"
+          ln -s "$VICTIM" "$ROOT/scheduler"
+          OUT="$(python3 install.py --target "$ROOT" --revert-proposal toctou2 2>&1 || true)"
+          echo "$OUT" | grep -qi "symlink" || \
+            (echo "expected a symlink-swap refusal from revert-proposal; got:"; echo "$OUT"; exit 1)
+          grep -q "SENSITIVE VICTIM CONTENT 2" "$VICTIM/manifest.yml" || \
+            (echo "SECURITY REGRESSION: revert-proposal wrote through the symlinked scheduler/"; exit 1)
 
       - name: memory scaffold present (Phase 5 — the agent's own note-writing isn't scriptable here)
         run: |
@@ -76,12 +345,15 @@ jobs:
       - name: compose into an existing workspace (--into), user content untouched
         run: |
           WS="${{ runner.temp }}/existing-workspace"
-          # model an AI-OS-Core-shaped workspace: user files AND a live memory/
-          mkdir -p "$WS/my-project" "$WS/memory"
+          # model an AI-OS-Core-shaped workspace: user files, a live memory/,
+          # AND a pre-existing recipient-owned skill (SEED-071 x --into: skill
+          # registration must not collide with or disturb it)
+          mkdir -p "$WS/my-project" "$WS/memory" "$WS/.claude/skills/mine"
           echo "user content" > "$WS/CLAUDE.md.mine"
           echo "user note" > "$WS/my-project/notes.txt"
           echo "# the user's live memory index" > "$WS/memory/MEMORY.md"
           echo "a real note" > "$WS/memory/my-note.md"
+          echo "recipient's own skill, not ours" > "$WS/.claude/skills/mine/SKILL.md"
           # --into refuses an EMPTY dir (that's what plain --target is for)
           mkdir "${{ runner.temp }}/empty-dir"
           if python3 install.py --target "${{ runner.temp }}/empty-dir" --into; then
@@ -93,6 +365,10 @@ jobs:
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
           if [ -f "$WS/memory/CONVENTIONS.md" ]; then
             echo "seed scaffold was written into the user's memory/"; exit 1; fi
+          test -L "$WS/.claude/skills/recall/SKILL.md" || \
+            (echo "expected cc-seed skills to register alongside a pre-existing recipient skill"; exit 1)
+          grep -q "recipient's own skill, not ours" "$WS/.claude/skills/mine/SKILL.md" || \
+            (echo "skill registration disturbed a pre-existing recipient skill"; exit 1)
           # collision refusal: a second --into must refuse, not merge
           if python3 install.py --target "$WS" --into; then
             echo "second --into should refuse"; exit 1; fi
@@ -101,17 +377,41 @@ jobs:
           # wrote anything catches this even though the path was never
           # shipped by the package)
           echo "tampered without approval" > "$WS/my-project/notes.txt"
-          python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" | grep -q "\[FLAGGED\] check 1:" || \
-            (echo "expected check 1 to flag a tampered pre-existing file"; exit 1)
+          # captured, not piped straight into grep -q: under pipefail (GH
+          # Actions' default), an EARLY match in a longer stream lets grep
+          # exit before install.py finishes writing, SIGPIPE-ing it into a
+          # nonzero exit that fails the pipeline even though grep DID match
+          # (reproduced live 2026-08-09 fixing this same CI gap) — capture
+          # first so grep's read never races install.py's write.
+          OUT="$(python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" || true)"
+          echo "$OUT" | grep -q "\[FLAGGED\] check 1:" || \
+            (echo "expected check 1 to flag a tampered pre-existing file; got:"; echo "$OUT"; exit 1)
           echo "user note" > "$WS/my-project/notes.txt"
-          python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" | grep -q "RESULT: PASS" || \
-            (echo "expected a clean audit once the tamper is reverted"; exit 1)
+          # SEED-070 ships repo_hygiene as scheduled-by-default, so a
+          # freshly --into'd manifest drifts from the not-yet-synced real
+          # cron/launchd state (check 2) until sync.sh actually reconciles
+          # it — the same step "enable + install the demo job" below does
+          # for --target installs. Found alongside the check-1 fix above
+          # while making this step's RESULT:PASS assertion true for the
+          # first time (never previously exercised: this workflow only
+          # runs in the PUBLISHED ai-os-seed repo's CI, and Wave 2G-2 was
+          # never published this session).
+          bash "$WS/scheduler/sync.sh"
+          OUT="$(python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" || true)"
+          echo "$OUT" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit once the tamper is reverted; got:"; echo "$OUT"; exit 1)
           # surgical uninstall: seed components go, user content AND memory stay
           python3 install.py --target "$WS" --uninstall
           test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
           test -f "$WS/memory/my-note.md"
           if [ -d "$WS/_lib" ]; then echo "uninstall left seed components"; exit 1; fi
+          # registered skill symlinks must be gone — not dangling, not live
+          if [ -e "$WS/.claude/skills/recall/SKILL.md" ] || [ -L "$WS/.claude/skills/recall/SKILL.md" ]; then
+            echo "uninstall left a registered skill symlink behind (live or dangling)"; exit 1; fi
+          # the recipient's own unrelated skill must survive untouched
+          grep -q "recipient's own skill, not ours" "$WS/.claude/skills/mine/SKILL.md" || \
+            (echo "uninstall disturbed a pre-existing recipient skill"; exit 1)
 
       - name: enable + install the demo job for real (Phase 6)
         run: |
@@ -122,16 +422,19 @@ jobs:
           bash "$ROOT/scheduler/sync.sh"
           bash "$ROOT/scheduler/sync.sh" --check
           # with a job scheduled for real, --detect must now find this install
-          python3 install.py --detect | grep -q "install root" || (echo "--detect missed a live install" && exit 1)
+          OUT="$(python3 install.py --detect || true)"
+          echo "$OUT" | grep -q "install root" || (echo "--detect missed a live install:"; echo "$OUT"; exit 1)
           # scheduler drift: the job vanishes from the manifest while the
           # real crontab/launchd entry still exists -> orphan, check 2 FLAGS
           cp "$ROOT/scheduler/manifest.yml" "${{ runner.temp }}/manifest.yml.bak"
           printf 'jobs: []\n' > "$ROOT/scheduler/manifest.yml"
-          python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" | grep -q "\[FLAGGED\] check 2:" || \
-            (echo "expected check 2 to flag an orphaned scheduler unit"; exit 1)
+          OUT="$(python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" || true)"
+          echo "$OUT" | grep -q "\[FLAGGED\] check 2:" || \
+            (echo "expected check 2 to flag an orphaned scheduler unit; got:"; echo "$OUT"; exit 1)
           cp "${{ runner.temp }}/manifest.yml.bak" "$ROOT/scheduler/manifest.yml"
-          python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" | grep -q "RESULT: PASS" || \
-            (echo "expected a clean audit once the manifest is restored"; exit 1)
+          OUT="$(python3 install.py --target "$ROOT" --audit --package "$GITHUB_WORKSPACE" || true)"
+          echo "$OUT" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit once the manifest is restored; got:"; echo "$OUT"; exit 1)
 
       - name: uninstall removes the whole footprint (Phase 7 undo path)
         run: |
@@ -148,6 +451,14 @@ jobs:
           ROOT="${{ runner.temp }}/aios-audit-target"
           PKG="$GITHUB_WORKSPACE"
           python3 install.py --target "$ROOT"
+          # SEED-070 ships repo_hygiene scheduled-by-default in the
+          # manifest, but a plain install doesn't sync it to real
+          # cron/launchd — sync first so check 2 has something to find, same
+          # as "enable + install the demo job" does for --target installs.
+          # Found the same day as this CI-coverage pass: this call was
+          # previously unreachable-in-practice (this workflow has never run
+          # in the published ai-os-seed repo's real CI).
+          bash "$ROOT/scheduler/sync.sh"
           python3 install.py --target "$ROOT" --audit --package "$PKG"
 
           mkdir -p "$ROOT/.cc-seed/staged"
@@ -176,9 +487,11 @@ jobs:
           mkdir -p "$WS/.cc-seed/staged"
           printf 'proposed addition\n' > "$WS/.cc-seed/staged/claude-md.proposed"
           python3 install.py --target "$WS" --approve claude-md
-          python3 install.py --target "$WS" --audit --package "$PKG" | grep -q "RESULT: PASS" || \
-            (echo "expected a clean audit for a byte-perfect install over a 0-byte pre-existing CLAUDE.md"; \
-             python3 install.py --target "$WS" --audit --package "$PKG"; exit 1)
+          bash "$WS/scheduler/sync.sh"  # SEED-070's default-scheduled repo_hygiene isn't synced by --into alone
+          OUT="$(python3 install.py --target "$WS" --audit --package "$PKG" || true)"
+          echo "$OUT" | grep -q "RESULT: PASS" || \
+            (echo "expected a clean audit for a byte-perfect install over a 0-byte pre-existing CLAUDE.md; got:"; \
+             echo "$OUT"; exit 1)
 
       - name: install-audit — refuses a dirty --package as reference
         run: |
@@ -189,14 +502,16 @@ jobs:
           python3 install.py --target "$ROOT"
           if python3 install.py --target "$ROOT" --audit --package "$DIRTY"; then
             echo "expected --audit to refuse a dirty --package"; exit 1; fi
-          python3 install.py --target "$ROOT" --audit --package "$DIRTY" 2>&1 | grep -qi "dirty" || \
-            (echo "dirty-package refusal reason not reported"; exit 1)
+          OUT="$(python3 install.py --target "$ROOT" --audit --package "$DIRTY" 2>&1 || true)"
+          echo "$OUT" | grep -qi "dirty" || \
+            (echo "dirty-package refusal reason not reported; got:"; echo "$OUT"; exit 1)
 
       - name: install-audit — negative fixtures (each must FLAG the right check, not just exit nonzero)
         run: |
           ROOT="${{ runner.temp }}/aios-audit-neg"
           PKG="$GITHUB_WORKSPACE"
           python3 install.py --target "$ROOT"
+          bash "$ROOT/scheduler/sync.sh"  # SEED-070's default-scheduled repo_hygiene needs syncing before check 2 can PASS
 
           # F6 fix (2026-08-06 Gemini review): assert_flagged used to check
           # only the check ID, so a check FLAGGED for the WRONG reason (e.g.
@@ -246,8 +561,9 @@ jobs:
           assert_flagged 1 "UNEXPECTED"
           rm "$ROOT/not_shipped_by_anyone.txt"
 
-          python3 install.py --target "$ROOT" --audit --package "$PKG" | grep -q "RESULT: PASS" || \
-            (echo "fixtures did not fully revert to a clean state"; exit 1)
+          OUT="$(python3 install.py --target "$ROOT" --audit --package "$PKG" || true)"
+          echo "$OUT" | grep -q "RESULT: PASS" || \
+            (echo "fixtures did not fully revert to a clean state; got:"; echo "$OUT"; exit 1)
 
           # 3a. malformed/duplicate CLAUDE.md markers -> check 3
           printf '<!-- cc-seed:start -->\nx\n<!-- cc-seed:end -->\n<!-- cc-seed:start -->\ny\n<!-- cc-seed:end -->\n' > "$ROOT/CLAUDE.md"

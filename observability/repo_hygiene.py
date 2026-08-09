@@ -251,22 +251,45 @@ def problems(days: int = DEFAULT_DAYS, now: float | None = None) -> list:
 
 
 def main() -> int:
+    global CC
     ap = argparse.ArgumentParser(description="Repo-hygiene guard for ~/{{REDACTED}}.")
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
                     help=f"grace period before dirty/ahead pages (default {DEFAULT_DAYS})")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--root", metavar="PATH",
+                    help="sweep root for this invocation, overriding CC_HYGIENE_ROOT "
+                         "and the ~/{{REDACTED}} default — a CLI arg (not just the env "
+                         "var) so a scheduler that execs argv directly, no shell, "
+                         "still works (cc-seed's SEED-070 starter job: launchd's "
+                         "ProgramArguments doesn't expand VAR=val prefixes the way "
+                         "a crontab line, run through sh -c, would)")
+    ap.add_argument("--findings-exit0", action="store_true",
+                    help="cc-seed scheduler convention (SEED-070, scheduler/"
+                         "CONVENTIONS.md rule 1): found-work is success, not "
+                         "breakage — print a leading FINDINGS: line and exit 0 "
+                         "when problems exist, instead of this script's own "
+                         "default of exit 1. Off by default: unchanged for the "
+                         "existing freshness.py dependency-check usage on this host, "
+                         "which reads problems() as data and never looks at this "
+                         "exit code.")
     args = ap.parse_args()
+    if args.root:
+        CC = Path(os.path.expanduser(args.root))
 
     probs = problems(args.days)
     if args.json:
         print(json.dumps({"problems": probs}, indent=2))
+        if args.findings_exit0:
+            return 0
         return 1 if probs else 0
     if not probs:
         return 0  # silent success — freshness/{{REDACTED}} send no ping
+    if args.findings_exit0:
+        print(f"FINDINGS: {len(probs)} repo(s)/target(s) need attention")
     for p in probs:
         tag = p["kind"].upper()
         print(f"[{tag:14}] {p['repo']}: {p['detail']}")
-    return 1
+    return 0 if args.findings_exit0 else 1
 
 
 if __name__ == "__main__":

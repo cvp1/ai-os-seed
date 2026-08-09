@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
-"""skill-center: scaffold a new Claude Code skill following Craig's conventions.
+"""skill-center: scaffold a new Claude Code skill following this workspace's conventions.
 
 Plan-validate-execute: runs DRY by default (prints the plan + validates the
 description), only touches disk with --commit. The why: a skill that triggers
 wrong or lands in the wrong place is annoying to unwind, so we validate the one
 field that matters (description) before creating anything.
 
-Craig's conventions enforced here:
-  - canonical files live in a git repo under ~/{{REDACTED}} (version-controlled)
-    * simple/workflow skills -> the shared {{REDACTED}}/cc-skills repo (default)
-    * skills with real code   -> their own repo (pass --repo-path)
-  - ~/.claude/skills/<name>/SKILL.md is a SYMLINK to the canonical file
-  - helper scripts stay in the repo, called by ABSOLUTE path with /usr/bin/python3
-  - secrets come from ~/.key (never hardcoded); shared helpers via _lib/cc-lib
+Conventions enforced here:
+  - canonical files live under this workspace's skills/<name>/ (version-
+    controlled with the rest of the workspace) — pass --repo-path to put a
+    skill with real code in its own repo instead
+  - .claude/skills/<name>/SKILL.md is a SYMLINK to the canonical file
+    (project-level discovery — Claude Code walks up from the working
+    directory looking for .claude/skills/)
+  - helper scripts stay next to the canonical SKILL.md, called by absolute
+    path with /usr/bin/python3
+  - secrets come from ~/.key (never hardcoded); shared helpers via _lib
 
 Usage:
   scaffold.py --name solar-peek --desc "..."                 # dry-run plan
   scaffold.py --name solar-peek --desc "..." --with-scripts  # add scripts/ dir
-  scaffold.py --name solar-peek --desc "..." --repo-path ~/{{REDACTED}}/solar-peek
+  scaffold.py --name solar-peek --desc "..." --repo-path ~/repos/solar-peek
   scaffold.py --name solar-peek --desc "..." --commit        # actually create
 """
 import argparse
 import os
 import re
 import sys
+from pathlib import Path
 
 HOME = os.path.expanduser("~")
-CC_SKILLS = os.path.join(HOME, "{{REDACTED}}/cc-skills")
-SKILLS_DIR = os.path.join(HOME, ".claude/skills")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+SKILLS_DIR = str(WORKSPACE_ROOT / ".claude" / "skills")
 
 SKELETON = '''---
 name: {name}
@@ -62,8 +66,8 @@ def validate(name, desc):
     if len(desc) < 40:
         errs.append("description too short — say what it does AND when to trigger")
     low = desc.lower()
-    if not re.search(r'"/?[\w-]+"|use when|use this when|when (craig|the user|you)', low):
-        errs.append('description needs explicit triggers (e.g. \'Use when Craig says "/x", ...\')')
+    if not re.search(r'"/?[\w-]+"|use when|use this when|when (the operator|the user|you)', low):
+        errs.append('description needs explicit triggers (e.g. \'Use when the operator says "/x", ...\')')
     # Ignore quoted trigger phrases (user's voice) — only the narration must be 3rd person.
     narration = re.sub(r'"[^"]*"|\'[^\']*\'', " ", desc)
     if re.search(r"\b(I |I'?ll|I'?m|you can|you should)", narration):
@@ -75,7 +79,7 @@ def plan(name, desc, repo_dir, with_scripts, repo_label):
     skill_link = os.path.join(SKILLS_DIR, name, "SKILL.md")
     canonical = os.path.join(repo_dir, "SKILL.md")
     lines = [
-        f"PLAN for skill '{name}'  (repo: {repo_label})",
+        f"PLAN for skill '{name}'  (canonical location: {repo_label})",
         f"  create dir   {repo_dir.replace(HOME, '~')}/",
         f"  write        {canonical.replace(HOME, '~')}",
     ]
@@ -87,10 +91,10 @@ def plan(name, desc, repo_dir, with_scripts, repo_label):
         "",
         "AFTER --commit, still TODO by hand:",
         "  - fill in the SKILL.md body",
-        f"  - audit.py            (lint the new skill)",
-        f"  - git -C {os.path.dirname(repo_dir).replace(HOME,'~') if repo_label!='cc-skills' else '~/{{REDACTED}}/cc-skills'} add + commit (identity {{REDACTED}})",
-        "  - write an auto-memory entry + MEMORY.md pointer",
-        "  - if scheduled: register a {{REDACTED}} cron shim (real file, not symlink)",
+        "  - audit.py            (lint the new skill)",
+        f"  - commit {repo_dir.replace(HOME, '~')} with your own identity",
+        "  - write a memory note + pointer (see memory/CONVENTIONS.md)",
+        "  - if scheduled: add it to scheduler/manifest.yml (see scheduler/CONVENTIONS.md)",
     ]
     return "\n".join(lines)
 
@@ -112,7 +116,7 @@ def execute(name, desc, repo_dir, with_scripts):
     link = os.path.join(link_dir, "SKILL.md")
     if os.path.islink(link) or os.path.exists(link):
         os.remove(link)
-    os.symlink(canonical, link)
+    os.symlink(os.path.relpath(canonical, link_dir), link)
     print(f"created {canonical}")
     print(f"symlinked {link} -> {canonical}")
     print("\nSKILL.md hot-loads this session; fill the body, then run audit.py.")
@@ -123,7 +127,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--desc", required=True, help="frontmatter description (what + when-to-trigger)")
-    ap.add_argument("--repo-path", help="own-repo path; default = shared cc-skills/<name>")
+    ap.add_argument("--repo-path", help="own-repo path; default = this workspace's skills/<name>")
     ap.add_argument("--with-scripts", action="store_true", help="also create a scripts/ dir in the repo")
     ap.add_argument("--commit", action="store_true", help="actually create files (default is dry-run)")
     args = ap.parse_args()
@@ -137,10 +141,10 @@ def main():
 
     if args.repo_path:
         repo_dir = os.path.expanduser(args.repo_path)
-        repo_label = os.path.basename(repo_dir.rstrip("/"))
+        repo_label = repo_dir.replace(HOME, "~")
     else:
-        repo_dir = os.path.join(CC_SKILLS, args.name)
-        repo_label = "cc-skills"
+        repo_dir = str(WORKSPACE_ROOT / "skills" / args.name)
+        repo_label = repo_dir.replace(HOME, "~")
 
     print(plan(args.name, args.desc, repo_dir, args.with_scripts, repo_label))
     if not args.commit:

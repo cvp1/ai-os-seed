@@ -1,44 +1,50 @@
 #!/usr/bin/env python3
-"""skill-center: audit + find over Craig's local Claude Code skills.
+"""skill-center: audit + find over the operator's local Claude Code skills.
 
 Two jobs, no dependencies (/usr/bin/python3):
 
   audit.py                 # lint every local skill against best-practices
   audit.py --find "query"  # rank local skills by relevance to a need
 
-A skill lives at ~/.claude/skills/<name>/SKILL.md, which is a symlink into a
-git repo ({{REDACTED}}/cc-skills or the skill's own repo). We read through the symlink
-so we lint the canonical file.
+A skill lives at <workspace>/.claude/skills/<name>/SKILL.md, which is a
+symlink into this workspace's own skills/<name>/ (project-level discovery —
+Claude Code walks up from the working directory looking for .claude/skills/,
+same as it does for .claude/commands/). We read through the symlink so we
+lint the canonical file, not the link. SKILLS_DIR resolves relative to this
+script's own location (two directories up: skills/skill-center/audit.py ->
+workspace root -> .claude/skills), so it needs no configuration regardless
+of where this workspace was installed; --dir overrides it for anyone who
+also registers skills at the user level (~/.claude/skills).
 
 Best-practice checks (Anthropic skill-authoring guide):
   - description present, has trigger phrases, third-person (no "I "/"you ")
   - description not vague ("helps with", "processes data", ...)
   - SKILL.md body < 500 lines (progressive disclosure)
-  - symlink resolves to a real file inside a git repo
+  - symlink resolves to a real file (not a bare file sitting directly in
+    .claude/skills/, which means the canonical/symlink split was skipped)
   - a vendored (`provenance: third-party`) skill has had its supervised first
     run recorded (`observed: true`) — see --mark-observed below
 The why: the description is the ONLY thing the runtime matches against a user
 prompt, so a vague or first-person one silently fails to trigger.
 
-Supply-chain note (audits/2026-08-05-continuous-verification Epic D, D1/D2):
-a static SKILL.md review cannot see what a skill's referenced scripts do at
-runtime (SkillCloak-class payloads defeat >90% of static scanners). D1's
-2026-08-05 audit found zero third-party skills installed via this path — the
-cheapest point to land a control is before the first one arrives, not after.
-So: `--vendor NAME` marks a freshly-vendored skill `provenance: third-party`
-+ `observed: false`; the audit flags it FIX until a human has supervised one
-real run and checked it against D1's own checklist (dynamic-context `!`
-lines, eval/exec/os.system, curl|sh, decode-then-execute) and run
-`--mark-observed NAME`. This is a lint gate, not a runtime sandbox — Claude
-Code has no per-skill execution jail to hook here; a real sandboxed-execution
-control is D3 (routed to ai-os-pm, not built in this repo).
+Supply-chain note: a static SKILL.md review cannot see what a skill's
+referenced scripts do at runtime (self-extracting/obfuscated payloads defeat
+most static scanners). The cheapest point to land a control is before the
+first third-party skill arrives, not after. So: `--vendor NAME` marks a
+freshly-vendored skill `provenance: third-party` + `observed: false`; the
+audit flags it FIX until a human has supervised one real run — checked for
+dynamic-context `!` lines, eval/exec/os.system, curl|sh, decode-then-execute
+— and run `--mark-observed NAME`. This is a lint gate, not a runtime
+sandbox: Claude Code has no per-skill execution jail to hook here.
 """
 import argparse
 import os
 import re
 import sys
+from pathlib import Path
 
-SKILLS_DIR = os.path.expanduser("~/.claude/skills")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+SKILLS_DIR = str(WORKSPACE_ROOT / ".claude" / "skills")
 VAGUE = ("helps with", "help you", "processes data", "various tasks",
          "utility", "general purpose", "does things")
 
@@ -81,7 +87,7 @@ def load_skills(skills_dir=SKILLS_DIR):
     return out
 
 
-def lint(rec):
+def lint(rec, skills_dir=SKILLS_DIR):
     issues = []
     if not rec["exists"]:
         return ["SKILL.md missing or broken symlink"]
@@ -90,7 +96,7 @@ def lint(rec):
         issues.append("no description (skill will never trigger reliably)")
     else:
         low = desc.lower()
-        if not re.search(r'"/?[\w-]+"|use when|use this when|when (craig|the user|you)', low):
+        if not re.search(r'"/?[\w-]+"|use when|use this when|when (the operator|the user|you)', low):
             issues.append("description has no explicit trigger phrases")
         # Quoted trigger phrases are the user's own voice ("how do I grow X") and
         # may legitimately be first/second person — only the narration must be 3rd.
@@ -105,21 +111,22 @@ def lint(rec):
         issues.append("no name in frontmatter")
     if rec.get("body_lines", 0) > 500:
         issues.append(f"body {rec['body_lines']} lines > 500 — split via progressive disclosure")
-    if rec["real"] and "/Github/" not in rec["real"]:
-        issues.append("canonical file not in a git repo under ~/Github (not version-controlled)")
+    if rec["real"] and os.path.dirname(rec["real"]) == os.path.join(skills_dir, rec["name"]):
+        issues.append("canonical file sits directly in .claude/skills/ — "
+                       "keep the real file in skills/<name>/ and symlink it in, "
+                       "so the skill stays version-controlled with the rest of the workspace")
     if rec["meta"].get("provenance") == "third-party" and rec["meta"].get("observed") != "true":
         issues.append("UNOBSERVED third-party skill — supervise one real run (check "
                        "dynamic-context `!` lines, eval/exec/os.system, curl|sh, "
-                       "decode-then-execute per D1's checklist), then run "
+                       "decode-then-execute), then run "
                        f"`audit.py --mark-observed {rec['name']}`")
     return issues
 
 
 def _set_frontmatter_key(text, key, value):
     """Set a top-level `key: value` in a SKILL.md's frontmatter, byte-preserving
-    everything else (same rewrite-not-regenerate discipline as
-    memory_write.py's set_lineage() — a vendoring/observation stamp must never
-    become an excuse to touch the body a reviewer is about to read)."""
+    everything else — a vendoring/observation stamp must never become an
+    excuse to touch the body a reviewer is about to read."""
     if not text.startswith("---"):
         raise ValueError("no `---` frontmatter block — refusing to guess")
     end = text.find("\n---", 3)
@@ -145,12 +152,12 @@ def _find_skill(skills, name):
     return None
 
 
-def cmd_vendor(skills, name):
+def cmd_vendor(skills, name, skills_dir=SKILLS_DIR):
     rec = _find_skill(skills, name)
     if rec is None or not rec["exists"]:
-        print(f"error: no skill '{name}' at ~/.claude/skills/{name}/SKILL.md — "
-              "vendor it in first (repo + symlink, per the FIND-mode convention), "
-              "then run --vendor to stamp it.", file=sys.stderr)
+        print(f"error: no skill '{name}' at {skills_dir}/{name}/SKILL.md — "
+              "vendor it in first (skills/<name>/ + a .claude/skills symlink, per "
+              "the FIND-mode convention), then run --vendor to stamp it.", file=sys.stderr)
         return 1
     if rec["meta"].get("provenance") == "third-party":
         print(f"'{name}' is already marked provenance: third-party "
@@ -162,15 +169,15 @@ def cmd_vendor(skills, name):
         f.write(new_text)
     print(f"marked '{name}' provenance: third-party, observed: false -> {rec['real']}")
     print("Before unrestricted use: supervise one real run (dynamic-context `!` "
-          "lines, eval/exec/os.system, curl|sh, decode-then-execute — D1's "
-          f"checklist), then: audit.py --mark-observed {name}")
+          "lines, eval/exec/os.system, curl|sh, decode-then-execute), then: "
+          f"audit.py --mark-observed {name}")
     return 0
 
 
-def cmd_mark_observed(skills, name):
+def cmd_mark_observed(skills, name, skills_dir=SKILLS_DIR):
     rec = _find_skill(skills, name)
     if rec is None or not rec["exists"]:
-        print(f"error: no skill '{name}' at ~/.claude/skills/{name}/SKILL.md", file=sys.stderr)
+        print(f"error: no skill '{name}' at {skills_dir}/{name}/SKILL.md", file=sys.stderr)
         return 1
     if rec["meta"].get("provenance") != "third-party":
         print(f"error: '{name}' is not marked provenance: third-party — "
@@ -186,10 +193,10 @@ def cmd_mark_observed(skills, name):
     return 0
 
 
-def cmd_audit(skills):
+def cmd_audit(skills, skills_dir=SKILLS_DIR):
     bad = 0
     for rec in skills:
-        issues = lint(rec)
+        issues = lint(rec, skills_dir)
         flag = "ok " if not issues else "FIX"
         if issues:
             bad += 1
@@ -235,16 +242,17 @@ def main():
     ap.add_argument("--mark-observed", metavar="NAME",
                      help="record that a third-party skill's supervised first run is done")
     ap.add_argument("--dir", metavar="PATH", default=SKILLS_DIR,
-                     help="skills directory to audit (default: ~/.claude/skills)")
+                     help="skills directory to audit (default: this workspace's .claude/skills)")
     args = ap.parse_args()
-    skills = load_skills(os.path.expanduser(args.dir))
+    skills_dir = os.path.expanduser(args.dir)
+    skills = load_skills(skills_dir)
     if args.find:
         return cmd_find(skills, args.find)
     if args.vendor:
-        return cmd_vendor(skills, args.vendor)
+        return cmd_vendor(skills, args.vendor, skills_dir)
     if args.mark_observed:
-        return cmd_mark_observed(skills, args.mark_observed)
-    return cmd_audit(skills)
+        return cmd_mark_observed(skills, args.mark_observed, skills_dir)
+    return cmd_audit(skills, skills_dir)
 
 
 if __name__ == "__main__":
