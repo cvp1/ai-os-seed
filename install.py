@@ -37,6 +37,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,10 +69,50 @@ jobs:
 CC_SEED_DIR = ".cc-seed"
 RECEIPT_NAME = "receipt.json"
 STAGED_DIR = "staged"
-GATED_WRITES = {"claude-md", "mesh-bootstrap"}
+GATED_WRITES = {"claude-md", "mesh-bootstrap", "import-pack"}
 MARKER_START = "<!-- cc-seed:start -->"
 MARKER_END = "<!-- cc-seed:end -->"
 _MAX_HASH_BYTES = 200 * 1024 * 1024  # Principle 8: bound the loop — don't hash unbounded files
+
+# --- P3 (2026-08-08): cc-pack import — the gated write path -----------------
+# A pack (cc-pack/build_pack.py's output, verified by pack/import_pack.py
+# which ships alongside this file) is applied entirely OUTSIDE --target's own
+# git tree, into an out-of-repo delivery root — see _pack_delivery_root().
+# CLAUDE.md gets at most one pointer line, ever, at the very START of the
+# file (never the end — the cc-seed claude-md region, when present, must stay
+# the LAST thing in the file per check 3's invariant; _approve_claude_md
+# already appends after whatever precedes it, so writing the pack pointer
+# first and leaving claude-md's own append logic untouched makes the two
+# compose regardless of which gated write runs first).
+PACKS_MARKER_START = "<!-- cc-pack:start -->"
+PACKS_MARKER_END = "<!-- cc-pack:end -->"
+# \A/\Z, not ^/$ (2026-08-08 P3 review, GPT): re.match with a trailing $
+# accepts a string ending in "\n" (Python's $ matches just before a final
+# newline, not only at the true end of string) — "foo\n" would pass this
+# check under ^...$ even though it embeds a control character none of the
+# OTHER path-safety helpers in this codebase would accept. \A/\Z has no
+# such exception.
+_PACK_SAFE_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+
+
+def _pack_is_safe_relpath(rel):
+    """Declared duplicate of cc-pack/pack_lib.py's is_safe_relpath (same
+    split as pack/import_pack.py — this file ships to targets without the
+    cc-pack repo). Must run before any path join: Path.__truediv__ silently
+    discards the left side when the right is absolute."""
+    if not rel or not isinstance(rel, str):
+        return False
+    if "\x00" in rel or "\\" in rel:
+        return False
+    if any(ord(c) < 0x20 for c in rel):
+        return False
+    if rel.startswith("/"):
+        return False
+    return all(p not in ("", ".", "..") for p in rel.split("/"))
+
+
+def _pack_is_safe_component(name):
+    return isinstance(name, str) and bool(_PACK_SAFE_COMPONENT_RE.match(name))
 
 
 def die(msg):
@@ -253,9 +294,43 @@ def _load_receipt(target: Path):
 # exactly the threat class this wave defends (a confused or scoped agent);
 # it does not defend against a fully compromised same-uid process with
 # unrestricted filesystem access — that residual is already disclosed.
+def _target_slug(target: Path) -> str:
+    # Full digest, not a truncated prefix (2026-08-08 P3 review, GPT: a
+    # 16-hex-char/64-bit prefix is an unnecessary collision boundary on a
+    # value that scopes both the receipt anchor and the pack delivery root
+    # — cheap to widen, no format that depends on the short form exists yet).
+    return hashlib.sha256(str(target).encode()).hexdigest()
+
+
 def _anchor_path(target: Path) -> Path:
-    slug = hashlib.sha256(str(target).encode()).hexdigest()[:16]
-    return Path.home() / ".cache" / "cc-seed" / "receipt-anchors" / f"{slug}.json"
+    return Path.home() / ".cache" / "cc-seed" / "receipt-anchors" / f"{_target_slug(target)}.json"
+
+
+def _pack_delivery_root(target: Path) -> Path:
+    """P3: where imported-pack content actually lands — out-of-repo, on
+    purpose (see the GATED_WRITES comment above). Same slug construction as
+    _anchor_path, factored into _target_slug per the design doc's own
+    instruction, so the two locations can never drift onto different slugs
+    for the same target."""
+    xdg_state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg_state) / "cc-pack" / _target_slug(target)
+
+
+def _expected_pack_dest(target: Path, pack_id: str) -> Path:
+    """The ONLY trustworthy delivery-root path for a given pack id — always
+    RE-DERIVED, never read from receipt.json's `delivery_path` field for any
+    operation that deletes or otherwise trusts filesystem content (2026-08-08
+    P3 tri-model review, consensus CRITICAL finding, all three reviewers
+    independently: a same-uid agent scoped to --target can edit the live
+    receipt — that's the entire reason the out-of-target anchor/check 7
+    exist — and `remove_pack`/check 9 read `delivery_path` straight off that
+    same untrusted receipt and used it for `shutil.rmtree()` / hashing. An
+    agent could set `delivery_path` to `~/.ssh` and have a human's later
+    `--remove-pack` delete it. `delivery_path` in the receipt is now
+    DISPLAY/PROVENANCE ONLY — every filesystem operation uses this function."""
+    if not _pack_is_safe_component(pack_id):
+        raise ValueError(f"pack id {pack_id!r} is not a safe path component")
+    return _pack_delivery_root(target) / "packs" / pack_id
 
 
 def _save_anchor(target: Path, receipt: dict):
@@ -579,13 +654,17 @@ def uninstall(target: Path):
 # is no window between "recorded as approved" and "written" for an agent to
 # race.
 
-def approve(target: Path, which: str):
+def approve(target: Path, which: str, from_pack: str = None, replace: bool = False, tag: str = None,
+            allowed_signers: str = None, allow_unsigned: bool = False):
     receipt = _load_receipt(target)
     if receipt is None:
         return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — was this target "
                    f"installed with this install.py?")
     if which == "claude-md":
         return _approve_claude_md(target, receipt)
+    if which == "import-pack":
+        return _approve_import_pack(target, receipt, from_pack, replace, tag,
+                                     allowed_signers, allow_unsigned)
     return _approve_mesh_bootstrap(target, receipt)
 
 
@@ -672,6 +751,617 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     return 0
 
 
+# --- P3 (2026-08-08): cc-pack import ----------------------------------------
+# install.py --approve import-pack --from-pack <path> is the write path the
+# cc-pack design calls for: an agent may --inspect/--verify a pack freely
+# (pack/import_pack.py, read-only), but only a human running --approve moves
+# bytes — same covenant as claude-md/mesh-bootstrap above.
+
+def _verify_pack_dir(pack_dir: Path):
+    """Shells out to the SAME import_pack.py this clone ships (pack/, next
+    to this file) rather than re-implementing SHA256SUMS/bijection/audience-
+    gate checking a third time — that logic is already hardened and kept in
+    sync with cc-pack/pack_lib.py by cc-pack/selftest.py's cross-fixture
+    tests; a third copy here would be a third place for it to drift."""
+    importer = HERE / "pack" / "import_pack.py"
+    if not importer.exists():
+        return False, f"{importer} not found — this clone is missing the pack importer (pack/import_pack.py)"
+    if not pack_dir.exists():
+        return False, f"{pack_dir} does not exist"
+    try:
+        r = subprocess.run([sys.executable, str(importer), "--pack", str(pack_dir), "--verify"],
+                            capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return False, f"{importer} --verify timed out after 120s on {pack_dir}"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+# P6c (2026-08-09): signature-verify state, machine-parsed from the SAME
+# import_pack.py --verify call above — never a THIRD re-implementation of
+# the ssh-keygen -Y logic (pack_lib.py is the second; import_pack.py's own
+# copy is the declared-duplicate first). See pack_lib.py's POSTURE comment
+# for why unsigned/invalid/unknown-signer/verification-error/verified is
+# the right state set and why enforcement (this file's job) is kept
+# separate from classification (import_pack.py's job).
+_SIG_LINE_RE = re.compile(r"^signature:\s*(\S+)(?:\s+principal=(\S+))?", re.MULTILINE)
+
+# Declared-duplicate constant of import_pack.py's SIG_STATES — this file
+# never imports import_pack.py (it only shells out to it), so it can't
+# import the tuple; kept in sync by hand like every other cross-file
+# constant in this design. Used to validate the parsed 'signature:' word
+# is actually one of the five known states before any policy decision is
+# made on it (2026-08-09 post-implementation review, Grok + GPT
+# independently HIGH: the regex captured ANY \S+ token with no allowlist —
+# today's producer only ever emits one of these five, but a future
+# diagnostic line, a dependency change in import_pack.py, or drift between
+# this file and that one could put a different word in the capture group,
+# and an unvalidated word flowing straight into "if sig_state == 'unsigned'"
+# / "if sig_state not in (...)" comparisons could silently pick either
+# branch depending on the string, or worse, an unrecognized-but-truthy
+# value could slip past 'unsigned'-only checks. Fail closed to
+# 'verification-error' on anything outside the known set — same posture as
+# every other classification failure in this function.
+_KNOWN_SIG_STATES = ("unsigned", "invalid", "unknown-signer", "verification-error", "verified")
+
+
+def _verify_pack_signature(pack_dir: Path, allowed_signers):
+    """Runs import_pack.py --verify --allowed-signers <path> (a SECOND call
+    to the same tool _verify_pack_dir already made — cheap, and keeps this
+    function's contract simple: it owns signature state, that one owns
+    integrity state) and parses the 'signature: <state>[ principal=<x>]'
+    line it prints. Returns (state, principal_or_None, raw_output). Fails
+    closed to 'verification-error' if the line can't be found at all, OR if
+    the captured state word isn't one of the five known SIG_STATES —
+    never silently treated as unsigned or verified."""
+    importer = HERE / "pack" / "import_pack.py"
+    cmd = [sys.executable, str(importer), "--pack", str(pack_dir), "--verify"]
+    if allowed_signers:
+        cmd += ["--allowed-signers", str(allowed_signers)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        return "verification-error", None, "import_pack.py --verify timed out"
+    out = r.stdout + r.stderr
+    m = _SIG_LINE_RE.search(out)
+    if not m:
+        return "verification-error", None, out
+    state = m.group(1)
+    if state not in _KNOWN_SIG_STATES:
+        return "verification-error", None, (
+            f"import_pack.py --verify printed an unrecognized signature state "
+            f"{state!r} (not one of {_KNOWN_SIG_STATES}) — refusing rather than "
+            f"trust an unvalidated value:\n{out}")
+    return state, m.group(2), out
+
+
+def _stage_pack_copy(pack_dir: Path, staging_parent: Path) -> Path:
+    """Copies pack_dir into a private, freshly-created staging directory
+    BEFORE verification — closing the verify/apply TOCTOU all three
+    2026-08-08 P3 reviewers found independently. The real-world race isn't
+    nanoseconds: a human reads --approve's output and decides to run it,
+    which is genuine wall-clock time an agent with write access to pack_dir
+    (the normal "agent stages, human approves" shape this whole design
+    exists for) could use to substitute content after --verify passed but
+    before _apply_pack_generic copies it — and _apply_pack_generic only
+    re-checks PATH SAFETY, never re-checks content against SHA256SUMS, so
+    whatever bytes are there at copy time get blessed into the receipt
+    outright. Verifying and applying the SAME snapshot — one nothing else
+    can reach once this function returns — removes the window instead of
+    narrowing it. Refuses to stage anything that isn't a regular file or
+    directory (no symlinks, fifos, devices) so a hostile pack_dir can't
+    smuggle a symlink through the copy itself."""
+    stage = Path(tempfile.mkdtemp(prefix=".cc-pack-stage-", dir=str(staging_parent)))
+    try:
+        for p in sorted(pack_dir.rglob("*")):
+            rel = p.relative_to(pack_dir)
+            dst = stage / rel
+            st = p.lstat()
+            if stat.S_ISDIR(st.st_mode):
+                dst.mkdir(parents=True, exist_ok=True)
+            elif stat.S_ISREG(st.st_mode):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(p.read_bytes())
+            else:
+                raise RuntimeError(
+                    f"{p}: not a regular file or directory (refusing to stage a "
+                    f"symlink/fifo/device from an unverified pack directory)")
+    except (RuntimeError, OSError):
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return stage
+
+
+def _read_pack_manifest(pack_dir: Path):
+    p = pack_dir / "pack.json"
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _apply_pack_generic(pack_dir: Path, manifest: dict, dest_root: Path) -> dict:
+    """Copies every file every part declares to dest_root/parts/<id>/<relfile>
+    — the same generic, delivery-root-only placement as pack_lib.Part.apply's
+    default (see that docstring for the P3 scope cut). Re-validates every
+    path here too: never trust that --verify a moment ago is still true of
+    the bytes about to be copied. Returns {"parts/<id>/<relfile>": sha256}
+    for the receipt."""
+    paths = {}
+    for part in manifest.get("parts", []) or []:
+        if not isinstance(part, dict):
+            continue
+        pid = part.get("id")
+        if not _pack_is_safe_component(pid):
+            raise RuntimeError(f"refusing to apply: part id {pid!r} is not a safe path component")
+        files = part.get("files", [])
+        if not isinstance(files, list):
+            continue
+        for f in files:
+            if not _pack_is_safe_relpath(f):
+                raise RuntimeError(f"refusing to apply: unsafe file entry {f!r} in part {pid!r}")
+            src = pack_dir / "parts" / pid / f
+            dst = dest_root / "parts" / pid / f
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            data = src.read_bytes()
+            dst.write_bytes(data)
+            paths[f"parts/{pid}/{f}"] = _sha256_bytes(data)
+    return paths
+
+
+def _render_packs_md(receipt: dict) -> bytes:
+    """Pure function of receipt['imported_packs'] — re-derived on every
+    import/removal, never hand-edited. Sorted by pack id so A-then-B and
+    B-then-A produce byte-identical output; one labeled section per pack,
+    provenance kept separate rather than blended (mirrors agy-bundle/
+    build.py's renderer shape)."""
+    packs = receipt.get("imported_packs", {}) or {}
+    lines = [
+        "# Imported packs",
+        "",
+        "Rendered by install.py from .cc-seed/receipt.json — do not hand-edit; "
+        "the next `--approve import-pack` or `--remove-pack` regenerates this file.",
+        "",
+    ]
+    if not packs:
+        lines.append("(none imported yet)")
+    for pid in sorted(packs):
+        p = packs[pid]
+        # PACKS.md is the file @-imported straight into CLAUDE.md, so every
+        # field here is effectively model-visible context — sanitize before
+        # rendering (2026-08-08 P3 review, Grok + GPT: an unescaped
+        # source_pack/tags/kind pulled from the receipt could embed
+        # newlines/control sequences and inject extra lines or markdown).
+        lines += [
+            f"## {_escape_path(str(pid))}",
+            "",
+            f"- kind: {_escape_path(str(p.get('kind')))}",
+            f"- audience: {_escape_path(str(p.get('audience')))}",
+            f"- tags: {_escape_path(', '.join(str(t) for t in (p.get('tags') or [])) or '(none)')}",
+            f"- imported: {_escape_path(str(p.get('approved_at')))}",
+            f"- source pack: {_escape_path(str(p.get('source_pack')))}",
+            f"- sha256sums_sha256: {_escape_path(str(p.get('sha256sums_sha256')))}",
+            f"- files: {len(p.get('paths') or {})}",
+            "",
+        ]
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _strip_pack_pointer_prefix(data: bytes, receipt: dict) -> bytes:
+    """If an APPROVED cc-pack pointer region sits at the very start of
+    `data`, strip it (region + its separator) before any cc-seed-region
+    reasoning runs on the rest. check 3 owns the cc-seed claude-md region and
+    must not double-count an approved, separately-owned pack region as
+    'unexplained content outside the region' when diffing against the
+    pre-install baseline — the two gated writes compose in the same file
+    (pack pointer always first, cc-seed region always last; see the
+    GATED_WRITES comment above), so check 3 needs to look straight through
+    the pack region to find what it actually owns."""
+    gw = receipt.get("gated_writes", {}).get("import-pack-pointer")
+    if not gw or not gw.get("written"):
+        return data
+    s_marker, e_marker = PACKS_MARKER_START.encode(), PACKS_MARKER_END.encode()
+    if not data.startswith(s_marker):
+        return data
+    e_idx = data.find(e_marker)
+    if e_idx == -1:
+        return data
+    end = e_idx + len(e_marker) + 1  # past the end marker AND its own guaranteed trailing \n
+    # _write_packs_pointer's "\n\n" separator (when anything follows the pack
+    # region) must be consumed as a pair, matching how it was written — a
+    # single \n here was the 2026-08-08 bug (see _write_packs_pointer).
+    if data[end:end + 2] == b"\n\n":
+        return data[end + 2:]
+    return data[end:]
+
+
+def _write_packs_pointer(target: Path, receipt: dict, delivery_root: Path) -> bool:
+    """Writes the one-line @<delivery_root>/PACKS.md pointer into
+    target/CLAUDE.md — ONCE ever per target (packs 2..N regenerate PACKS.md
+    and touch CLAUDE.md zero times). _lib/context_build.py's IMPORT_RE
+    already resolves absolute @/path.md imports — existing, selftested
+    mechanism, not modified here. Returns True if it wrote (first pack ever
+    for this target), False if the pointer was already there (no-op).
+
+    Raises RuntimeError if cc-pack markers are ALREADY on disk but the
+    receipt has no record of writing them — mirrors _approve_claude_md's
+    existing refusal on a pre-existing cc-seed region (2026-08-08 P3 review,
+    Grok + GPT independently: without this check, a crash between this
+    write and the receipt save — disk full, EPERM, Ctrl-C — leaves CLAUDE.md
+    with a pointer region the receipt doesn't know about; a retry (needed
+    anyway, since the pack directory now exists unrecorded and requires
+    --replace) would prepend a SECOND pack region with no error, and check 8
+    would find 2 start markers and FLAG permanently until a human hand-edits
+    the file. Refusing loudly here turns that into a clear, one-time,
+    fixable error instead of silent corruption on the retry path)."""
+    gw = receipt.setdefault("gated_writes", {})
+    if gw.get("import-pack-pointer", {}).get("written"):
+        return False
+    claude_md = target / "CLAUDE.md"
+    existing = claude_md.read_bytes() if claude_md.exists() else b""
+    if PACKS_MARKER_START.encode() in existing or PACKS_MARKER_END.encode() in existing:
+        raise RuntimeError(
+            f"{claude_md} already contains cc-pack markers but the receipt has no record of "
+            f"writing them — this usually means a prior import wrote the file and then failed "
+            f"before saving the receipt. Resolve by hand: either remove the existing cc-pack "
+            f"region from {claude_md} and retry, or if it's correct, this is a bug (the region "
+            f"content can't be recovered into the receipt automatically — file it).")
+    pointer_line = f"@{delivery_root}/PACKS.md\n".encode()
+    region = PACKS_MARKER_START.encode() + b"\n" + pointer_line + PACKS_MARKER_END.encode() + b"\n"
+    # Same "\n\n" separator convention as _approve_claude_md's own
+    # `before = existing + b"\n\n"` — MUST match regardless of which gated
+    # write runs first, or _strip_pack_pointer_prefix (which assumes a
+    # single fixed byte count between the two regions) mis-counts and leaves
+    # a stray leading newline that check 3 then reads as unexplained content
+    # (caught live 2026-08-08: approving claude-md after an existing pack
+    # import produced exactly this false flag before this fix).
+    new_bytes = region + (b"\n\n" + existing if existing else b"")
+    _atomic_write(claude_md, new_bytes)
+    gw["import-pack-pointer"] = {
+        "approved_hash": _sha256_bytes(pointer_line),
+        "approved_at": _now(), "written": True,
+    }
+    return True
+
+
+def _approve_import_pack(target: Path, receipt: dict, from_pack: str, replace: bool, tag: str = None,
+                          allowed_signers: str = None, allow_unsigned: bool = False) -> int:
+    if not from_pack:
+        return die("--approve import-pack requires --from-pack <path>")
+    pack_dir = Path(from_pack).expanduser()
+    if not pack_dir.is_absolute():
+        return die(f"--from-pack must be an absolute path, got {from_pack!r}")
+    if pack_dir.is_file():
+        return die(f"{pack_dir} is a tar pack — --from-pack only accepts a DIRECTORY in this "
+                   f"build (untar it first: tar xf {pack_dir} -C <dir>). Applying directly from "
+                   f"a tar is a stated P3 residual, not built.")
+    if not pack_dir.is_dir():
+        return die(f"{pack_dir} does not exist or is not a directory")
+
+    delivery_root = _pack_delivery_root(target)
+    delivery_root.mkdir(parents=True, exist_ok=True)
+    try:
+        staged_pack = _stage_pack_copy(pack_dir, delivery_root)
+    except (RuntimeError, OSError) as e:
+        return die(f"failed to stage {pack_dir} for verification ({e}) — refusing to import; "
+                   f"nothing was applied")
+
+    try:
+        ok, detail = _verify_pack_dir(staged_pack)
+        if not ok:
+            return die(f"pack at {pack_dir} failed verification — refusing to import:\n{_escape_path(detail)}")
+        manifest = _read_pack_manifest(staged_pack)
+        if manifest is None:
+            return die(f"{pack_dir}/pack.json did not parse even though --verify just passed — "
+                       f"refusing (this should not happen; investigate before retrying)")
+        pack_id = manifest.get("id")
+        if not _pack_is_safe_component(pack_id):
+            return die(f"pack id {pack_id!r} is not a safe path component — refusing")
+        sums_hash = manifest.get("sha256sums_sha256")
+
+        # Signature policy (P6c, 2026-08-09; tri-model CRITICAL fix — see
+        # pack_lib.py's POSTURE comment for the full rationale). A pure
+        # policy gate, checked immediately after manifest/pack_id
+        # validation and BEFORE any state-changing step below (the
+        # engagement-scoping check, the duplicate-import check, or
+        # anything touching the filesystem) — same placement discipline
+        # the --tag engagement gate already uses.
+        #
+        # audience=replica defaults to require_sig=verified: unsigned,
+        # unknown-signer, invalid, and verification-error ALL refuse.
+        # unsigned is allowed ONLY via the explicit --allow-unsigned
+        # break-glass — never the silent default — and is recorded as such
+        # in the receipt, and ONLY for audience=replica (audience=shareable
+        # was already unsigned-tolerant by design, see below).
+        #
+        # invalid/unknown-signer/verification-error have NO override AND
+        # this refusal is UNCONDITIONAL — it is checked BEFORE the audience
+        # is even consulted, so it applies to every audience, not just
+        # replica (2026-08-09 post-implementation review, all three models
+        # independently converged on this as the load-bearing finding: the
+        # ORIGINAL version of this gate nested the whole signature check
+        # inside `if manifest.get("audience") == "replica"`, which meant an
+        # attacker who can write the pack directory before a human's
+        # `--approve` — the exact threat model this whole design exists
+        # for — could simply relabel pack.json's own `audience` field from
+        # "replica" to "shareable" (this does not touch SHA256SUMS or any
+        # part file, so the integrity chain _verify_pack_dir already passed
+        # stays self-consistent, PROVIDED the relabeled pack's part types
+        # are all dual-audience-compatible, e.g. doctrine/skills/
+        # memory-digest/secret-handles) and walk straight past the
+        # signature gate entirely with a now-stale, now-"invalid" signature
+        # that would otherwise have refused. Only "legitimately never
+        # signed" is ever a maybe, for any audience; "signed and
+        # untrustable" never is, for any audience either.
+        #
+        # audience=shareable's own historical "not gated" design is
+        # narrowed, not removed: an UNSIGNED shareable pack still imports
+        # with no override needed (lower stakes, already scrubbed for wide
+        # distribution — that part of the original design stands), but a
+        # shareable pack that WAS signed and is now provably untrustworthy
+        # refuses exactly like a replica pack does. The signature state is
+        # still recorded in the receipt for every pack regardless of
+        # audience, informational for the unsigned/verified cases.
+        sig_state, sig_principal, sig_raw = _verify_pack_signature(staged_pack, allowed_signers)
+        if sig_state not in ("unsigned", "verified"):
+            return die(
+                f"pack {pack_id!r} signature check returned {sig_state!r} — refusing "
+                f"to import (this applies to every audience, not just replica). This "
+                f"state has NO override (only a genuinely unsigned pack can proceed, "
+                f"and only via --allow-unsigned for a replica-audience pack); "
+                f"investigate before retrying:\n{_escape_path(sig_raw.strip())}")
+        if sig_state == "unsigned" and manifest.get("audience") == "replica" and not allow_unsigned:
+            return die(
+                f"pack {pack_id!r} is UNSIGNED — refusing to import a replica pack "
+                f"without a signature by default. Pass --allow-unsigned to proceed "
+                f"anyway (recorded loudly in the receipt), or sign the pack first "
+                f"(cc-pack/build_pack.py --sign).")
+
+        # Engagement scoping (FDE-TOOLKIT-PLAN.md F1's original "actual gap"
+        # against memory_seed.py, closed here for cc-pack instead): a pack
+        # built with build_pack.py --tag <slug> is engagement-scoped and must
+        # not cross into a session for a different engagement. Fails closed
+        # both directions — no engagement set on the TARGET refuses (never
+        # "import everything"), and a target engagement that doesn't match
+        # refuses too. An untagged pack (tags == []) is not engagement-scoped
+        # at all and always imports — the general-purpose case (Craig's own
+        # doctrine/skills packs), not a client engagement.
+        #
+        # 2026-08-09 fix, post-review (Grok 4.5/GPT-5.6-sol/Gemini 3.1 Pro,
+        # cc-pack/reviews/2026-08-09-tag-gate-review-*.md, all three
+        # independently converged): the ORIGINAL version of this gate checked
+        # the pack's tags against `tag` — a bare CLI argument typed fresh on
+        # every invocation — which is not an authorization boundary, it's an
+        # unauthenticated claim (a Client-B session could import a
+        # Client-A-tagged pack just by passing --tag client-a; the die
+        # message even named the exact tag needed). The authorization source
+        # is now `receipt.get("engagement")` — set once, deliberately, via
+        # `install.py --set-engagement <slug>` (refuses to silently switch an
+        # already-set engagement). `--tag` on THIS call is now only a
+        # redundant confirmation checked against that recorded value, never
+        # the thing being trusted on its own.
+        # 2026-08-09, round 2 (GPT-5.6-sol caught this on verification —
+        # neither Grok nor Gemini did): `manifest.get("tags") or []` treats
+        # every FALSY value — "", {}, 0, False — as absent, so a malformed-
+        # but-falsy tags field would silently reach here as an empty list,
+        # bypassing the type check below entirely (it only ever saw the
+        # coerced [], not the original bad value). Inspect the RAW value
+        # first and only treat an actually-absent (None) tags key as "no
+        # tags"; every other non-list-of-strings shape is refused outright.
+        raw_tags = manifest.get("tags")
+        if raw_tags is None:
+            pack_tags = []
+        elif isinstance(raw_tags, list) and all(isinstance(t, str) for t in raw_tags):
+            pack_tags = raw_tags
+        else:
+            # Round 1: all three reviewers independently found that a
+            # malformed/type-confused `tags` value (e.g. a bare string
+            # instead of a list) turns `tag not in pack_tags` into a
+            # SUBSTRING match ("client" in "client-a" is True) — refuse
+            # outright rather than risk that bypass.
+            return die(f"pack {pack_id!r} manifest 'tags' is malformed (expected a list of "
+                       f"strings or an absent/null value, got {raw_tags!r}) — refusing rather "
+                       f"than silently treating a malformed value as untagged")
+        if pack_tags:
+            target_engagement = receipt.get("engagement")
+            if not target_engagement:
+                return die(f"pack {pack_id!r} is tagged for {pack_tags} but this TARGET has no "
+                           f"engagement recorded — refusing. Run `install.py --target ... "
+                           f"--set-engagement <slug>` first; an engagement-scoped pack requires "
+                           f"the target itself, not just a command-line flag, to declare which "
+                           f"engagement it's operating under.")
+            if target_engagement not in pack_tags:
+                return die(f"pack {pack_id!r} is tagged for {pack_tags}, but this target's "
+                           f"recorded engagement is {target_engagement!r} — refusing "
+                           f"(cross-engagement import blocked)")
+            if tag is not None and tag != target_engagement:
+                return die(f"--tag {tag!r} does not match this target's recorded engagement "
+                           f"{target_engagement!r} — refusing rather than silently ignoring the "
+                           f"mismatch (fix the --tag argument, or confirm this is really the "
+                           f"target you meant)")
+
+        imported = receipt.setdefault("imported_packs", {})
+        if pack_id in imported:
+            if imported[pack_id].get("sha256sums_sha256") == sums_hash:
+                print(f"{pack_id}: already imported, identical content — nothing to do.")
+                return 0
+            return die(f"pack id {pack_id!r} is already imported with DIFFERENT content on record "
+                       f"({imported[pack_id].get('sha256sums_sha256')} vs {sums_hash}) — should be "
+                       f"impossible under content-addressed ids; refusing rather than silently "
+                       f"overwriting. Investigate before retrying.")
+
+        dest = _expected_pack_dest(target, pack_id)
+        if dest.is_symlink():
+            return die(f"refusing to write through {dest} — it is a symlink, not a directory "
+                       f"this import would have created. Remove it by hand after confirming "
+                       f"what it is before retrying.")
+        if dest.exists():
+            if not replace:
+                return die(f"{dest} already exists on disk but is not recorded in the receipt as "
+                           f"imported — refusing to overwrite. Pass --replace if you're sure this "
+                           f"is leftover from a prior failed attempt, or remove it by hand first.")
+            shutil.rmtree(dest)
+
+        try:
+            paths = _apply_pack_generic(staged_pack, manifest, dest)
+        except (RuntimeError, OSError) as e:
+            if dest.exists():
+                shutil.rmtree(dest)
+            return die(f"apply failed partway through ({e}) — cleaned up the partial write at {dest}")
+
+        imported[pack_id] = {
+            "approved_at": _now(),
+            "kind": manifest.get("kind"),
+            "audience": manifest.get("audience"),
+            "tags": manifest.get("tags") or [],
+            "sha256sums_sha256": sums_hash,
+            "source_pack": str(pack_dir),
+            "delivery_path": str(dest),  # display/provenance only — see _expected_pack_dest
+            "paths": paths,
+            # P6c (2026-08-09): signature state at import time, plus whether
+            # an unsigned pack was let through the explicit break-glass —
+            # loud and recorded, never a silent default. principal is None
+            # for every state but "verified".
+            "signature_state": sig_state,
+            "signature_principal": sig_principal,
+            "imported_unsigned": sig_state == "unsigned" and manifest.get("audience") == "replica",
+        }
+
+        try:
+            pointer_written = _write_packs_pointer(target, receipt, delivery_root)
+        except RuntimeError as e:
+            # apply already succeeded and is recorded in `imported` above —
+            # this is a partial-state failure (content landed, receipt/
+            # pointer did not), surfaced loudly rather than silently retried
+            # (retrying blind is exactly how findings from this review's
+            # "non-transactional import" class happen).
+            return die(f"pack content applied but the CLAUDE.md pointer write refused: {e}\n"
+                       f"the pack is NOT recorded as imported (receipt not saved) — resolve the "
+                       f"CLAUDE.md issue named above, then retry the whole import")
+
+        packs_md = delivery_root / "PACKS.md"
+        _atomic_write(packs_md, _render_packs_md(receipt))
+        _save_receipt(target, receipt)
+
+        print(f"{pack_id}: imported ({len(paths)} file(s)) -> {dest}")
+        print(f"PACKS.md: {packs_md}")
+        if pointer_written:
+            print(f"CLAUDE.md: pointer to PACKS.md written (first pack import for this target)")
+        return 0
+    finally:
+        shutil.rmtree(staged_pack, ignore_errors=True)
+
+
+def list_packs(target: Path) -> int:
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — was this target "
+                   f"installed with this install.py?")
+    imported = receipt.get("imported_packs", {}) or {}
+    if not imported:
+        print(f"no packs imported into {target}.")
+        return 0
+    delivery_root = _pack_delivery_root(target)
+    print(f"{len(imported)} pack(s) imported into {target} (delivery root: {delivery_root}):")
+    for pid in sorted(imported):
+        rec = imported[pid]
+        tags = ",".join(str(t) for t in (rec.get("tags") or [])) or "(none)"
+        sig = rec.get("signature_state", "?")
+        if rec.get("imported_unsigned"):
+            sig += " (--allow-unsigned)"
+        print(_escape_path(
+            f"  - {pid}  kind={rec.get('kind')} audience={rec.get('audience')} "
+            f"tags={tags} signature={sig} imported={rec.get('approved_at')}"))
+    print(f"PACKS.md: {delivery_root / 'PACKS.md'}")
+    return 0
+
+
+def set_engagement(target: Path, slug: str, force: bool) -> int:
+    """Record which engagement THIS TARGET is operating under — the missing
+    authorization anchor the 2026-08-09 tag-gate review round (Grok 4.5,
+    GPT-5.6-sol, Gemini 3.1 Pro; all three independently, cc-pack/reviews/
+    2026-08-09-tag-gate-review-*.md) converged on as the CRITICAL finding:
+    --tag alone is a self-asserted CLI string with nothing binding it to the
+    importing session's real identity — a Client-B session could import a
+    Client-A-tagged pack by simply typing --tag client-a. This makes the
+    TARGET's own recorded state, set here as a deliberate, refuse-on-silent-
+    overwrite step, the actual authorization source; _approve_import_pack
+    checks THIS, not the CLI argument. Modeled on the existing gated-write
+    covenant (a human runs a real command; the receipt is the ledger)."""
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — was this target "
+                   f"installed with this install.py?")
+    if not _pack_is_safe_component(slug):
+        return die(f"engagement slug {slug!r} is not a safe identifier — refusing")
+    current = receipt.get("engagement")
+    if current == slug:
+        print(f"engagement already set to {slug!r} — nothing to do.")
+        return 0
+    imported = receipt.get("imported_packs", {}) or {}
+    if current is not None and not force:
+        comingling = (f" This target ALREADY has {len(imported)} pack(s) imported "
+                      f"under {current!r} — switching would co-mingle their content "
+                      f"with anything imported under {slug!r} next; nothing purges "
+                      f"or isolates it automatically (all three tag-gate reviewers "
+                      f"flagged this, 2026-08-09; deliberately left as an operator "
+                      f"decision, not auto-refused or auto-purged)." if imported else "")
+        return die(f"this target's engagement is already set to {current!r} — refusing to "
+                   f"silently switch to {slug!r}. Pass --force if you are deliberately "
+                   f"re-scoping this target to a new engagement.{comingling} Review "
+                   f"--list-packs and --remove-pack <id> each pack first if you want a "
+                   f"clean re-scope rather than a co-mingled one.")
+    receipt["engagement"] = slug
+    _save_receipt(target, receipt)
+    print(f"engagement set to {slug!r}, recorded in {target}/{CC_SEED_DIR}/{RECEIPT_NAME}")
+    if force and current is not None and imported:
+        print(f"WARNING: {len(imported)} pack(s) imported under the previous engagement "
+              f"{current!r} are still on this target and are now co-mingled with "
+              f"{slug!r}: {', '.join(sorted(imported))}. Nothing was purged — run "
+              f"--list-packs to review, --remove-pack <id> for each one you don't want "
+              f"carried into {slug!r}.")
+    return 0
+
+
+def remove_pack(target: Path, pack_id: str) -> int:
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — was this target "
+                   f"installed with this install.py?")
+    imported = receipt.get("imported_packs", {}) or {}
+    if pack_id not in imported:
+        return die(f"{pack_id!r} is not an imported pack for {target} — nothing to remove "
+                   f"(--list-packs to see what's there).")
+    try:
+        dest = _expected_pack_dest(target, pack_id)
+    except ValueError as e:
+        return die(f"refusing to remove {pack_id!r}: {e}")
+    rec = imported.pop(pack_id)
+    # dest is RE-DERIVED, never rec['delivery_path'] (see _expected_pack_dest)
+    # — a mismatch is itself worth surfacing, not silently ignored, since it
+    # means the receipt disagrees with what this build would have produced.
+    recorded = rec.get("delivery_path")
+    if recorded and recorded != str(dest):
+        print(f"WARNING: receipt's recorded delivery_path ({recorded}) does not match the "
+              f"re-derived path ({dest}) — removing the re-derived path only; if the receipt "
+              f"was tampered with, {recorded} was NOT touched and may need manual review.",
+              file=sys.stderr)
+    if dest.is_symlink():
+        return die(f"refusing to remove {dest} — it is a symlink, not the pack directory this "
+                   f"install.py would have created; remove it by hand after confirming what it is.")
+    if dest.exists():
+        shutil.rmtree(dest)
+    delivery_root = _pack_delivery_root(target)
+    packs_md = delivery_root / "PACKS.md"
+    packs_md.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(packs_md, _render_packs_md(receipt))
+    _save_receipt(target, receipt)
+    print(f"{pack_id}: removed ({dest})")
+    return 0
+
+
 # --- Wave 2H, piece 3: --audit (SEED-068) -----------------------------------
 # Deterministic post-install auditor, run by the human in a fresh shell.
 # Compares live state against the receipt (piece 1) and --package's own
@@ -685,10 +1375,15 @@ PERIMETER_DISCLAIMER = (
     "above, (partially — see check 5) keyvault's shipped scripts, and — if "
     "mesh-bootstrap was approved — the one Claude Code memory-store path "
     "that write deterministically targets (~/.claude/projects/<slug of "
-    "ROOT>/memory/, outside <ROOT> but a single named path, not a scan). It "
-    "did not scan your shell rc files, SSH config, other applications' "
-    "config, or anything else outside <ROOT>. A confused install session "
-    "can still write there; this audit cannot see it."
+    "ROOT>/memory/, outside <ROOT> but a single named path, not a scan). "
+    "For each approved pack import (check 9), it also verified the one "
+    "named out-of-repo delivery root ($XDG_STATE_HOME/cc-pack/<slug of "
+    "ROOT>/) content still matches what was recorded at import time — it "
+    "does NOT re-verify against the original --from-pack source, only "
+    "against the receipt. It did not scan your shell rc files, SSH config, "
+    "other applications' config, or anything else outside <ROOT> and these "
+    "named paths. A confused install session can still write there; this "
+    "audit cannot see it."
 )
 
 
@@ -773,6 +1468,18 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         for pkg_p in [pkg_base] + sorted(pkg_base.rglob("*")):
             rel = pkg_p.relative_to(package).as_posix()
             checked_rel.add(rel)
+            if rel == "scheduler/manifest.yml":
+                continue  # owned by check 2 — --enable-demo is a legitimate,
+                          # in-place rewrite of this file (see enable_demo()),
+                          # so a raw byte-diff against the shipped template
+                          # permanently flags it post-demo. sync.py --check
+                          # (check 2) already validates it semantically, against
+                          # live cron/launchd state — a stronger property than
+                          # this loop's package-identity comparison ever gave.
+                          # Repro'd 2026-08-09: CI red on ai-os-seed's
+                          # "sync from seed pipeline" push, root-caused via
+                          # gh api commits/<sha>/check-runs + a local
+                          # --enable-demo/--audit repro before this fix.
             reason = _compare_entry(pkg_p, target / rel)
             if reason:
                 problems.append(f"{rel}: {reason}")
@@ -852,6 +1559,10 @@ def _check_3(target: Path, receipt: dict) -> dict:
         return _pass("3", "CLAUDE.md region", "no CLAUDE.md and no approval on record")
 
     data = claude_md.read_bytes()
+    # P3: an approved cc-pack pointer region may sit before the cc-seed
+    # region (see _strip_pack_pointer_prefix) — invisible to everything
+    # below so check 3 keeps reasoning only about what IT owns.
+    data = _strip_pack_pointer_prefix(data, receipt)
     s_marker, e_marker = MARKER_START.encode(), MARKER_END.encode()
     starts, ends = data.count(s_marker), data.count(e_marker)
 
@@ -994,6 +1705,162 @@ def _check_7(target: Path, receipt: dict) -> dict:
     return _pass("7", "receipt integrity")
 
 
+def _check_8(target: Path, receipt: dict) -> dict:
+    """P3: cross-checks the cc-pack pointer region (see the GATED_WRITES
+    comment) — same marker-counting idiom as check 3, but for a region that
+    must be at the START of the file rather than the end (cc-seed's region,
+    when present, stays the LAST thing in the file; packs are always written
+    before it). check 3 independently owns whatever follows this region,
+    including a cc-seed region if one exists — this check does not re-verify
+    that content, only its own."""
+    claude_md = target / "CLAUDE.md"
+    gw = receipt.get("gated_writes", {}).get("import-pack-pointer")
+    if not claude_md.exists():
+        if gw and gw.get("written"):
+            return _flagged("8", "cc-pack pointer region", ["approved+written in receipt but the file is now missing"])
+        return _pass("8", "cc-pack pointer region", "no CLAUDE.md and no pack import on record")
+
+    data = claude_md.read_bytes()
+    s_marker, e_marker = PACKS_MARKER_START.encode(), PACKS_MARKER_END.encode()
+    starts, ends = data.count(s_marker), data.count(e_marker)
+
+    if starts == 0 and ends == 0:
+        if gw and gw.get("written"):
+            return _flagged("8", "cc-pack pointer region", ["receipt records an approved pack pointer but none is present on disk"])
+        return _pass("8", "cc-pack pointer region")
+    if starts != 1 or ends != 1:
+        return _flagged("8", "cc-pack pointer region",
+                         [f"malformed markers: {starts} start(s), {ends} end(s) — exactly one region expected"])
+    s, e = data.index(s_marker), data.index(e_marker)
+    if e < s:
+        return _flagged("8", "cc-pack pointer region", ["end marker precedes start marker"])
+    if s != 0:
+        return _flagged("8", "cc-pack pointer region",
+                         ["pack pointer region is not at the start of the file — it must be "
+                          "written first, before any other content"])
+    if data[len(s_marker):len(s_marker) + 1] != b"\n":
+        # The byte immediately after the start marker is unconditionally
+        # skipped below when extracting `region` — if it's NOT the \n
+        # _write_packs_pointer always writes, that byte is invisible to the
+        # hash check that follows and could smuggle an unaudited byte into
+        # CLAUDE.md (2026-08-08 P3 review, GPT). Catch it explicitly rather
+        # than silently mis-slicing.
+        return _flagged("8", "cc-pack pointer region",
+                         ["no newline immediately after the start marker — malformed region"])
+
+    region = data[s + len(s_marker) + 1: e]
+    problems = []
+    if not gw or not gw.get("written"):
+        problems.append("region is present but no approval is on record in the receipt")
+    elif _sha256_bytes(region) != gw.get("approved_hash"):
+        problems.append("region content hash does not match the approved hash in the receipt")
+    return _flagged("8", "cc-pack pointer region", problems) if problems else _pass("8", "cc-pack pointer region")
+
+
+def _check_9(target: Path, receipt: dict) -> dict:
+    """P3: imported-pack content lives entirely outside --target (the
+    out-of-repo delivery root — see the GATED_WRITES comment), so check 1's
+    target.rglob walk never sees it. This is that check's counterpart for
+    the delivery root: every file install.py itself wrote during an
+    approved import must still hash-match what the receipt recorded at
+    approval time, and nothing extra may have appeared there since — the
+    same tamper story as check 1, scoped to where pack content actually
+    lives in this design.
+
+    Walks EVERY recorded path via _expected_pack_dest — the RE-DERIVED
+    location, never receipt['delivery_path'] (2026-08-08 P3 review, all
+    three reviewers independently: trusting delivery_path from a receipt a
+    same-uid agent can edit turns this check into an oracle that can be
+    pointed anywhere, including outside the delivery root entirely). Also
+    covers the two other things a pointer-based design needs auditing:
+    PACKS.md itself (the file literally imported into CLAUDE.md — was
+    outside audit coverage entirely before this fix) and orphaned pack
+    directories under packs/ that exist on disk but aren't in the receipt
+    at all (invisible to a per-recorded-pack walk)."""
+    imported = receipt.get("imported_packs", {}) or {}
+    delivery_root = _pack_delivery_root(target)
+    problems = []
+
+    for pid, rec in sorted(imported.items()):
+        try:
+            dest = _expected_pack_dest(target, pid)
+        except ValueError as e:
+            problems.append(f"{pid}: {e}")
+            continue
+        recorded = rec.get("delivery_path")
+        if recorded and recorded != str(dest):
+            problems.append(f"{pid}: receipt's delivery_path ({recorded}) does not match the "
+                            f"re-derived path ({dest}) — this check audits the re-derived path only")
+        if dest.is_symlink():
+            problems.append(f"{pid}: {dest} is a symlink, not a plain directory — refusing to "
+                            f"treat its target as this pack's content")
+            continue
+        recorded_paths = rec.get("paths") or {}
+        if not isinstance(recorded_paths, dict):
+            problems.append(f"{pid}: receipt 'paths' is {type(recorded_paths).__name__}, expected an object")
+            continue
+        seen = set()
+        for rel, expected_hash in sorted(recorded_paths.items()):
+            if not _pack_is_safe_relpath(rel):
+                problems.append(f"{pid}/{rel}: unsafe recorded path, refusing to check it")
+                continue
+            p = dest / rel
+            seen.add(rel)
+            if p.is_symlink():
+                problems.append(f"{pid}/{rel}: is a symlink, not a plain file — refusing to "
+                                f"follow it")
+                continue
+            if not p.exists() or not p.is_file():
+                problems.append(f"{pid}/{rel}: missing (recorded at import time, now absent)")
+                continue
+            if _sha256_file(p) != expected_hash:
+                problems.append(f"{pid}/{rel}: content differs from what was recorded at import time")
+        if dest.is_dir():
+            for p in sorted(dest.rglob("*")):
+                if p.is_symlink():
+                    rel = p.relative_to(dest).as_posix()
+                    if rel not in seen:
+                        problems.append(f"{pid}/{rel}: symlink present on disk but not recorded "
+                                        f"in the receipt (possible tamper or manual edit)")
+                    continue
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(dest).as_posix()
+                if rel not in seen:
+                    problems.append(f"{pid}/{rel}: present on disk but not recorded in the "
+                                    f"receipt (possible tamper or manual edit)")
+
+    # PACKS.md is a pure function of receipt['imported_packs'] (_render_packs_md)
+    # and is the exact file the CLAUDE.md pointer resolves to — audit it by
+    # re-rendering from the (already-trusted-at-this-point) receipt and
+    # comparing bytes, rather than storing a separate hash to keep in sync.
+    packs_md = delivery_root / "PACKS.md"
+    if imported or packs_md.exists():
+        if packs_md.is_symlink():
+            problems.append(f"PACKS.md: {packs_md} is a symlink, not a plain file")
+        elif not packs_md.exists():
+            problems.append(f"PACKS.md: missing at {packs_md} despite {len(imported)} pack(s) on record")
+        elif packs_md.read_bytes() != _render_packs_md(receipt):
+            problems.append(f"PACKS.md: {packs_md} does not match what the current receipt "
+                            f"would render — edited outside install.py, or stale")
+
+    # Orphaned pack directories: content that exists under packs/ but has no
+    # receipt entry at all — invisible to the per-recorded-pack loop above,
+    # e.g. left behind by a failed import that got partway through applying
+    # before a later step failed (see _approve_import_pack's cleanup, which
+    # only covers _apply_pack_generic's own exceptions).
+    packs_dir = delivery_root / "packs"
+    if packs_dir.is_dir() and not packs_dir.is_symlink():
+        for child in sorted(packs_dir.iterdir()):
+            if child.name not in imported:
+                problems.append(f"{child}: present under the delivery root's packs/ but not "
+                                f"recorded in the receipt (orphaned import, or tamper)")
+
+    if not imported and not problems:
+        return _pass("9", "imported pack content", "no packs imported")
+    return _flagged("9", "imported pack content", problems) if problems else _pass("9", "imported pack content")
+
+
 def _print_report(report):
     print(f"install.py --audit {report['target']}")
     print(f"installer: version {report['installer_version']}, commit {report['installer_commit']}")
@@ -1014,12 +1881,30 @@ def _print_report(report):
           "signal — an agent pasting this into chat is not.")
 
 
+def _safe_check(fn, id_, name, *args):
+    """Runs a check function, converting an unexpected exception into an
+    ERROR result rather than crashing the whole --audit invocation. Scoped
+    to checks 8/9 (P3): both read imported_packs, a structure a same-uid
+    agent can shape adversarially via receipt tampering — the exact class
+    of hostile input pack_lib.verify_pack's own type-guards exist to
+    survive (2026-08-08 P3 review, GPT: 'one exception can abort the whole
+    audit instead of producing an ERROR check'). Checks 1-7 pre-date this
+    wrapper and are out of scope for this pass (see cc-pack/README.md)."""
+    try:
+        return fn(*args)
+    except Exception as e:
+        return _error(id_, name, [f"check crashed: {type(e).__name__}: {e}"])
+
+
 def do_audit(target: Path, package: Path, as_json: bool) -> int:
     receipt = _load_receipt(target)
     if receipt is None:
         print(f"install.py --audit: no receipt at {target}/{CC_SEED_DIR}/{RECEIPT_NAME} — was "
               f"this target installed with this install.py? Nothing to audit.", file=sys.stderr)
         return 2
+
+    check_8 = _safe_check(_check_8, "8", "cc-pack pointer region", target, receipt)
+    check_9 = _safe_check(_check_9, "9", "imported pack content", target, receipt)
 
     trustworthy, why = _package_is_trustworthy(package)
     if trustworthy:
@@ -1031,6 +1916,8 @@ def do_audit(target: Path, package: Path, as_json: bool) -> int:
             _check_5(target),
             _check_6(target),
             _check_7(target, receipt),
+            check_8,
+            check_9,
         ]
     else:
         print(f"install.py --audit: cannot certify checks 1/2/6 — {why}. Fix --package and "
@@ -1043,6 +1930,8 @@ def do_audit(target: Path, package: Path, as_json: bool) -> int:
             _check_5(target),
             _error("6", "runtime-writable plausibility", ["skipped — package reference not trustworthy"]),
             _check_7(target, receipt),
+            check_8,
+            check_9,
         ]
 
     report = {
@@ -1082,7 +1971,48 @@ def main():
     ap.add_argument("--approve", choices=sorted(GATED_WRITES),
                     help="record approval + perform the write for a staged gated write — "
                          "claude-md needs .cc-seed/staged/claude-md.proposed staged first; "
-                         "mesh-bootstrap runs memory-mesh/install.sh itself")
+                         "mesh-bootstrap runs memory-mesh/install.sh itself; import-pack "
+                         "needs --from-pack <path>")
+    ap.add_argument("--from-pack", help="with --approve import-pack: a verified pack DIRECTORY to import")
+    ap.add_argument("--set-engagement",
+                     help="record which engagement THIS TARGET is operating under (the "
+                          "authorization anchor tagged packs are checked against — see "
+                          "--set-engagement's own function docstring for the 2026-08-09 fix "
+                          "history). Refuses to silently switch an already-set engagement "
+                          "unless --force is also given")
+    ap.add_argument("--force", action="store_true",
+                     help="with --set-engagement: allow switching a target's already-set "
+                          "engagement to a different one. Does NOT purge or isolate any "
+                          "already-imported pack content from the old engagement — a "
+                          "switch co-mingles it with whatever imports next unless you "
+                          "--remove-pack each one first (--list-packs to review). "
+                          "Operator discipline, by deliberate choice, not automation.")
+    ap.add_argument("--tag",
+                     help="with --approve import-pack: an OPTIONAL redundant confirmation, "
+                          "checked against this target's recorded engagement (--set-engagement) "
+                          "— not itself the authorization source. A pack whose own pack.json "
+                          "tags[] is non-empty is refused unless the target's recorded "
+                          "engagement matches one of them; an untagged pack always imports "
+                          "regardless")
+    ap.add_argument("--replace", action="store_true",
+                    help="with --approve import-pack: overwrite a leftover, unrecorded "
+                         "delivery-root directory for this pack id")
+    ap.add_argument("--allowed-signers", default=None,
+                     help="with --approve import-pack: signer registry path used to verify "
+                          "a pack's signature. A replica-audience pack defaults to requiring "
+                          "a VERIFIED signature to import — omitting this flag on a signed "
+                          "pack refuses (verification-error), it does not silently skip the "
+                          "check. This tool never probes a default location.")
+    ap.add_argument("--allow-unsigned", action="store_true",
+                     help="with --approve import-pack: explicit break-glass to import a "
+                          "replica-audience pack that carries NO signature at all — recorded "
+                          "loudly in the receipt. Has no effect on a pack whose signature is "
+                          "present but invalid/unknown-signer/verification-error; those "
+                          "states have no override.")
+    ap.add_argument("--list-packs", action="store_true", help="list packs imported into this target")
+    ap.add_argument("--remove-pack",
+                     help="pack id to remove: deletes its delivery-root content and receipt "
+                          "entry, regenerates PACKS.md")
     ap.add_argument("--audit", action="store_true",
                     help="deterministic post-install auditor — compares live state against "
                          "the install receipt and --package's pristine manifest")
@@ -1093,7 +2023,9 @@ def main():
     args = ap.parse_args()
 
     if args.detect:
-        if args.target or args.enable_demo or args.enable_governance or args.uninstall or args.approve or args.audit:
+        if (args.target or args.enable_demo or args.enable_governance or args.uninstall
+                or args.approve or args.audit or args.list_packs or args.remove_pack
+                or args.set_engagement):
             return die("--detect takes no other flags (it's a read-only report)")
         return detect()
     if not args.target:
@@ -1102,15 +2034,31 @@ def main():
     target = Path(args.target).expanduser()
     if not target.is_absolute():
         return die(f"--target must be an absolute path, got {args.target!r}")
-    exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit]
+    exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit,
+                 args.list_packs, bool(args.remove_pack), bool(args.set_engagement)]
     if sum(bool(x) for x in exclusive) > 1:
-        return die("--enable-demo, --enable-governance, --uninstall, --approve, and --audit are mutually exclusive")
+        return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
+                   "--list-packs, --remove-pack, and --set-engagement are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.json and not args.audit:
         return die("--json only applies to --audit")
     if args.package and not args.audit:
         return die("--package only applies to --audit")
+    if args.from_pack and args.approve != "import-pack":
+        return die("--from-pack only applies to --approve import-pack")
+    if args.replace and args.approve != "import-pack":
+        return die("--replace only applies to --approve import-pack")
+    if args.tag and args.approve != "import-pack":
+        return die("--tag only applies to --approve import-pack")
+    if args.allowed_signers and args.approve != "import-pack":
+        return die("--allowed-signers only applies to --approve import-pack")
+    if args.allow_unsigned and args.approve != "import-pack":
+        return die("--allow-unsigned only applies to --approve import-pack")
+    if args.force and not args.set_engagement:
+        return die("--force only applies to --set-engagement")
+    if args.approve == "import-pack" and not args.from_pack:
+        return die("--approve import-pack requires --from-pack <path>")
 
     if args.uninstall:
         return uninstall(target)
@@ -1118,8 +2066,15 @@ def main():
         return enable_demo(target)
     if args.enable_governance:
         return enable_governance(target)
+    if args.list_packs:
+        return list_packs(target)
+    if args.remove_pack:
+        return remove_pack(target, args.remove_pack)
+    if args.set_engagement:
+        return set_engagement(target, args.set_engagement, args.force)
     if args.approve:
-        return approve(target, args.approve)
+        return approve(target, args.approve, from_pack=args.from_pack, replace=args.replace, tag=args.tag,
+                        allowed_signers=args.allowed_signers, allow_unsigned=args.allow_unsigned)
     if args.audit:
         if not args.package:
             return die("--audit requires --package <clone-dir>")
