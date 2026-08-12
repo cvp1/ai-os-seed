@@ -8,7 +8,7 @@
 
     # promote an agent's proposal (the gardener path): agents may only emit
     # kind=propose-correct; ONLY this command turns one into signed truth
-    sign.py --promote <proposal-id>
+    python3 sign.py --promote <proposal-id>
 
 Signed events are the only truth the fold will defend: any unsigned event
 disagreeing with a signed one on the same subject parks AND alarms. Agents

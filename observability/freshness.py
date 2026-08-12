@@ -183,7 +183,27 @@ SOFT_RATIO = 0.75      # this share of them writing stderr = persistent
 
 
 def soft_failure(conn, job):
-    """Detail string if `job` looks soft-failing, else None. Never raises."""
+    """Detail string if `job` is soft-failing RIGHT NOW, else None. Never raises.
+
+    Two conditions, and both are required:
+
+      1. **The most recent run wrote stderr.** This is the state gate. Without
+         it the check reported a repaired job as broken for a further
+         SOFT_WINDOW runs — a nightly job stayed red for twelve nights after
+         the fix landed. That is a false reading, not a slow one: the operator
+         is told a thing is wrong when it is already right, and the only way to
+         find out is to go read the code. Principle 7 — the alert follows the
+         current state, and goes quiet the moment the condition clears.
+      2. **It is persistent, not a blip** — SOFT_RATIO of the window is noisy.
+         The window survives as CONTEXT for how chronic this is, which was the
+         original point; it just no longer decides on its own.
+
+    So a repaired job clears on its very next clean run, and a genuinely
+    chronic one still reports every run. The note is taken from `rows[0]` —
+    the latest run — never from an older noisy one, because quoting a
+    days-old stderr line beside the word "recent" is the same false reading in
+    miniature.
+    """
     try:
         rows = conn.execute(
             "SELECT ok, stderr_bytes, error_tail FROM runs WHERE job=? "
@@ -194,12 +214,15 @@ def soft_failure(conn, job):
         return None
     if any(not r["ok"] for r in rows):
         return None        # a real failure in the window — FAILING already covers it
+    if (rows[0]["stderr_bytes"] or 0) <= 0:
+        return None        # condition 1: latest run is clean -> not failing now
     noisy = [r for r in rows if (r["stderr_bytes"] or 0) > 0]
     if len(noisy) / len(rows) < SOFT_RATIO:
         return None
-    tail = (noisy[0]["error_tail"] or "").strip().splitlines()
-    note = tail[-1][:120] if tail else f"{noisy[0]['stderr_bytes']} bytes, text not captured"
-    return (f"exit 0 but wrote stderr on {len(noisy)}/{len(rows)} recent runs: {note}")
+    tail = (rows[0]["error_tail"] or "").strip().splitlines()
+    note = tail[-1][:120] if tail else f"{rows[0]['stderr_bytes']} bytes, text not captured"
+    return (f"exit 0 but wrote stderr on its last run and {len(noisy)}/{len(rows)} "
+            f"recent ones: {note}")
 
 
 def evaluate(conn, now):

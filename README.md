@@ -14,6 +14,29 @@ accounts, no network calls
 
 ---
 
+## What you have when the install finishes
+
+Not a plan, not a framework to build against — a running system, in the
+same session:
+
+- **A real scheduled job**, live on your crontab or launchd, that will run
+  again tonight whether or not you're at the machine.
+- **A run database** — one row per run, so *"did the backup actually go
+  last night?"* is a query instead of a feeling.
+- **A backstop that notices silence.** A failing job shouts; a job that
+  quietly stops running says nothing at all, and no per-job healthcheck
+  can see it. This one can.
+- **A secrets vault** that's encrypted at rest, read at the point of use,
+  and fails closed when locked — so credentials never land in a transcript.
+- **Four working verbs**: `/status` (one honest screen), `/improve` (a
+  correction becomes durable memory), `/recall` (cited answers from your
+  own notes and run history), `/skill-center` (author your own).
+- **A memory with a history** — corrections supersede instead of piling
+  up, contradictions park loudly instead of one quietly winning, and
+  `replay.py` reconstructs what your agent believed at any past moment.
+
+Then you build your own system on top. That part is yours.
+
 ## What this is
 
 A personal AI operating system has three layers. This repo is the bottom
@@ -335,14 +358,18 @@ cross from inside the same user account.
 and orphan-job detection; and that your pre-existing crontab entries
 survive untouched.
 
-**Known issue: shipped skills aren't registered anywhere.** `install.py`
-copies the `skills/` component to disk, but nothing symlinks each
-`skills/<name>/SKILL.md` into `~/.claude/skills/<name>/SKILL.md` — the path
-Claude Code actually discovers skills from (and the same path
-`skill-center/audit.py`/`scaffold.py` already assume exists). On a fresh
-install, the shipped skills are present on disk but invisible to the agent
-until you register them by hand. Fix tracked for the F1 portability pass
-(context-build + skills-registration work) — not yet built.
+**Shipped skills are registered for you, project-scoped.** `install.py`
+symlinks each `skills/<name>/SKILL.md` into
+`<ROOT>/.claude/skills/<name>/SKILL.md`, records them in the install
+receipt, and prints what it registered. Project-level is deliberate over
+user-level `~/.claude/skills/`: it never touches your global dotfiles and
+it composes with `--into`. `--audit` verifies each symlink against the
+canonical shipped file (so a repointed link is still caught), and
+`--uninstall` removes them. **The caveat worth knowing:** project-scoped
+means Claude Code discovers them when its working directory is at or under
+`<ROOT>`. Start a session from somewhere else and the skills won't load —
+`cd` to your install root, or symlink the ones you want into
+`~/.claude/skills/` yourself.
 
 **What isn't covered:** your specific machine's quirks. The first
 real-hardware install found a genuine bug

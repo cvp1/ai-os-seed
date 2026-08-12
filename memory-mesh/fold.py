@@ -396,7 +396,7 @@ def main():
             print(f"[PARKED ] {s} — opposing/inconsistent claims; see CONFLICTS.md")
         for e in fold["quarantined"]:
             print(f"[QUARANT] {e['subject']} (id {e['id']}) — untrusted lineage, "
-                  f"NOT served; promote with sign.py --promote {e['id']}")
+                  f"NOT served; promote with python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote {e['id']}")
         for a in alarms:
             print(f"[ALARM  ] {a}")
         for p in problems:

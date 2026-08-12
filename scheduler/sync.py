@@ -13,12 +13,20 @@ own — everything this script writes lives inside a clearly marked managed
 block (crontab) or a `dev.cc-seed.*` plist (launchd), so a recipient's own
 existing crontab entries or launchd agents are left alone.
 
+Two kinds of finding, not one (SEED-075). DRIFT is "the installed scheduler
+no longer matches the manifest." RISK/WARN are supervision findings about the
+manifest's own commands — a scratch path that can vanish, a target that isn't
+on disk, an unfilled placeholder, or a job that doesn't route through
+log_run.py and so would fail invisibly. `--check` reports both and exits 1;
+install refuses on RISK and proceeds with a warning on WARN.
+
 Stdlib + PyYAML (matches build_seed.py's own build-time-only dependency;
 the manifest format, not a shipped runtime dependency of the jobs it runs).
 """
 import argparse
 import platform
 import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -27,6 +35,10 @@ import yaml
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "manifest.yml"
+# The installed --target root: the scheduler ships to <target>/scheduler/,
+# so the root is this file's grandparent. Used by the supervision checks to
+# decide whether a job's command points inside the install or out of it.
+SEED_ROOT = HERE.parent
 
 CRON_BEGIN = "# BEGIN cc-seed managed jobs (scheduler/sync.py — do not hand-edit this block)"
 CRON_END = "# END cc-seed managed jobs"
@@ -43,6 +55,122 @@ WEEKLY_FIELD_RE = re.compile(r"^(\d{1,2}) (\d{1,2}) \* \* (\d)$")
 class ScheduleError(Exception):
     """A job's cron expression doesn't translate to this platform's
     scheduler — refused rather than silently mis-scheduled."""
+
+
+# --- supervision checks (SEED-075) ------------------------------------------
+#
+# The drift checks below answer "does the installed scheduler match the
+# manifest?" They already catch a THIRD party rewriting an installed entry —
+# the rewritten line stops matching and reports as content drift.
+#
+# What nothing caught was a poisoned MANIFEST. On 2026-08-09 an agent working
+# in a /tmp sandbox rewrote two of the source fleet's production jobs to point
+# into that sandbox; the sandbox was then deleted and both jobs died for ~27
+# hours. Reconciling a manifest whose commands name a scratch directory
+# installs that fault rather than reporting it, so the manifest is the seam
+# these checks sit at — they fire at install time, while the sandbox still
+# exists, which is *before* the job dies.
+#
+# The worse half of that incident was not the dead job. The rewritten entries
+# also lost their log_run.py wrapper, so failures stopped being RECORDED: the
+# freshness monitor could only ever render STALE, never FAILING, with no exit
+# code and no cause. A supervised job that can be edited to become
+# unsupervised was never supervised — hence UNSUPERVISED is its own finding
+# and not a footnote on the path check.
+
+BLOCK = "RISK"          # refuse to install; fails --check
+WARN = "WARN"           # report and proceed; fails --check
+
+LOG_RUN_MARKER = "observability/log_run.py"
+PLACEHOLDER_RE = re.compile(r"<[A-Z][A-Z0-9_]*>")
+# Scratch roots a live job must never depend on. Deliberately a small,
+# explicit list: this is the incident's exact shape and it has effectively no
+# false positives, which is what lets it BLOCK rather than merely warn.
+EPHEMERAL_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/",
+                   "/private/tmp/", "/private/var/folders/")
+# Interpreters and system tools live outside the target root by design, so
+# they are exempt from the outside-the-root check — but NOT from the
+# does-it-exist check, which still catches a typo'd interpreter.
+SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
+                   "/opt/", "/etc/")
+
+
+def _command_paths(command):
+    """Absolute filesystem paths named anywhere in a command line.
+
+    shlex so a quoted path with spaces survives; a fallback split so a command
+    with unbalanced quotes is still inspected rather than skipped silently —
+    refusing to look is how a malformed entry would slip past every check.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    paths = []
+    for tok in tokens:
+        if tok.startswith("~"):
+            tok = str(Path(tok).expanduser())
+        if tok.startswith("/"):
+            paths.append(tok)
+    return paths
+
+
+def _inside(path, root):
+    try:
+        return Path(path).resolve().is_relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def command_problems(job, root=None):
+    """Supervision findings for one manifest entry, as (severity, message)."""
+    root = Path(root or SEED_ROOT)
+    name = job.get("name", "<unnamed>")
+    command = (job.get("command") or "").strip()
+    out = []
+
+    if not command:
+        return [(BLOCK, f"{name}: manifest entry has no command")]
+
+    m = PLACEHOLDER_RE.search(command)
+    if m:
+        out.append((BLOCK, f"{name}: command still contains the unfilled "
+                           f"template placeholder {m.group(0)} — it would be "
+                           f"scheduled verbatim and fail every run"))
+
+    if LOG_RUN_MARKER not in command:
+        out.append((WARN, f"{name}: command does not route through "
+                          f"{LOG_RUN_MARKER} — the job would run UNSUPERVISED: "
+                          f"no runs.db row, so a failure can only ever surface "
+                          f"as STALE, never as FAILING, with no exit code and "
+                          f"no cause"))
+
+    for p in _command_paths(command):
+        # Ephemeral AND outside the install. An operator who installs the seed
+        # under /tmp has made that choice for the whole tree, and flagging the
+        # install's own files would make the check unusable there; the fault
+        # this catches is a job reaching OUT of the install into a scratch dir
+        # — which is exactly the shape of the 2026-08-09 incident, where units
+        # under ~/.config pointed into a /tmp sandbox.
+        if p.startswith(EPHEMERAL_ROOTS) and not _inside(p, root):
+            out.append((BLOCK, f"{name}: command targets an ephemeral path "
+                               f"{p} — a scratch/sandbox directory outside "
+                               f"the install that can vanish under a live job"))
+            continue
+        if not Path(p).exists():
+            out.append((BLOCK, f"{name}: command targets {p}, which does not "
+                               f"exist on disk"))
+        if not p.startswith(SYSTEM_PREFIXES) and not _inside(p, root):
+            out.append((WARN, f"{name}: command targets {p}, outside the "
+                              f"installed target root {root}"))
+    return out
+
+
+def manifest_problems(jobs, root=None):
+    out = []
+    for job in jobs:
+        out.extend(command_problems(job, root))
+    return out
 
 
 def load_jobs():
@@ -234,6 +362,9 @@ def main():
     args = ap.parse_args()
 
     jobs = load_jobs()
+    problems = manifest_problems(jobs)
+    blocking = [msg for sev, msg in problems if sev == BLOCK]
+    soft = [msg for sev, msg in problems if sev == WARN]
     system = platform.system()
 
     if system == "Linux":
@@ -244,13 +375,31 @@ def main():
         sys.exit(f"scheduler/sync.py: unsupported platform {system!r} (Linux/macOS only)")
 
     if args.check:
-        drift, code = check_fn(jobs)
-        if drift:
-            for line in drift:
-                print(line)
-        else:
+        drift, _ = check_fn(jobs)
+        for line in drift:
+            print(line)
+        for msg in blocking:
+            print(f"{BLOCK}: {msg}")
+        for msg in soft:
+            print(f"{WARN}: {msg}")
+        if not drift and not problems:
             print("scheduler/sync.py --check: in sync.")
-        return code
+        return 1 if (drift or problems) else 0
+
+    # Refuse to INSTALL a manifest that names a scratch path, an unfilled
+    # placeholder or a missing target: reconciling it would schedule the fault
+    # instead of reporting it. A missing log_run.py wrapper only warns — the
+    # manifest documents unwrapped jobs as legal ("still runs; just never
+    # appears in runs.db"), so blocking on it would refuse something the
+    # product tells the operator they may do.
+    if blocking:
+        for msg in blocking:
+            print(f"scheduler/sync.py: {BLOCK}: {msg}", file=sys.stderr)
+        print("scheduler/sync.py: refusing to install — fix the manifest, or "
+              "run --check to see every finding.", file=sys.stderr)
+        return 2
+    for msg in soft:
+        print(f"scheduler/sync.py: {WARN}: {msg}", file=sys.stderr)
 
     try:
         install_fn(jobs)

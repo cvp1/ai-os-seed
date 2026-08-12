@@ -907,7 +907,7 @@ def fold_events(events, registry):
     #
     # Two promotion routes, both requiring the operator's passphrase-gated key
     # (sign.py; an agent cannot sign by construction):
-    #   1. sign.py --promote <id>  — emits a signed `correct` superseding it.
+    #   1. python3 sign.py --promote <id>  — emits a signed `correct` superseding it.
     #   2. a signature on the event itself — Craig vouching for it in place.
     # An unknown or absent lineage quarantines and alarms: the field is required
     # at emit, so a live event missing it means the log was written by something
@@ -1248,7 +1248,7 @@ def render_views(fold, audience):
             "# INDEX.md and out of the harness MEMORY.md, and they cannot park or",
             "# contradict a served fact. Promote with the operator's key:",
             "#",
-            "#     memory-mesh/sign.py --promote <id>",
+            "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>",
             "#",
             "# or drop one by emitting a retract that supersedes it. Doing nothing is",
             "# a valid outcome — an unpromoted lesson simply never becomes doctrine.",
@@ -1608,7 +1608,7 @@ def render_harness_memory(fold, store):
     if n_quar:
         head.append(f"# {n_quar} untrusted-lineage fact(s) QUARANTINED and not "
                     "served — views/operator/QUARANTINE.md; promote: "
-                    "memory-mesh/sign.py --promote <id>")
+                    "python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>")
     head.append("")
     return fit_harness_memory(head, ranked, sorted(exclude))
 
@@ -1646,7 +1646,7 @@ def render_store_quarantine(fold):
         "# tombstone, never the body). NOT standing policy.",
         "#",
         "# PROMOTE (needs Craig's passphrase-gated key — an agent cannot):",
-        "#     memory-mesh/sign.py --promote <event-id>",
+        "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <event-id>",
         "# REJECT: emit a retract superseding the event, then delete the file.",
         "#",
         "# Slugs and one-line hooks only — bodies are deliberately absent.",
