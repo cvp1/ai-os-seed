@@ -36,7 +36,7 @@ see `triage`.
 | `teach` | **core** | stateful tutor; general |
 | `workflow-visualizer` | **core** | system description → HTML diagram |
 | `proton-mail` | **adapter : comms** | Proton Bridge — one realization of the mail-connector contract |
-| `cognizant` | **adapter : comms** | M365 work-mailbox binding (employer-specific) |
+| `{{REDACTED}}` | **adapter : comms** | M365 work-mailbox binding (employer-specific) |
 | `weather` | **adapter : domain (ranch)** | bias-corrected to the on-site station |
 | `garden` | **adapter : domain (ranch)** | grounded in the 17-guide library |
 | `firealert` | **adapter : domain (ranch)** | Twilio fire roster |
@@ -59,7 +59,7 @@ Tally: **8 core · 2 comms adapters · 4 domain adapters.**
   `workflow-visualizer` (added 2026-06-27). The product builds skills from its
   embedded prompt spec, not shipped files — "promote" = add the skill to PHASE 1
   (fresh installs build it; upgrade-mode adds it to existing installs).
-- **Comms skills: factored.** `triage`, `cognizant`, and `proton-mail` now split a
+- **Comms skills: factored.** `triage`, `{{REDACTED}}`, and `proton-mail` now split a
   provider-blind engine from adapter bindings (`accounts.yml` / `account.yml` +
   per-skill `connectors.md`) over the shared contract in
   [`CONNECTORS.md`](CONNECTORS.md). The engines are Core; the manifests and

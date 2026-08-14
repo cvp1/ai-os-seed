@@ -121,7 +121,7 @@ Extends the existing sanctioned CLI (the one door; hook-enforced).
 - Latency rungs: fold timer per host (floor, minutes) → emit nudge (seconds)
   → `--sync` (confirmed replication).
 - Build prerequisite: the three **reverse** ssh routes ({{REDACTED}}→{{REDACTED}},
-  {{REDACTED}}→cvptp, cvptp→{{REDACTED}}); outbound-from-{{REDACTED}} three are
+  {{REDACTED}}→{{REDACTED}}, {{REDACTED}}→{{REDACTED}}); outbound-from-{{REDACTED}} three are
   verified live 2026-07-27.
 
 ## Consumer — `memory_fold.py` (timer + session-start-if-stale)

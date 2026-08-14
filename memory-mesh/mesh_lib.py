@@ -49,6 +49,13 @@ KINDS = {"assert", "correct", "lesson", "denial", "retract",
          "propose-correct", "update-pointer", "pin"}
 POLARITIES = {"exists", "absent", "n/a"}
 LINEAGES = {"operator-direct", "contains-untrusted"}
+# The two promotion classes an untrusted-lineage fact can reach (Craig,
+# 2026-08-12: "there is key signed and verbally signed"). NOT lineages —
+# lineage is where the content CAME FROM and never changes; promotion is
+# whether the operator has vouched for it, and how strongly.
+PROMOTION_KEY = "key-signed"        # cryptographic, agent-impossible by construction
+PROMOTION_VERBAL = "verbally-signed"  # Craig reasoned it through and said yes, in session
+MIN_APPROVAL_WORDS = 8              # an attestation shorter than this quotes nothing
 AUDIENCES = {"operator", "family", "shared"}
 CONFIDENCES = {"operator-stated", "verified-live", "inferred"}
 
@@ -230,7 +237,7 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                lineage="operator-direct", audience="operator",
                confidence="inferred", supersedes=None, pin=False, ts=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
-               carry_forward=False, body_sha256=None):
+               carry_forward=False, body_sha256=None, verbal_approval=None):
     # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
     # this is the one place a stump can be refused before it becomes doctrine —
     # backfill.py was gated first and the same week five more stumps arrived
@@ -276,6 +283,22 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
     # as "no content binding on record", not as a failure.
     if body_sha256 is not None:
         ev["body_sha256"] = body_sha256
+    # VERBAL APPROVAL (2026-08-12, Craig's ruling — decisions/verbal-approval-
+    # promotes-untrusted-memory-2026-08-12.md). The SECOND promotion class:
+    # "there is key signed and verbally signed", his words. `lineage` keeps
+    # describing the SOURCE (untrusted content is still untrusted; approval
+    # does not launder where it came from), so promotion is an ORTHOGONAL
+    # axis rather than a third lineage value.
+    #
+    # Deliberately NOT a security control, and it must not be described as
+    # one: an agent can pass any string here, exactly as an agent can pass
+    # carry_forward=True above. What it buys is AUDITABILITY — Craig's words
+    # are recorded verbatim, so the question "did you actually approve this?"
+    # has an answer to check. A plain dict key, so canonical_bytes() covers
+    # it: if such an event is ever key-signed later, the signature attests to
+    # the attestation too, and it cannot be swapped after the fact.
+    if verbal_approval is not None:
+        ev["verbal_approval"] = verbal_approval
     if expires is not None:
         ev["expires"] = expires
     problems = validate_event(ev)
@@ -302,6 +325,22 @@ def validate_event(ev):
         p.append(f"bad audience {ev.get('audience')!r}")
     if ev.get("confidence") not in CONFIDENCES:
         p.append(f"bad confidence {ev.get('confidence')!r}")
+    # A verbal approval must actually carry Craig's words. An empty or
+    # placeholder attestation would serve an untrusted-lineage fact while
+    # recording nothing anyone could later check — worse than no attestation,
+    # because it LOOKS like provenance.
+    va = ev.get("verbal_approval")
+    if va is not None:
+        if not isinstance(va, dict):
+            p.append("verbal_approval must be an object")
+        else:
+            words = (va.get("words") or "").strip()
+            if len(words) < MIN_APPROVAL_WORDS:
+                p.append(f"verbal_approval.words is {len(words)}B — under "
+                         f"{MIN_APPROVAL_WORDS}B is not a quotable approval")
+            if not va.get("ts"):
+                p.append("verbal_approval.ts missing — an approval with no "
+                         "date cannot be placed in a session")
     if ev.get("residency") is not None and ev.get("residency") not in RESIDENCIES:
         p.append(f"bad residency {ev.get('residency')!r}")
     # A2 at the schema level: an event carrying a body for a non-fleet audience
@@ -547,7 +586,7 @@ SIG_NAMESPACE = "memory-mesh"
 # throwaway keypair to exercise the verify path end-to-end.
 def _signers_file():
     """One signer registry for the fleet, but its checkout path differs by
-    host ({{REDACTED}}/cvptp: ~/{{REDACTED}}/cc-handoff; {{REDACTED}}: ~/cc-handoff).
+    host ({{REDACTED}}/{{REDACTED}}: ~/{{REDACTED}}/cc-handoff; {{REDACTED}}: ~/cc-handoff).
     A host that can't find it treats every signature as unverified — which
     silently forked view.version fleet-wide (found 2026-07-28). Probe the
     known homes; env override wins (drills)."""
@@ -905,10 +944,21 @@ def fold_events(events, registry):
     # contradicting it — memory poisoning by denial of service rather than by
     # substitution. It cannot reach the rule pass at all.
     #
-    # Two promotion routes, both requiring the operator's passphrase-gated key
-    # (sign.py; an agent cannot sign by construction):
+    # Promotion routes, in DESCENDING strength:
     #   1. python3 sign.py --promote <id>  — emits a signed `correct` superseding it.
     #   2. a signature on the event itself — Craig vouching for it in place.
+    #      (1 and 2 = PROMOTION_KEY: the passphrase-gated key, agent-impossible
+    #      by construction.)
+    #   3. python3 sign.py --promote-verbal <id> --approved "<his words>"
+    #      (PROMOTION_VERBAL, added 2026-08-12 on Craig's ruling). This one is
+    #      NOT agent-impossible — an agent can write the attestation. It is an
+    #      AUDIT record, not a cryptographic gate, and the fold stamps it
+    #      distinctly so nothing downstream can mistake it for route 1 or 2.
+    #      Craig owns that trade knowingly: the signing key lives on another
+    #      host behind a passphrase, so the practical effect of key-only
+    #      promotion was a permanent quarantine backlog, not review.
+    #      Rationale + the residual risk: decisions/verbal-approval-promotes-
+    #      untrusted-memory-2026-08-12.md.
     # An unknown or absent lineage quarantines and alarms: the field is required
     # at emit, so a live event missing it means the log was written by something
     # that is not this code, and the safe reading of that is "do not serve".
@@ -919,7 +969,18 @@ def fold_events(events, registry):
         if lin == "operator-direct":
             keep.append(e)
         elif lin == "contains-untrusted":
-            (keep if e.get("_signed") else quarantined).append(e)
+            # TWO promotion routes since 2026-08-12, stamped so they never
+            # render as each other (see PROMOTION_* above). `_promotion` is a
+            # fold-local underscore field like `_signed`: derived every fold,
+            # never trusted from the log.
+            if e.get("_signed"):
+                e["_promotion"] = PROMOTION_KEY
+                keep.append(e)
+            elif e.get("verbal_approval"):
+                e["_promotion"] = PROMOTION_VERBAL
+                keep.append(e)
+            else:
+                quarantined.append(e)
         else:
             quarantined.append(e)
             alarms.append(
@@ -1246,9 +1307,15 @@ def render_views(fold, audience):
             "# These were written by a session working on ingested or otherwise",
             "# untrusted content (lineage: contains-untrusted). They are held out of",
             "# INDEX.md and out of the harness MEMORY.md, and they cannot park or",
-            "# contradict a served fact. Promote with the operator's key:",
+            "# contradict a served fact. Two promotion routes (2026-08-12):",
             "#",
+            "#   key-signed (strongest — an agent cannot produce this):",
             "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>",
+            "#   verbally-signed (Craig reasoned it through and said yes;",
+            "#   an AUDIT record, not a cryptographic gate — buys `served`,",
+            "#   never `pinned`/`doctrine`):",
+            "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <id> \\",
+            "#            --approved \"<his verbatim words>\"",
             "#",
             "# or drop one by emitting a retract that supersedes it. Doing nothing is",
             "# a valid outcome — an unpromoted lesson simply never becomes doctrine.",
@@ -1310,7 +1377,7 @@ def render_views(fold, audience):
 # Post-cutover that file is GENERATED here from the folded corpus. The flip is
 # per-host OPT-IN via a `.mesh-generated` marker in the store: a host whose
 # curated index has not been backfilled into the mesh keeps its hand-built
-# MEMORY.md untouched until it backfills and opts in ({{REDACTED}}/cvptp).
+# MEMORY.md untouched until it backfills and opts in ({{REDACTED}}/{{REDACTED}}).
 
 def store_dir():
     """This workspace's auto-memory store path. The workspace root is
@@ -1608,7 +1675,8 @@ def render_harness_memory(fold, store):
     if n_quar:
         head.append(f"# {n_quar} untrusted-lineage fact(s) QUARANTINED and not "
                     "served — views/operator/QUARANTINE.md; promote: "
-                    "python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>")
+                    "sign.py --promote <id> (key) or --promote-verbal <id> "
+                    "--approved \"<Craig's words>\" (verbal, weaker)")
     head.append("")
     return fit_harness_memory(head, ranked, sorted(exclude))
 
@@ -1645,8 +1713,13 @@ def render_store_quarantine(fold):
         "# HELD OUT of the always-on index and of /recall's pack (recall serves a",
         "# tombstone, never the body). NOT standing policy.",
         "#",
-        "# PROMOTE (needs Craig's passphrase-gated key — an agent cannot):",
+        "# PROMOTE, key-signed (needs Craig's passphrase-gated key — an agent cannot):",
         "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <event-id>",
+        "# PROMOTE, verbally-signed (Craig's spoken approval, recorded verbatim.",
+        "# An agent CAN write this — it is an audit record, not a gate. Serves,",
+        "# but never reaches pinned/doctrine):",
+        "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <event-id> \\",
+        "#            --approved \"<his verbatim words>\"",
         "# REJECT: emit a retract superseding the event, then delete the file.",
         "#",
         "# Slugs and one-line hooks only — bodies are deliberately absent.",

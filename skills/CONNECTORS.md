@@ -38,7 +38,7 @@ verb mapping. Engines reference connectors by name.
 | `gcal-mcp` | Google Calendar (claude.ai MCP) | `triage` | gated writes |
 | `drive` | Google Drive (claude.ai MCP) | `triage` | read, opportunistic |
 | `proton-bridge` | Proton Mail (local Bridge) | `proton-mail` | dry-run-then-send |
-| `outlook-composio-work` | {{REDACTED}} M365 (Composio) | `cognizant` | **read-only** |
+| `outlook-composio-work` | {{REDACTED}} M365 (Composio) | `{{REDACTED}}` | **read-only** |
 
 A skill's `connectors.md` documents only the realizations it owns; this table is
 the cross-skill map.

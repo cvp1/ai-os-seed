@@ -62,6 +62,27 @@ covered by a specific convention, reason from here.
     promotion is also NOT a tool-security clearance: Gemini the API is first-party,
     but Gemini CLI / Antigravity as agentic tools over sensitive repos remain a
     separate, unresolved axis (`decisions/grok-build-gemini-cli-not-adopted-2026-08-06.md`).
+19. **Split the job before picking the model.** (Applies *before* 10 — numbered
+    19 because these numbers are cited from code and reviews, so the list is
+    append-only.) For every field in an output, ask whether code can compute it
+    from the input. If yes, **code owns it and the model never sees it**; if no,
+    the model owns it — selection, ranking, prose, judgement. A model asked to
+    transcribe data it was already given will drop it; the same model asked only
+    to judge will not. **Guarantees belong in code, not in prompts** — a
+    structural guarantee has no success rate, while a prompt's has to be
+    measured every run. So diagnose by failure KIND, because the two kinds have
+    opposite remedies: a STRUCTURAL failure (dropped items, missing verbatim
+    fields, wrong shape, truncation) is closed completely by moving that field
+    to code, while a JUDGEMENT failure (fabrication, wrong pick, unsupported
+    claims) is not helped at all — a harness will format the wrong answer
+    beautifully. Origin: 2026-08-13, signal-scan's degraded path, where the
+    local model was hand-copying links, upvote counts, odds and star counts that
+    were already structured data in its own input: 0–44% link compliance doing
+    that, unfixed by a 5× token budget, and 100% the moment code emitted them —
+    also faster, and with fabricated links made impossible rather than merely
+    unobserved. Its fabrication count was zero throughout; it was honest and
+    could judge, and unreliable only at transcription. Method + instrument:
+    `ollama-tools/JOB_TRIAGE.md`, `ollama-tools/job_triage.py`.
 
 ## Architecture
 12. **Small sharp tools on a shared spine.** Independent repos, one concern each,

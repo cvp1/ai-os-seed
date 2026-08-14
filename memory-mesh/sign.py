@@ -38,7 +38,7 @@ MEMORY_WRITE = Path(os.path.expanduser(
     "~/{{REDACTED}}/cc-skills/improve/memory_write.py"))
 
 
-def reconcile_store(subject):
+def reconcile_store(subject, approved_words=None):
     """After a promotion, make it fact on the STORE surface too (2026-07-30).
 
     Craig's ruling, in his words: "if I promote it, that must be fact
@@ -71,11 +71,17 @@ def reconcile_store(subject):
               f"still reads lineage: contains-untrusted while the mesh serves "
               f"this fact. Retag it by hand-equivalent tooling.", file=sys.stderr)
         return
-    r = subprocess.run([sys.executable, str(MEMORY_WRITE), "retag", slug,
-                        "--lineage", "craig-direct", "--commit"],
-                       capture_output=True, text=True, timeout=120)
+    cmd = [sys.executable, str(MEMORY_WRITE), "retag", slug,
+           "--lineage", "craig-direct", "--commit"]
+    # A verbal promotion has no signature for retag's own gate to verify, so it
+    # must carry Craig's words through to the store the same way it carries
+    # them into the mesh event — one promotion, one attestation, both surfaces.
+    if approved_words:
+        cmd += ["--operator-approved", approved_words]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode == 0:
-        print(f"  store reconciled: {slug} -> lineage: craig-direct")
+        klass = M.PROMOTION_VERBAL if approved_words else M.PROMOTION_KEY
+        print(f"  store reconciled: {slug} -> lineage: craig-direct ({klass})")
     else:
         print(f"  STORE NOT RECONCILED for {slug} (the signed event stands and "
               f"is authoritative, but the store copy still says "
@@ -85,6 +91,14 @@ def reconcile_store(subject):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--promote", help="proposal event id to promote to signed truth")
+    ap.add_argument("--promote-verbal", metavar="EVENT_ID",
+                    help="promote an event on Craig's VERBAL approval instead of "
+                         "his key (2026-08-12). Requires --approved with his "
+                         "actual words. Weaker than --promote and stamped as such: "
+                         "it buys `served`, never `pinned`/`doctrine`.")
+    ap.add_argument("--approved", metavar="WORDS",
+                    help="Craig's verbatim approval, recorded for audit. Required "
+                         "by --promote-verbal.")
     ap.add_argument("--subject")
     ap.add_argument("--content")
     ap.add_argument("--polarity", default="n/a", choices=sorted(M.POLARITIES))
@@ -99,11 +113,32 @@ def main():
                                         args.home, args.polarity)
     supersedes = [s for s in (args.supersedes or "").split(",") if s]
 
-    if args.promote:
+    # The two promotion classes are mutually exclusive on one invocation:
+    # "which one promoted this?" must always have exactly one answer.
+    if args.promote and args.promote_verbal:
+        sys.exit("sign: --promote and --promote-verbal are mutually exclusive — "
+                 "a promotion has one class, key-signed or verbally-signed.")
+    if args.approved and not args.promote_verbal:
+        sys.exit("sign: --approved is only meaningful with --promote-verbal. A "
+                 "key-signed promotion is attested by the signature itself.")
+    if args.promote_verbal:
+        words = (args.approved or "").strip()
+        if len(words) < M.MIN_APPROVAL_WORDS:
+            sys.exit(
+                f"sign: --promote-verbal requires --approved \"<Craig's actual "
+                f"words>\" (at least {M.MIN_APPROVAL_WORDS} characters; got "
+                f"{len(words)}).\n"
+                "  The attestation IS the audit trail — it is the only thing that "
+                "lets anyone later ask him 'did you approve this?' and get a\n"
+                "  checkable answer. An empty or token approval would serve an "
+                "untrusted-lineage fact while recording nothing.")
+
+    promote_id = args.promote or args.promote_verbal
+    if promote_id:
         events, _ = M.read_all_events()
-        prop = next((e for e in events if e["id"] == args.promote), None)
+        prop = next((e for e in events if e["id"] == promote_id), None)
         if prop is None:
-            sys.exit(f"sign: no event {args.promote!r} found")
+            sys.exit(f"sign: no event {promote_id!r} found")
         # Two things are promotable, and for the same reason: both are claims
         # this fold deliberately refuses to serve until the operator's key says
         # otherwise. A proposal (an agent's suggested correction) and a
@@ -112,7 +147,7 @@ def main():
         promotable = (prop["kind"] == "propose-correct"
                       or prop.get("lineage") == "contains-untrusted")
         if not promotable:
-            sys.exit(f"sign: {args.promote} is kind={prop['kind']} / "
+            sys.exit(f"sign: {promote_id} is kind={prop['kind']} / "
                      f"lineage={prop.get('lineage')!r} — only proposals and "
                      f"quarantined (contains-untrusted) events are promoted; "
                      f"write others explicitly with --subject/--content")
@@ -124,7 +159,7 @@ def main():
         # live claim on that subject, so one operator act clears the conflict.
         fold = M.fold_events(events, M.load_registry())
         parked = fold["parked"].get(subject, [])
-        supersedes = sorted({args.promote, *supersedes,
+        supersedes = sorted({promote_id, *supersedes,
                              *(e["id"] for e in parked)})
         # A promotion must not SILENTLY overwrite a fact already being served.
         # Superseding the parked set clears a conflict the operator is already
@@ -169,22 +204,50 @@ def main():
                 "can't be promoted through this path.")
         body_sha256 = M.content_fingerprint(store_file.read_text())
 
+    # A VERBAL promotion keeps lineage `contains-untrusted` on purpose. The
+    # source of the content did not change because Craig approved it — only
+    # whether he vouches for it did. Emitting `operator-direct` here would
+    # launder the source, serve the fact through the ordinary trusted branch,
+    # and make the two promotion classes indistinguishable in the fold, which
+    # is the one thing Craig asked for ("there is key signed and verbally
+    # signed"). Keeping the lineage is also what caps residency for free:
+    # effective_residency() refuses `pinned` to any unsigned event, so a verbal
+    # promotion buys `served` and cannot reach doctrine off-host.
+    verbal = None
+    if args.promote_verbal:
+        verbal = {"words": args.approved.strip(),
+                  "ts": M.datetime.datetime.now(M.datetime.timezone.utc)
+                        .strftime("%Y-%m-%dT%H:%M:%SZ")}
     ev, _ = M.make_event("correct", subject, content, session=args.session,
                          polarity=polarity, home=home, audience=args.audience,
                          confidence="operator-stated",
+                         lineage="contains-untrusted" if verbal else "operator-direct",
                          supersedes=supersedes or None,
-                         body_sha256=body_sha256)
-    M.sign_event(ev, args.signer)          # raises loudly if vault locked
-    if not M.verify_sig(ev):
-        sys.exit("sign: signature did not verify against allowed_signers — "
-                 "refusing to emit an event that the fold would alarm on")
-    line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
-    append(ev, line)
-    print(f"signed {ev['id']} ({subject}) by {args.signer}")
+                         body_sha256=body_sha256,
+                         verbal_approval=verbal)
+    if verbal:
+        # No signature by construction — that is what makes this the weaker
+        # class. body_sha256 is still bound: it records WHICH bytes he approved,
+        # so a later edit is detectable even without a signature over them.
+        line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
+        append(ev, line)
+        print(f"VERBALLY signed {ev['id']} ({subject})")
+        print(f"  approved: {verbal['words']!r}")
+        print(f"  class: {M.PROMOTION_VERBAL} — served, but NOT pinned/doctrine.")
+        print(f"  this is an AUDIT record, not a cryptographic gate. To make it "
+              f"one, run: sign.py --promote {ev['id']}")
+    else:
+        M.sign_event(ev, args.signer)      # raises loudly if vault locked
+        if not M.verify_sig(ev):
+            sys.exit("sign: signature did not verify against allowed_signers — "
+                     "refusing to emit an event that the fold would alarm on")
+        line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
+        append(ev, line)
+        print(f"signed {ev['id']} ({subject}) by {args.signer}")
     if supersedes:
         print(f"  supersedes: {', '.join(supersedes)}")
-    if args.promote:
-        reconcile_store(subject)
+    if promote_id:
+        reconcile_store(subject, approved_words=verbal["words"] if verbal else None)
     return 0
 
 

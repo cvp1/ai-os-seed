@@ -25,7 +25,7 @@ on {{REDACTED}} (2026-07-28, Craig's go): staleness hook installed, store
 backfilled, and MEMORY.md flipped to fold-generated — per-host opt-in via a
 `.mesh-generated` marker in the store (`memory_write.py flip-generated`);
 memory_write/consolidate/reconcile key off the marker and stand down from
-index editing. {{REDACTED}}/cvptp flip after backfilling their own corpus.
+index editing. {{REDACTED}}/{{REDACTED}} flip after backfilling their own corpus.
 Phase 6 DONE (2026-07-28): replay, gardener promote, and the home watcher —
 `home_watch.py` (hourly timer on EVERY host; first-noticer-wins suppression)
 hashes the registered canonical homes (`[[homes]]`) and emits a superseding

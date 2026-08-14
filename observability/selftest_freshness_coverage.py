@@ -13,7 +13,7 @@ Covers the two things a coverage-only PR can silently get wrong:
    (false STALE during a normal scheduled gap) nor so loose it can't catch
    a genuinely missed run. panel_health has a non-trivial gap by design (only
    runs 09:00-15:00 AZ, an ~18h overnight gap) and is checked at both
-   boundaries using the REAL runs.db (read-only; never writes). cognizant_brief
+   boundaries using the REAL runs.db (read-only; never writes). {{REDACTED}}_brief
    was a second such case until it was retired 2026-08-07.
 3. Every job NAMED in the `_skipped` documentation block actually exists —
    `_skipped` is pure documentation (evaluate() never reads it), so nothing
@@ -34,7 +34,7 @@ sys.path.insert(0, str(HERE))
 import db as obs_db  # noqa: E402
 import freshness  # noqa: E402
 
-HERMES_JOBS = Path("~/.{{REDACTED}}/cron/jobs.json").expanduser()
+{{REDACTED}}_JOBS = Path("~/.{{REDACTED}}/cron/jobs.json").expanduser()
 
 FAILS = []
 
@@ -84,7 +84,7 @@ def status_at(job, now):
     Returns a sentinel rather than raising: a bare next() here made ONE
     unconfigured job abort the entire selftest with StopIteration, so every
     check after it never ran and the suite reported nothing at all rather than
-    one red line. Found 2026-08-11 — cognizant_brief is in TARGET_JOBS but not
+    one red line. Found 2026-08-11 — {{REDACTED}}_brief is in TARGET_JOBS but not
     in freshness.json, and it was hiding the rest of the file.
     """
     for r in freshness.evaluate(conn, now):
@@ -106,14 +106,14 @@ check("panel_health: NOT stale just before the next scheduled run (~18h gap)",
 check("panel_health: IS stale if a run is genuinely missed (well past 20h)",
       status_at("panel_health", lr + timedelta(hours=21)) == "STALE")
 
-# cognizant_brief was RETIRED 2026-08-07 (cron commit 983b68d, "retire the
+# {{REDACTED}}_brief was RETIRED 2026-08-07 (cron commit 983b68d, "retire the
 # weekday work brief"): manifest entry enabled=false, unit no longer rendered,
 # last real run 2026-08-07. Its coverage entry and its two weekend-gap edge
 # checks stayed behind and failed forever after — the retirement removed the
 # job but not the things watching it. Asserting the retirement instead, so this
 # turns red if the job comes back without its freshness entry.
-check("cognizant_brief: retired — absent from freshness.json, and that is correct",
-      "cognizant_brief" not in cfg_jobs)
+check("{{REDACTED}}_brief: retired — absent from freshness.json, and that is correct",
+      "{{REDACTED}}_brief" not in cfg_jobs)
 
 
 # --- _skipped documentation: every job it names must actually exist. Pure
@@ -122,7 +122,7 @@ check("cognizant_brief: retired — absent from freshness.json, and that is corr
 def real_job_scripts():
     """Live job names, from cron/schedules.toml — the current source of truth.
 
-    Was reading ~/.{{REDACTED}}/cron/jobs.json. Hermes cron has been PAUSED since
+    Was reading ~/.{{REDACTED}}/cron/jobs.json. {{REDACTED}} cron has been PAUSED since
     2026-07-26 (the estate runs on systemd user timers), so that file froze on
     the migration date: every job added afterwards read as "not a real live
     job". Measured 2026-08-11 — grok_tier_check and soak_check both failed this

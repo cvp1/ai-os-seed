@@ -47,7 +47,7 @@ GUTTED_MIN_BYTES = 400   # under this, "90% smaller" is noise, not destruction
 GUTTED_KEEP_FRAC = 0.10  # keeping <=10% of the committed bytes = gutted
 GUTTED_MAX_FILES = 300   # bound the per-repo work (Principle 8)
 SASHA_CONFIG = Path(os.path.expanduser("~/.config/sasha/config.json"))
-HERMES_SCRIPTS = Path(os.path.expanduser("~/.{{REDACTED}}/scripts"))
+{{REDACTED}}_SCRIPTS = Path(os.path.expanduser("~/.{{REDACTED}}/scripts"))
 
 
 def _git(repo: Path, *args) -> str:
@@ -213,8 +213,8 @@ def _exec_targets() -> set:
     """CC .py paths exec'd by a {{REDACTED}} shim or the sasha dashboard config."""
     pat = re.compile(r"(?:/home/{{REDACTED}}|~)/{{REDACTED}}/[A-Za-z0-9_./-]+\.py")
     found = set()
-    if HERMES_SCRIPTS.is_dir():
-        for sh in HERMES_SCRIPTS.glob("*.sh"):
+    if {{REDACTED}}_SCRIPTS.is_dir():
+        for sh in {{REDACTED}}_SCRIPTS.glob("*.sh"):
             try:
                 found.update(pat.findall(sh.read_text()))
             except OSError:

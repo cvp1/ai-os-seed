@@ -118,6 +118,35 @@ def repo_hygiene_problems():
         return [f"repo_hygiene failed to run: {e}"]
 
 
+def model_drift_problems():
+    """Craig's call 2026-08-13: check the frontier DAILY, and deliver it here.
+
+    Why inside this job rather than a timer of its own: no scheduler in this
+    fleet notifies anyone, so a standalone daily `frontier_drift.py` would print
+    a perfect report to a journal nobody reads — the same last-hop gap that
+    FINDINGS.md was created to close. This job already writes FINDINGS.md, and
+    CLAUDE.md already tells every agent to read it at session start. That is a
+    delivery path with a proven consumer; a new timer would not be.
+
+    Never crashes the run (the one-bad-entry rule: a malformed key once took the
+    staleness monitor out for all 82 jobs). A provider being unreachable is a
+    FINDING, not an exception — silence about an unchecked model is the failure
+    this exists to prevent.
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from _lib import model_catalog
+        # Standing structural gaps (claude/local have no catalog API here) are
+        # excluded: they are true every single day, and a daily FINDINGS.md
+        # entry that never changes is how the whole file gets skimmed past.
+        # They live in the always-printed `python3 -m _lib.model_catalog` view.
+        return ["%s: %s" % (cls, text.strip())
+                for cls, text in model_catalog.findings()
+                if cls != "NO-INSTRUMENT"]
+    except Exception as e:  # noqa: BLE001
+        return ["frontier drift check failed to run: %s" % e]
+
+
 def shim_drift():
     """Run `cron/sync.sh --check` (or the seed's `scheduler/sync.sh` when
     that's what's installed) so set/content drift between the manifest and
@@ -138,6 +167,32 @@ def shim_drift():
         return []
     lines = [ln for ln in r.stdout.splitlines() if ln.startswith("DRIFT:")]
     return lines or [f"sync.sh --check exit {r.returncode}: {(r.stderr or r.stdout).strip()[:120]}"]
+
+
+def prices_projection_drift():
+    """Run `gen_prices.py --check` so a hand-edit to prices.json — or a PRICING
+    change that was never projected — is edge-triggered here rather than found
+    the next time someone happens to read the file.
+
+    WHY: until 2026-08-12 prices.json and _lib/model_router.py PRICING were two
+    hand-maintained Claude rate tables. Both carried an effective-2026-09-01 row
+    raising claude-sonnet-5 to $3/$15 that Anthropic had cancelled; the fix
+    removed it from _lib only and the copy here survived, found by accident. The
+    projection made prices.json derived — this makes the derivation checked.
+    Never crashes the job."""
+    gen = _HERE / "gen_prices.py"
+    if not gen.exists():
+        return [f"gen_prices.py missing at {gen}"]
+    try:
+        r = subprocess.run([sys.executable, str(gen), "--check"],
+                           capture_output=True, text=True, timeout=30)
+    except Exception as e:  # noqa: BLE001 — never let the backstop crash the job
+        return [f"gen_prices.py --check failed to run: {e}"]
+    if r.returncode == 0:
+        return []
+    lines = [ln.strip() for ln in r.stderr.splitlines() if ln.startswith("DRIFT:")]
+    return lines or [f"gen_prices.py --check exit {r.returncode}: "
+                     f"{(r.stderr or r.stdout).strip()[:120]}"]
 
 
 def parse_age(s: str) -> timedelta:
@@ -278,6 +333,8 @@ def main():
         results = evaluate(conn, now)
     drift = shim_drift()  # Story 025: shim set/content drift is a paging problem too
     repo = repo_hygiene_problems()  # Story 008: dirty/unpushed/untracked-exec drift
+    prices = prices_projection_drift()  # prices.json must stay a projection of PRICING
+    models = model_drift_problems()  # frontier pins vs what the providers actually serve
 
     # STALE (went silent) and FAILING (crashed) are high-confidence — they page.
     # MISSING (never run) is weaker: usually a newly-instrumented job that hasn't
@@ -294,29 +351,38 @@ def main():
                     sorted(problems, key=lambda x: x["job"])]
         findings += [f"[DRIFT] cron shim reconcile: {d}" for d in drift]
         findings += [f"[REPO] git hygiene: {rp}" for rp in repo]
+        findings += [f"[DRIFT] price table projection: {p}" for p in prices]
+        findings += [f"[MODEL] frontier drift: {m}" for m in models]
         write_findings(findings, now)
 
     if args.json:
         print(json.dumps({"checked_at": now.isoformat(timespec="seconds"),
                           "problems": len(problems), "results": results,
-                          "shim_drift": drift, "repo_hygiene": repo}, indent=2))
+                          "shim_drift": drift, "repo_hygiene": repo,
+                          "prices_drift": prices, "model_drift": models},
+                         indent=2))
         return 0
 
     shown = results if args.all else problems
-    if not shown and not drift and not repo:
+    if not shown and not drift and not repo and not prices and not models:
         # Silent success: nothing printed, nothing found.
         return 0
-    if problems or drift or repo:
+    if problems or drift or repo or prices or models:
         # Found work is success (Story 008): report with a FINDINGS: first line
         # (log_run stores it as the run's summary) and exit 0 below.
         print(f"FINDINGS: {len(problems)} job problem(s), "
-              f"{len(drift)} shim drift, {len(repo)} repo hygiene")
+              f"{len(drift)} shim drift, {len(repo)} repo hygiene, "
+              f"{len(prices)} price drift, {len(models)} model drift")
     for r in sorted(shown, key=lambda x: (x["status"] == "OK", x["job"])):
         print(f"[{r['status']:7}] {r['label']}: {r['detail']}")
     for d in drift:
         print(f"[{'DRIFT':7}] cron shim reconcile: {d}")
     for rp in repo:
         print(f"[{'REPO':7}] git hygiene: {rp}")
+    for p in prices:
+        print(f"[{'DRIFT':7}] price table projection: {p}")
+    for m in models:
+        print(f"[{'MODEL':7}] frontier drift: {m}")
     return 0
 
 
