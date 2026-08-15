@@ -2594,6 +2594,18 @@ SHIPPED_PATHS = COMPONENTS + ROOT_FILES  # the exact surface install() itself wr
 # real job on the next update. --update reports these but NEVER auto-writes
 # them — reconciling scheduler entries stays a manual, by-hand act.
 UPDATE_MANUAL_ONLY_PATHS = {"scheduler/manifest.yml"}
+# Whole COMPONENTS this file already treats as user-owned the moment real
+# content exists — install() itself never overwrites memory/ once it's
+# there (SATISFIED_BY_EXISTING, _memory_is_pristine): it ships an EMPTY
+# starter scaffold that becomes the operator's real, evolving, host-
+# specific memory the moment anything writes to it. Missed this in the
+# first version of --update and found it in the FIRST real dry run against
+# a real install ({{REDACTED}}): memory/MEMORY.md — Craig's actual live memory
+# index there — planned as [UPDATE], which would have overwritten it with
+# the empty scaffold on --apply. Caught by reading the dry-run plan before
+# ever passing --apply; excluded entirely, matching install()'s own
+# standing rule for this component rather than inventing a new one.
+UPDATE_MANUAL_ONLY_COMPONENTS = {"memory"}
 
 
 def _update_lock_path(target: Path) -> Path:
@@ -2775,6 +2787,12 @@ def _reconstruct_legacy_shipped(receipt: dict, tmp_parent: Path):
     return _shipped_snapshot(tree)
 
 
+def _is_update_manual_only(rel: str) -> bool:
+    if rel in UPDATE_MANUAL_ONLY_PATHS:
+        return True
+    return rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS
+
+
 def _plan_update(target: Path, shipped_now: dict, new_tree: Path):
     """Three-way plan: for every path the NEW tree would ship, decide
     create / update / skip_dirty / manual_only / unchanged. `shipped_now` is
@@ -2787,11 +2805,11 @@ def _plan_update(target: Path, shipped_now: dict, new_tree: Path):
     for rel, new_entry in sorted(new_snap.items()):
         live = target / rel
         if not live.exists() and not live.is_symlink():
-            if rel in UPDATE_MANUAL_ONLY_PATHS:
+            if _is_update_manual_only(rel):
                 continue  # doesn't exist yet -> nothing install() would have synthesized either
             plan["create"].append(rel)
             continue
-        if rel in UPDATE_MANUAL_ONLY_PATHS:
+        if _is_update_manual_only(rel):
             plan["manual_only"].append(rel)
             continue
         st = live.lstat()
@@ -2954,9 +2972,12 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             for rel in plan["skip_dirty"]:
                 print(f"  [SKIP  ] {rel} — locally modified since install, not touched")
             for rel in plan["manual_only"]:
-                print(f"  [MANUAL] {rel} — install() writes this file itself (e.g. your live "
-                     f"scheduled jobs); --update never touches it automatically. Compare it "
-                     f"by hand against the new tree if you want anything it added.")
+                if rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS:
+                    why = "this is your live, personal workspace, not shipped content"
+                else:
+                    why = "install() synthesizes this file (e.g. splices in your live scheduled jobs)"
+                print(f"  [MANUAL] {rel} — {why}; --update never touches it automatically. "
+                     f"Compare it by hand against the new tree if you want anything it added.")
 
             if not apply:
                 print("\n(dry run — pass --apply to write these changes)")
