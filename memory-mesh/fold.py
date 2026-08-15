@@ -151,7 +151,46 @@ def fetch_peers():
     A peer that rewrote history gets REFUSED, loudly — never merged.
     Peers = the events repo's own git remotes (the remote list IS the mesh
     membership on the consumer side; mesh.toml serves the producer's ssh
-    nudges). Drills wire local-path remotes — identical git mechanics."""
+    nudges). Drills wire local-path remotes — identical git mechanics.
+
+    Found 2026-08-15 ({{REDACTED}} silently stopped merging for ~29h): the ref
+    filter used to compare `%(refname:short)` output against the literal
+    string "{host}/HEAD" to drop the remote's HEAD symref. git's short-form
+    renderer collapses `refs/remotes/<host>/HEAD` to the BARE remote name
+    (e.g. "{{REDACTED}}", not "{{REDACTED}}/HEAD") — a real, verified quirk,
+    not a guess (confirmed live: `for-each-ref --format=%(refname:short)
+    refs/remotes/{{REDACTED}}` on the affected host printed exactly
+    ["{{REDACTED}}", "{{REDACTED}}/master"]). Whether that symref exists at
+    all depends on the git version/config on each host (newer git can
+    auto-create it on fetch; older git doesn't) — {{REDACTED}}'s newer git had it,
+    {{REDACTED}}/{{REDACTED}}'s didn't, so only {{REDACTED}} tripped the "expected
+    exactly one branch" branch on every single scheduled run and silently
+    skipped the merge, forever, with no signal anywhere. Fixed by comparing
+    FULL ref paths (unambiguous across git versions) instead of the
+    short-form rendering. `git rev-parse`/`git merge` accept a full ref path
+    identically to the short form, so nothing downstream changes.
+
+    Second, independent bug this uncovered: this function used to return
+    ALL non-happy-path conditions (unreachable, wrong branch count, no ref
+    yet) via a `notes` list that main() collected and then never printed or
+    otherwise used anywhere — a structurally silent failure channel. That is
+    exactly why the {{REDACTED}} stall produced zero signal for 29 hours despite
+    the scheduled job exiting 0 every 5 minutes. Every non-"ok" condition now
+    goes to `alarms` instead, which main() already surfaces (edge-triggered,
+    on change) and folds into the FINDINGS printout.
+
+    3-model panel review (grok-4.6/gpt-5.6-terra/gemini-pro-latest,
+    2026-08-15) confirmed this diagnosis and both fixes unanimously. openai
+    additionally suggested `--ff-only` on the merge, reasoning the log looked
+    linear with zero merge commits in 857+ real events — plausible-sounding,
+    WRONG: drill_1 (split-brain replay) and drill_2 (partition: emit
+    everywhere, converge after) explicitly drill concurrent divergent writes
+    across hosts that require a real 3-way merge to reconcile, which
+    --ff-only refuses outright. Tried it, ran the drill suite, watched drills
+    1/2/5/7 fail that pass clean without it, reverted. Left here as a record
+    of a plausible panel suggestion that live verification (Principle 13)
+    caught before it shipped — a lesson in why every suggestion still needs
+    its own proof, panel-endorsed or not."""
     notes, alarms = [], []
     state_f = M.MESH_ROOT / "state" / "last-seen.json"
     state = json.loads(state_f.read_text()) if state_f.exists() else {}
@@ -160,18 +199,19 @@ def fetch_peers():
         r = subprocess.run(["git", "-C", str(M.MESH_ROOT), "fetch", "-q", host],
                            capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
-            notes.append(f"{host}: unreachable ({r.stderr.strip()[:80]})")
+            alarms.append(f"{host}: unreachable ({r.stderr.strip()[:80]})")
             continue
+        head_ref = f"refs/remotes/{host}/HEAD"
         refs = [ln for ln in M.git(
-            "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{host}",
-            check=False).splitlines() if ln.strip() and ln != f"{host}/HEAD"]
+            "for-each-ref", "--format=%(refname)", f"refs/remotes/{host}",
+            check=False).splitlines() if ln.strip() and ln != head_ref]
         if len(refs) != 1:
-            notes.append(f"{host}: expected exactly one branch (single-writer "
-                         f"invariant), found {refs or 'none'}")
+            alarms.append(f"{host}: expected exactly one branch (single-writer "
+                          f"invariant), found {refs or 'none'}")
             continue
         sha = M.git("rev-parse", refs[0], check=False).strip()
         if not sha:
-            notes.append(f"{host}: no ref yet")
+            alarms.append(f"{host}: no ref yet")
             continue
         last = state.get(host)
         if last:
