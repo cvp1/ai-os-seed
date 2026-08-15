@@ -2833,6 +2833,58 @@ def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_s
     receipt["shipped"] = shipped
 
 
+def do_adopt_baseline(target: Path) -> int:
+    """SEED-076 follow-up, found live the first time --update ran against a
+    REAL install: some installs predate the receipt system itself (pre-
+    Wave-2H — no .cc-seed/receipt.json at all), a state even older than the
+    "legacy install with a receipt but no shipped history" case --update
+    already handles by fetching the historical commit. There is no commit
+    to fetch here — nothing on disk records what was ever "shipped" versus
+    added later by the operator.
+
+    The panel's explicit recommendation for exactly this case (2026-08-15
+    design review, gpt-5.6-terra): "offer an explicit, noisy --adopt-
+    baseline/migration workflow that records current hashes as the
+    operator-approved baseline; it must not be implicit in --update." This
+    is that command. It does NOT claim anything about where the current
+    content came from — it just says "starting now, treat exactly this as
+    the known-good reference point," which is the only honest thing this
+    tool can say about a tree with no history. Requires the operator to
+    run it by name; --update never calls it implicitly, and it refuses on
+    a target that already has a receipt (that's --update's job, not this
+    one's)."""
+    if not looks_like_install(target):
+        return die(f"{target} doesn't look like an AI-OS Seed install — "
+                   f"--adopt-baseline only operates on an existing install")
+    if _load_receipt(target) is not None:
+        return die(f"{target} already has a {CC_SEED_DIR}/{RECEIPT_NAME} — "
+                   f"--adopt-baseline is only for installs that predate receipts "
+                   f"entirely (nothing to adopt: --update already has real history here, "
+                   f"or use its own legacy-bootstrap path if it's missing 'shipped')")
+    present = [c for c in SHIPPED_PATHS if (target / c).exists()]
+    shipped = _shipped_snapshot(target, present)
+    receipt = {
+        "schema": 1,
+        "install": {
+            "target": str(target), "mode": "adopted",
+            "installer_version": _installer_version_of(target),
+            "installer_commit": "unknown",
+            "components": [c for c in COMPONENTS if c in present],
+            "skipped": [], "at": _now(),
+        },
+        "baseline": {}, "gated_writes": {}, "shipped": shipped,
+    }
+    (target / CC_SEED_DIR).mkdir(parents=True, exist_ok=True)
+    _save_receipt(target, receipt)
+    print(f"adopted: recorded {len(shipped)} path(s) under {len(present)} shipped "
+         f"location(s) as this install's baseline (version "
+         f"{receipt['install']['installer_version']}). This is NOT a claim about "
+         f"where that content came from — only that, from now on, --update treats "
+         f"exactly what's on disk today as the known-good reference point. Run "
+         f"--update to check for anything newer.")
+    return 0
+
+
 def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -> int:
     if not looks_like_install(target):
         return die(f"{target} doesn't look like an AI-OS Seed install (no PRINCIPLES.md + "
@@ -3021,6 +3073,12 @@ def main():
     ap.add_argument("--allow-downgrade", action="store_true",
                     help="with --update: permit installing a version OLDER than what's "
                          "currently installed (refused by default)")
+    ap.add_argument("--adopt-baseline", action="store_true",
+                    help="SEED-076: for an install that predates the receipt system "
+                         "entirely (no .cc-seed/receipt.json at all) — records current "
+                         "on-disk content as the operator-approved baseline so --update "
+                         "has real history to compare against, going forward. Refuses if "
+                         "a receipt already exists. Never called implicitly by --update.")
     args = ap.parse_args()
 
     if args.detect:
@@ -3037,11 +3095,12 @@ def main():
         return die(f"--target must be an absolute path, got {args.target!r}")
     exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit,
                  args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
-                 bool(args.apply_proposal), bool(args.revert_proposal), args.update]
+                 bool(args.apply_proposal), bool(args.revert_proposal), args.update,
+                 args.adopt_baseline]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
                    "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
-                   "--revert-proposal, and --update are mutually exclusive")
+                   "--revert-proposal, --update, and --adopt-baseline are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.json and not args.audit:
@@ -3071,6 +3130,8 @@ def main():
 
     if args.update:
         return do_update(target, args.update_from, args.apply, args.allow_downgrade)
+    if args.adopt_baseline:
+        return do_adopt_baseline(target)
     if args.uninstall:
         return uninstall(target)
     if args.enable_demo:
