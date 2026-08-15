@@ -2572,8 +2572,16 @@ def do_audit(target: Path, package: Path, as_json: bool) -> int:
 #     (does NOT yet serialize against --approve/--apply-proposal racing at
 #     the same time — named as a residual below, not silently dropped).
 
-UPDATE_SOURCE_OWNER = "{{REDACTED}}"
-UPDATE_SOURCE_REPO = "ai-os-seed"
+# ONE literal ("owner/repo"), not two separate constants: install.py builds
+# URLs against multiple domains (github.com AND raw.githubusercontent.com),
+# so no existing scrub exception covers "{{REDACTED}}" split across an f-string.
+# Found live 2026-08-15 — a bare UPDATE_SOURCE_OWNER = "{{REDACTED}}" got scrubbed
+# to "{{REDACTED}}" in the shipped build (valid Python, so syntax_audit
+# passed clean; the URL just silently 404s at runtime). This exact literal
+# is now a build_seed.py PUBLIC_EXCEPTIONS entry, so it survives scrubbing
+# whole.
+UPDATE_SOURCE_REPO_SLUG = "cvp1/ai-os-seed"
+UPDATE_SOURCE_OWNER, UPDATE_SOURCE_REPO = UPDATE_SOURCE_REPO_SLUG.split("/", 1)
 _UPDATE_MAX_BYTES = 50 * 1024 * 1024  # dist/ is a few MB; bound the fetch (Principle 8)
 _UPDATE_FETCH_TIMEOUT = 30
 SHIPPED_PATHS = COMPONENTS + ROOT_FILES  # the exact surface install() itself writes
