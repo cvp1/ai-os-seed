@@ -7,6 +7,8 @@
 !/VISION.md
 !/CLAUDE.md
 !/PRINCIPLES.md
+!/PRINCIPLES-CORE.md
+!/ORIGINS.md
 !/audits/
 # Root-anchored tool config (outputDir points OUTSIDE the repo — story 002).
 !/playwright-mcp.config.json

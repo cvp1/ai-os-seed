@@ -58,7 +58,7 @@ covered by a specific convention, reason from here.
     is Craig's call, not a fixed property of a vendor** — each revision gets a dated
     record in `decisions/` AND is encoded in `_lib/merit_policy.CANDIDATES`, the one
     authority every other layer derives from. A decision recorded but not encoded is
-    the failure mode: the Grok ruling sat unapplied in code for four days. A trust
+    the failure mode (`ORIGINS.md` 2026-07-31). A trust
     promotion is also NOT a tool-security clearance: Gemini the API is first-party,
     but Gemini CLI / Antigravity as agentic tools over sensitive repos remain a
     separate, unresolved axis (`decisions/grok-build-gemini-cli-not-adopted-2026-08-06.md`).
@@ -75,14 +75,9 @@ covered by a specific convention, reason from here.
     fields, wrong shape, truncation) is closed completely by moving that field
     to code, while a JUDGEMENT failure (fabrication, wrong pick, unsupported
     claims) is not helped at all — a harness will format the wrong answer
-    beautifully. Origin: 2026-08-13, signal-scan's degraded path, where the
-    local model was hand-copying links, upvote counts, odds and star counts that
-    were already structured data in its own input: 0–44% link compliance doing
-    that, unfixed by a 5× token budget, and 100% the moment code emitted them —
-    also faster, and with fabricated links made impossible rather than merely
-    unobserved. Its fabrication count was zero throughout; it was honest and
-    could judge, and unreliable only at transcription. Method + instrument:
-    `ollama-tools/JOB_TRIAGE.md`, `ollama-tools/job_triage.py`.
+    beautifully. Origin: 2026-08-13, signal-scan's degraded path — measurements
+    in `ORIGINS.md`. Method + instrument: `ollama-tools/JOB_TRIAGE.md`,
+    `ollama-tools/job_triage.py`.
 
 ## Architecture
 12. **Small sharp tools on a shared spine.** Independent repos, one concern each,
@@ -126,9 +121,7 @@ covered by a specific convention, reason from here.
     depends on a session transcript has already failed. Being audit-ready is
     not a mode you enter when asked; the evidence has to exist before anyone
     asks, which means producing it at the moment of the claim. Origin:
-    2026-08-01, a rival-model verdict relayed without the prompt that produced
-    it, so the operator was "corrected" for an inference my own summary had
-    licensed — one of several claims that session which outran their evidence.
+    2026-08-01, a relayed verdict that outran its evidence — `ORIGINS.md`.
 
 ## Consent
 17. **Show what you're asking to approve.** An approval gate proves only what the
@@ -141,6 +134,5 @@ covered by a specific convention, reason from here.
     content), and make the display the part an agent cannot rewrite. Reading
     costs the human nothing, which is why there is never a UX argument for
     skipping it — the seamless version and the safe version are the same
-    version. Origin: 2026-07-31, a signing flow that met "go, PIN, touch"
-    exactly and would have collected a perfect signature on bytes the operator
-    never saw.
+    version. Origin: 2026-07-31, a signing flow that would have collected a
+    perfect signature on bytes the operator never saw — `ORIGINS.md`.

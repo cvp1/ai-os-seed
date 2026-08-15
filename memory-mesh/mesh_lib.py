@@ -129,7 +129,15 @@ LOADER_BYTE_CEILING = 24_986
 # `decisions/index-byte-objective-2026-08-01.md`. Raising this is a real
 # decision — it spends always-on context on advertisement, and the measurement
 # in fit_harness_memory says advertisement is not what drives retrieval.
-APPENDIX_BYTES = 2_000
+#
+# 0 since 2026-08-13 (Craig's go, memory-mesh tri-model review): the named
+# appendix is pure advertisement — fit_harness_memory's own measurement (65%
+# of served slugs never named; the estate's most-served slug absent; 17 named
+# slugs never served) plus a full session observed at zero appendix uses. The
+# existence STUB stays (it is the always-on trace that the second tier exists,
+# [[no-data-must-not-render-as-positive-data]]); only the names go. /recall
+# and retrieve.py are unaffected — being named here was never reachability.
+APPENDIX_BYTES = 0
 LOADER_LINE_CEILING = 200
 # Share of the DELIVERED file (not the loader ceiling — the delivered file is
 # what a session actually gets) that the pinned tier may hold. Unsigned pins

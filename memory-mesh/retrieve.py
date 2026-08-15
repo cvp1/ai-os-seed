@@ -41,6 +41,7 @@ import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -183,11 +184,17 @@ def log_injection(turn_text, hits, path=None):
     Without this, 'why did it do that' is unanswerable a week later, and a
     poisoned memory that shaped a turn leaves no trace. The log is the audit
     surface for a channel that otherwise operates invisibly.
+
+    `ts` (added 2026-08-14, effectiveness.py): a Unix timestamp per line so a
+    later reader can window by real time instead of line count. Additive
+    only — older lines have no `ts` and readers must treat that as "unknown
+    time," never as epoch 0.
     """
     path = path or (M.MESH_ROOT / "state" / "retrieval-log.ndjson")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        rec = {"chars": len(turn_text or ""),
+        rec = {"ts": round(time.time(), 3),
+               "chars": len(turn_text or ""),
                "hits": [{"slug": s, "score": round(sc, 4)} for sc, s, _ in hits]}
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
