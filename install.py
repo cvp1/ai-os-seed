@@ -6,14 +6,14 @@ thing that writes install content, so what lands in --target is
 byte-identical to this repo, never transcribed by a model.
 
     install.py --detect                            # read-only: report prior installs on this machine
-    install.py --target ~/ai-os-seed               # copy the substrate in
-    install.py --target ~/ai-os-seed --enable-demo # add hello_fleet to the scheduler manifest
-    install.py --target ~/ai-os-seed --approve claude-md       # apply a staged CLAUDE.md addition
-    install.py --target ~/ai-os-seed --approve mesh-bootstrap  # run memory-mesh/install.sh, recorded
-    install.py --target ~/ai-os-seed --apply-proposal SLUG     # apply an agent-written scheduler repair
-    install.py --target ~/ai-os-seed --revert-proposal SLUG    # undo one, if nothing's touched it since
-    install.py --target ~/ai-os-seed --audit --package <clone> # deterministic post-install auditor
-    install.py --target ~/ai-os-seed --uninstall   # de-schedule managed jobs, then remove the tree
+    install.py --target ~/aios               # copy the substrate in
+    install.py --target ~/aios --enable-demo # add hello_fleet to the scheduler manifest
+    install.py --target ~/aios --approve claude-md       # apply a staged CLAUDE.md addition
+    install.py --target ~/aios --approve mesh-bootstrap  # run memory-mesh/install.sh, recorded
+    install.py --target ~/aios --apply-proposal SLUG     # apply an agent-written scheduler repair
+    install.py --target ~/aios --revert-proposal SLUG    # undo one, if nothing's touched it since
+    install.py --target ~/aios --audit --package <clone> # deterministic post-install auditor
+    install.py --target ~/aios --uninstall   # de-schedule managed jobs, then remove the tree
 
 Stdlib only. Refuses to overwrite a non-empty target; uninstall asks the
 scheduler to drop its managed jobs before deleting anything, and refuses a
@@ -241,7 +241,7 @@ def detect():
         findings.append(f"launchd: {plist.name} -> install root {root}")
 
     # 3. Directories a previous install (or AI-OS Core) commonly leaves behind.
-    for cand in ["~/ai-os-seed", "~/aios", "~/tools/ai-os-seed", "~/ai-os"]:
+    for cand in ["~/aios", "~/ai-os-seed", "~/tools/ai-os-seed", "~/ai-os"]:
         p = Path(cand).expanduser()
         if not p.is_dir():
             continue
