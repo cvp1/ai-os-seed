@@ -256,7 +256,13 @@ jobs:
             (echo "a refused stale proposal still wrote after_content"; exit 1)
           python3 -c "
           p = '$ROOT/scheduler/manifest.yml'
-          open(p, 'w').write(open(p).read().replace('# drift\n', ''))
+          # Read BEFORE opening for write: the previous one-liner opened for
+          # 'w' first (truncating) and then read the now-empty file, so every
+          # later sub-fixture ran against an EMPTY manifest. Unnoticed until
+          # SEED-077's validity check refused to write a manifest with no
+          # jobs: key (2026-09-02) -- the guard caught the fixture's own bug.
+          text = open(p).read().replace('# drift\n', '')
+          open(p, 'w').write(text)
           "
 
           # reused slug: apply once for real, then a second proposal under the same slug
