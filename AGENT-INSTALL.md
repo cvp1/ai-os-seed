@@ -81,10 +81,11 @@ Ask, one at a time:
      mechanically, not just aesthetically: agent memory is keyed to the
      working directory, so a second root is literally a second brain
      that can't see the first.)
-   - **No → a fresh directory.** Default suggestion: `~/ai-os-seed`; any
-     absolute path is fine. Keep it distinct from the clone directory
-     you're reading this file in — the clone is the source, the install
-     root is the live system. Call it `<ROOT>` below.
+   - **No → a fresh directory.** Default suggestion: `~/aios`; any
+     absolute path is fine. Existing installs at `~/ai-os-seed` stay
+     where they are. Keep it distinct from the clone directory you're
+     reading this file in — the clone is the source, the install root
+     is the live system. Call it `<ROOT>` below.
 2. **What's the first real thing you'd want to watch or automate?** (You
    won't build it now — knowing it lets you tailor the wrap-up advice.)
 3. **Name to use in their CLAUDE.md** (optional; skip if they prefer).

@@ -1,6 +1,7 @@
-# AI-OS Seed
+# AIOS
 
-**The operations floor for a personal AI operating system.**
+**The operations floor for a personal AI operating system.** This repo
+is the floor. The window is [Corral Light](https://github.com/cvp1/corral-light).
 
 Install it on a machine you own and your AI agent stops being a chat
 window. It runs jobs on a schedule while you sleep, keeps a record of
@@ -39,18 +40,20 @@ Then you build your own system on top. That part is yours.
 
 ## What this is
 
-A personal AI operating system has three layers. This repo is the bottom
-one — the part that makes the other two dependable.
+A personal AI operating system has four layers. This repo is the floor
+— the substrate that makes the rest dependable.
 
 | Layer | What it does | Who ships it |
 |---|---|---|
-| **Your system** | the jobs, adapters and skills you build for your own life | you |
-| **Substrate** | secrets vault · scheduler · run history · freshness backstop · event-sourced memory · skills conventions | **AI-OS Seed** (this repo) |
+| **Window** | the conversation you look at, pointed at the same workspace folder | [Corral Light](https://github.com/cvp1/corral-light) |
+| **Substrate** | secrets vault · scheduler · run history · freshness backstop · event-sourced memory · skills conventions | **this repo** (the AIOS floor) |
 | **Assistant** | the agent you actually talk to — mail, calendar, questions | [AI-OS Core](https://craigvandeputte.com), or whatever you already use |
+| **Your system** | the jobs, adapters and skills you build for your own life | you |
 
-In one sentence: **AI-OS Seed turns a machine with an AI coding agent on
-it into an operated system** — scheduled, observable, secret-safe, and
-able to learn — owned entirely by you, with nothing phoning home.
+In one sentence: **this repo is the AIOS floor — it turns a machine with
+an AI coding agent on it into an operated system** — scheduled, observable,
+secret-safe, and able to learn — owned entirely by you, with nothing
+phoning home.
 
 It is not a SaaS, not a framework to code against, and not a chatbot. It
 is a working substrate plus the doctrine that holds it together, extracted
@@ -68,10 +71,11 @@ reads source, welcome — you're exactly who this is for.
 
 ## Who it's for
 
-Someone comfortable in a terminal, who owns a machine that stays on and
-has something real worth watching. You'll finish the install with a
-scheduled job running green and reporting into your own run database —
-then you grow your own system on top.
+Claude Code power users can start here — this is the floor — and add the
+window ([Corral Light](https://github.com/cvp1/corral-light)) when they
+want it. You'll finish the install with a scheduled job running green
+and reporting into your own run database — then you grow your own system
+on top.
 
 Want a personal AI assistant without the terminal? Start with
 [AI-OS Core](https://craigvandeputte.com) instead; you can add this later.
@@ -79,6 +83,17 @@ Want a personal AI assistant without the terminal? Start with
 ---
 
 ## Install
+
+### Official order (window + floor)
+
+For Claude Code power users who want both:
+
+1. **Already have Claude Code.**
+2. **Install this repo** into `~/aios` (the default target). The
+   agent-driven path below is how you do this step.
+3. **Install [Corral Light](https://github.com/cvp1/corral-light)** and
+   point the Claude conversation working directory at that same folder.
+4. **Done when `/status` answers.**
 
 ### Before you start
 
@@ -101,16 +116,18 @@ Your agent handles this for you on the agent-driven path.
 counts.) The seed moves *into* it. One root, one memory, one agent — a
 second directory is literally a second brain that can't see the first.
 
-**Starting fresh?** It gets its own directory, `~/ai-os-seed` by default.
+**Starting fresh?** It gets its own directory, `~/aios` by default.
+Existing installs and `--into` stay as they are.
 
 ### Step 2 — let your agent install it (the primary path)
 
 Open Claude Code on that machine and paste this:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.2.6-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.3-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
-> follow it exactly. Show me every command before you run it.
+> follow it exactly. Default workspace is `~/aios`. Show me every command
+> before you run it.
 
 That's the whole install. Your agent then works through
 [`AGENT-INSTALL.md`](AGENT-INSTALL.md):
@@ -136,11 +153,11 @@ this repo, never agent-transcribed.
 `AGENT-INSTALL.md` is written for an agent, but every step is a plain
 command. The short version:
 
-    git clone --branch v0.2.6-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
+    git clone --branch v0.3.3-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
     cd ~/tools/ai-os-seed
     python3 install.py --detect                      # read-only: any prior install?
 
-    python3 install.py --target ~/ai-os-seed         # fresh directory
+    python3 install.py --target ~/aios               # fresh directory
     # ...or, joining a workspace you already have:
     python3 install.py --target <your-workspace> --into
 
@@ -281,6 +298,9 @@ up in `/status`.
 ---
 
 ## The honest ledger (alpha)
+
+The window — [Corral Light](https://github.com/cvp1/corral-light) — is a
+separate repo. This ledger covers the floor only.
 
 **Verified on real hardware, both OSes.** Installed by hand on a real Mac
 — launchd job live, freshness green, the full spine confirmed — as well as
