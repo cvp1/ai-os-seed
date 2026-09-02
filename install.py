@@ -12,6 +12,9 @@ byte-identical to this repo, never transcribed by a model.
     install.py --target ~/ai-os-seed --approve mesh-bootstrap  # run memory-mesh/install.sh, recorded
     install.py --target ~/ai-os-seed --apply-proposal SLUG     # apply an agent-written scheduler repair
     install.py --target ~/ai-os-seed --revert-proposal SLUG    # undo one, if nothing's touched it since
+    install.py --target ~/ai-os-seed --review-proposals        # read-only: READY / HELD / SOLO per staged proposal
+    install.py --target ~/ai-os-seed --apply-proposals         # apply every READY one; SOLO (settings.json) is deferred
+    install.py --target ~/ai-os-seed --apply-proposal SLUG --confirm TOKEN  # a SOLO one, token printed beside its diff
     install.py --target ~/ai-os-seed --audit --package <clone> # deterministic post-install auditor
     install.py --target ~/ai-os-seed --uninstall   # de-schedule managed jobs, then remove the tree
 
@@ -1096,10 +1099,114 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
 # performs the one write — generalized to an open-ended shape (any target,
 # not one bespoke flow per write) but deliberately allowlisted, not opened
 # wide: SEED-072's own AC scopes v1 to scheduler-entry changes only.
-# "Reversible filesystem actions" more broadly stays out of the allowlist
-# until this pattern has proven itself under real use — SEED-073 depends on
-# that, not on the class being wide from day one.
-PROPOSAL_ALLOWED_TARGETS = {"scheduler/manifest.yml"}
+# "Reversible filesystem actions" as a CLASS stays out of the allowlist for
+# good: SEED-073 (the unattended Tier-1 grant) was declined 2026-08-09
+# because a same-uid control is a convention, not a boundary. What widens
+# is the list of NAMED files, one code change at a time.
+#
+# --- SEED-077 (2026-09-02): widened allowlist ---------------------------
+# SEED-072 ran three weeks on manifest.yml alone in real use, so the lane
+# widens — to NAMED files, never a class. Every entry must be (a)
+# reversible through this same mechanism, (b) owned by the system itself
+# (never human-owned state like goals or ledgers), and (c) validatable
+# before the write (see _PROPOSAL_CHECKS). settings.json's presence is NOT
+# an agent inference — the first submission's rationale ("the lane is
+# doctrine's explicit authorization") was rejected in review as
+# self-authorizing. It is here on Craig's own ruling, 2026-09-02, verbatim:
+# "I am approving the change to settings.json as long as the changes are
+# clearly communicated to me before making them." The condition is
+# enforced in mechanism, not intent: settings.json proposals are excluded
+# from --apply-proposals (PROPOSAL_SINGLE_APPLY_ONLY below); their FULL
+# unified diff prints in --review-proposals and again at --apply-proposal
+# time; and the apply REFUSES unless it carries --confirm TOKEN, where the
+# token is a prefix of the after-content hash that only that diff output
+# prints. "Communicated before making" is therefore two commands by
+# construction (one shows, one writes), and the approval is bound to the
+# exact bytes it was shown, not to the slug name.
+PROPOSAL_ALLOWED_TARGETS = {
+    "scheduler/manifest.yml",
+    "observability/freshness.json",
+    ".claude/settings.json",
+}
+
+# Targets the batch walker refuses to touch: each apply must be its own
+# deliberate, slug-named human command, with the full diff in front of the
+# human first. Guard-weakening surfaces belong here.
+PROPOSAL_SINGLE_APPLY_ONLY = {".claude/settings.json"}
+
+# Bound every output (Principle): a runaway diff truncates, never floods.
+_PROPOSAL_DIFF_MAX_LINES = 200
+
+
+def _print_proposal_diff(slug: str, rel_target: str, before: str, after: str):
+    import difflib
+    diff = list(difflib.unified_diff(
+        before.splitlines(), after.splitlines(),
+        fromfile=f"{rel_target} (current)", tofile=f"{rel_target} (proposed)",
+        lineterm=""))
+    print(f"--- full diff for '{slug}' ({rel_target} is single-apply-only; "
+          f"review every line) ---")
+    for line in diff[:_PROPOSAL_DIFF_MAX_LINES]:
+        print(f"  {line}")
+    if len(diff) > _PROPOSAL_DIFF_MAX_LINES:
+        print(f"  ... truncated at {_PROPOSAL_DIFF_MAX_LINES} of {len(diff)} lines — "
+              f"read the proposal file itself before applying.")
+
+
+_CONFIRM_LEN = 12
+
+
+def _confirm_token(after_content: str) -> str:
+    """The token --apply-proposal must carry for a single-apply-only target:
+    a prefix of after_content's own hash. It is printed only alongside the
+    full diff, so possessing it means the diff was in front of the human;
+    and it changes if the proposal's bytes change, so a re-staged proposal
+    under the same slug cannot ride an earlier approval."""
+    return _sha256_bytes(after_content.encode("utf-8")).split(":", 1)[-1][:_CONFIRM_LEN]
+
+
+def _check_json_object(text: str):
+    """after_content must parse as a JSON object — a proposal that would
+    leave freshness.json or settings.json unreadable is refused before the
+    write, not discovered by the next job that loads it."""
+    try:
+        parsed = json.loads(text)
+    except ValueError as e:
+        return f"after_content is not valid JSON ({e})"
+    if not isinstance(parsed, dict):
+        return "after_content parses but is not a JSON object"
+    return None
+
+
+def _check_manifest_yaml(text: str):
+    """Structural sanity for scheduler/manifest.yml without a yaml import
+    (stdlib-first): the jobs key must survive, tabs must not appear (YAML
+    rejects them as indentation), and no two jobs may share a name — each
+    is a mistake an agent-written full-file replacement can realistically
+    make, and each would take the whole scheduler down, not one job."""
+    if "jobs:" not in text:
+        return "no 'jobs:' key — this would empty the scheduler"
+    if "\t" in text:
+        return "contains tab characters, which YAML rejects as indentation"
+    names = [line.strip()[len("- name:"):].strip()
+             for line in text.splitlines()
+             if line.strip().startswith("- name:") and not line.strip().startswith("#")]
+    dupes = {n for n in names if names.count(n) > 1}
+    if dupes:
+        return f"duplicate job name(s): {', '.join(sorted(dupes))}"
+    return None
+
+
+# Verification BEFORE apply, not after: each allowlisted target names the
+# check its replacement bytes must pass. A check returns None (pass) or a
+# reason string (refuse). Deliberately a fixed registry keyed by target —
+# proposals never name their own check command; an agent-suppliable
+# verifier is an agent-suppliable no-op.
+_PROPOSAL_CHECKS = {
+    "scheduler/manifest.yml": _check_manifest_yaml,
+    "observability/freshness.json": _check_json_object,
+    ".claude/settings.json": _check_json_object,
+}
 
 
 def _proposals_dir(target: Path) -> Path:
@@ -1130,7 +1237,7 @@ def _validate_slug(slug: str):
         raise SystemExit(2)
 
 
-def apply_proposal(target: Path, slug: str) -> int:
+def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
     _validate_slug(slug)
     with _proposal_lock(target):
         receipt = _load_receipt(target)
@@ -1145,14 +1252,25 @@ def apply_proposal(target: Path, slug: str) -> int:
         rel_target = proposal.get("target", "")
         if rel_target not in PROPOSAL_ALLOWED_TARGETS:
             return die(f"proposal targets {rel_target!r}, which is outside the allowed set "
-                       f"({', '.join(sorted(PROPOSAL_ALLOWED_TARGETS))}) — SEED-072 v1 is "
-                       f"scoped to scheduler-entry changes only. Refusing.")
+                       f"({', '.join(sorted(PROPOSAL_ALLOWED_TARGETS))}) — widening the "
+                       f"set is a code change to PROPOSAL_ALLOWED_TARGETS plus a matching "
+                       f"_PROPOSAL_CHECKS entry, never a proposal. Refusing.")
         before_content = proposal.get("before_content", "")
         before_hash = proposal.get("before_sha256")
         if _sha256_bytes(before_content.encode("utf-8")) != before_hash:
             return die(f"proposal '{slug}' is malformed — its own before_content doesn't "
                        f"hash to its own before_sha256. Refusing rather than trusting a "
                        f"proposal that can't even check itself.")
+        check = _PROPOSAL_CHECKS.get(rel_target)
+        if check is None:
+            return die(f"{rel_target} is allowlisted but has no _PROPOSAL_CHECKS entry — "
+                       f"the two registries have drifted. Failing closed rather than "
+                       f"writing unvalidated bytes; fix the registry first.")
+        reason = check(proposal.get("after_content", ""))
+        if reason is not None:
+            return die(f"proposal '{slug}' fails the {rel_target} validity check: "
+                       f"{reason}. Refusing before the write — ask the agent to "
+                       f"re-propose content that passes.")
 
         try:
             dir_fd, fname = _resolve_target_dir_fd(target, rel_target)
@@ -1175,6 +1293,22 @@ def apply_proposal(target: Path, slug: str) -> int:
                            f"with no receipt to record it in can never be reverted through this "
                            f"mechanism. Refusing rather than making a change nothing can audit.")
 
+            # Every refusal above ran against the LIVE file, so the diff shown
+            # here is exactly what a confirmed re-run will write.
+            token = _confirm_token(proposal.get("after_content", ""))
+            if rel_target in PROPOSAL_SINGLE_APPLY_ONLY:
+                _print_proposal_diff(slug, rel_target, before_content,
+                                     proposal.get("after_content", ""))
+                if confirm is None:
+                    return die(f"{rel_target} is single-apply-only: nothing written. The diff "
+                               f"above is the exact change; to make it, run\n"
+                               f"  install.py --target {target} --apply-proposal {slug} "
+                               f"--confirm {token}")
+            if confirm is not None and confirm != token:
+                return die(f"--confirm {confirm} does not match this proposal's after_content "
+                           f"(expected {token}) — the bytes changed since you were shown the "
+                           f"diff, or the token belongs to a different proposal. Nothing written; "
+                           f"re-run --review-proposals and confirm what it prints.")
             after_bytes = proposal.get("after_content", "").encode("utf-8")
             after_hash = _sha256_bytes(after_bytes)
             _atomic_write_at(dir_fd, fname, after_bytes)
@@ -1294,6 +1428,122 @@ def revert_proposal(target: Path, slug: str) -> int:
         _save_receipt(target, receipt)
         print(f"reverted proposal '{slug}' — {target / rel_target} restored to {record['before_sha256']}")
         return 0
+
+
+# --- SEED-077 (2026-09-02): batch review + apply ----------------------------
+# The Monday proposal feed produces several proposals at once; applying them
+# one slug at a time made the human the serial bottleneck the lane exists to
+# remove. --review-proposals is the five-minute read (read-only, exit 0
+# always); --apply-proposals walks the queue through the SAME per-slug
+# apply_proposal() path — every guard (allowlist, self-hash, validity check,
+# stale-live-hash, receipt, lock) runs per item, a refusal skips that item
+# and keeps going, and the batch exits nonzero if anything was refused.
+# Batch is a loop over the audited single, never a second write path.
+
+def _staged_proposal_slugs(target: Path):
+    """Valid-slug staged proposals, sorted for a deterministic apply order.
+    Files whose stem fails _SLUG_RE are reported and skipped, not died on —
+    one junk file must not block the rest of the queue."""
+    d = _proposals_dir(target)
+    if not d.is_dir():
+        return [], []
+    slugs, junk = [], []
+    for p in sorted(d.glob("*.json")):
+        if p.is_file():
+            (slugs if _SLUG_RE.match(p.stem) else junk).append(p.stem)
+    return slugs, junk
+
+
+def review_proposals(target: Path) -> int:
+    """Read-only queue report: for each staged proposal, would --apply-proposal
+    take it right now, and why not if not. Never writes anything."""
+    import difflib
+    slugs, junk = _staged_proposal_slugs(target)
+    for stem in junk:
+        print(f"SKIP  {stem!r}: not a valid slug (agent wrote a junk filename?)")
+    if not slugs:
+        print(f"no staged proposals in {_proposals_dir(target)}")
+        return 0
+    for slug in slugs:
+        proposal = _load_proposal_file(_proposals_dir(target) / f"{slug}.json")
+        if proposal is None:
+            print(f"BAD   {slug}: unreadable or not JSON")
+            continue
+        rel_target = proposal.get("target", "")
+        rationale = proposal.get("rationale", "(no rationale)")
+        before = proposal.get("before_content", "")
+        after = proposal.get("after_content", "")
+        problems = []
+        if rel_target not in PROPOSAL_ALLOWED_TARGETS:
+            problems.append(f"target {rel_target!r} not allowlisted")
+        else:
+            check = _PROPOSAL_CHECKS.get(rel_target)
+            if check is None:
+                problems.append("no validity check registered (registry drift)")
+            else:
+                reason = check(after)
+                if reason is not None:
+                    problems.append(f"fails validity check: {reason}")
+        if _sha256_bytes(before.encode("utf-8")) != proposal.get("before_sha256"):
+            problems.append("malformed (before_content doesn't hash to before_sha256)")
+        elif rel_target in PROPOSAL_ALLOWED_TARGETS:
+            live = target / rel_target
+            try:
+                live_hash = _sha256_bytes(live.read_bytes())
+            except OSError as e:
+                problems.append(f"cannot read live target ({e})")
+            else:
+                if live_hash != proposal.get("before_sha256"):
+                    problems.append("stale (live file changed since proposed)")
+        diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm=""))
+        added = sum(1 for l in diff if l.startswith("+") and not l.startswith("+++"))
+        removed = sum(1 for l in diff if l.startswith("-") and not l.startswith("---"))
+        single = rel_target in PROPOSAL_SINGLE_APPLY_ONLY
+        status = ("SOLO " if single else "READY") if not problems else "HELD "
+        print(f"{status} {slug}  ->  {rel_target}  (+{added}/-{removed})")
+        print(f"       {rationale}")
+        for p in problems:
+            print(f"       held: {p}")
+        if single and not problems:
+            _print_proposal_diff(slug, rel_target, before, after)
+            print(f"       apply deliberately: install.py --target {target} "
+                  f"--apply-proposal {slug} --confirm {_confirm_token(after)}")
+    print(f"\napply everything READY: install.py --target {target} --apply-proposals")
+    print(f"apply one:              install.py --target {target} --apply-proposal SLUG")
+    print(f"single-apply-only:      ... --apply-proposal SLUG --confirm TOKEN  (token printed with its diff above)")
+    return 0
+
+
+def apply_proposals(target: Path) -> int:
+    """Apply every staged proposal through apply_proposal(), one at a time,
+    continuing past refusals. Exit 0 only if nothing was refused."""
+    slugs, junk = _staged_proposal_slugs(target)
+    for stem in junk:
+        print(f"SKIP  {stem!r}: not a valid slug", file=sys.stderr)
+    if not slugs:
+        print(f"no staged proposals in {_proposals_dir(target)}")
+        return 0
+    refused, deferred = [], []
+    for i, slug in enumerate(slugs, 1):
+        proposal = _load_proposal_file(_proposals_dir(target) / f"{slug}.json")
+        if proposal is not None and proposal.get("target") in PROPOSAL_SINGLE_APPLY_ONLY:
+            # Craig's 2026-09-02 condition on settings.json: the change is
+            # communicated before it is made. Batch is the wrong granularity
+            # for that — leave it staged for a slug-named single apply.
+            print(f"[{i}/{len(slugs)}] {slug} — DEFERRED: {proposal.get('target')} is "
+                  f"single-apply-only; review the diff, then run "
+                  f"--apply-proposal {slug} --confirm TOKEN yourself")
+            deferred.append(slug)
+            continue
+        print(f"[{i}/{len(slugs)}] {slug}")
+        if apply_proposal(target, slug) != 0:
+            refused.append(slug)
+    applied = len(slugs) - len(refused) - len(deferred)
+    print(f"\n{applied} applied, {len(refused)} refused, {len(deferred)} deferred "
+          f"of {len(slugs)} staged"
+          + (f" — refused: {', '.join(refused)}" if refused else "")
+          + (f" — deferred to single apply: {', '.join(deferred)}" if deferred else ""))
+    return 0 if not refused else 2
 
 
 # --- P3 (2026-08-08): cc-pack import ----------------------------------------
@@ -3084,9 +3334,20 @@ def main():
                          ".cc-seed/staged/proposals/SLUG.json — hash-checked against the "
                          "target's current content before anything is written, allowlisted "
                          "to scheduler-entry changes in this build (PROPOSALS.md)")
+    ap.add_argument("--confirm", metavar="TOKEN",
+                    help="SEED-077: with --apply-proposal on a single-apply-only target "
+                         "(.claude/settings.json): the token printed beside that proposal's "
+                         "full diff. Without it the apply shows the diff and writes nothing")
     ap.add_argument("--revert-proposal", metavar="SLUG",
                     help="undo a previously-applied proposal, refusing if the target has "
                          "changed since --apply-proposal ran")
+    ap.add_argument("--review-proposals", action="store_true",
+                    help="SEED-077: read-only report of every staged proposal — target, "
+                         "rationale, diff size, and whether apply would take it right now")
+    ap.add_argument("--apply-proposals", action="store_true",
+                    help="SEED-077: apply ALL staged proposals through the same per-item "
+                         "guards as --apply-proposal; refusals are skipped and reported, "
+                         "exit is nonzero if any item was refused")
     ap.add_argument("--update", action="store_true",
                     help="SEED-076: check this install against the latest published cc-seed "
                          "content (pinned to an immutable release tag — never a mutable "
@@ -3113,7 +3374,8 @@ def main():
     if args.detect:
         if (args.target or args.enable_demo or args.enable_governance or args.uninstall
                 or args.approve or args.audit or args.list_packs or args.remove_pack
-                or args.set_engagement or args.apply_proposal or args.revert_proposal):
+                or args.set_engagement or args.apply_proposal or args.revert_proposal
+                or args.review_proposals or args.apply_proposals):
             return die("--detect takes no other flags (it's a read-only report)")
         return detect()
     if not args.target:
@@ -3124,14 +3386,18 @@ def main():
         return die(f"--target must be an absolute path, got {args.target!r}")
     exclusive = [args.enable_demo, args.enable_governance, args.uninstall, args.approve, args.audit,
                  args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
-                 bool(args.apply_proposal), bool(args.revert_proposal), args.update,
+                 bool(args.apply_proposal), bool(args.revert_proposal),
+                 args.review_proposals, args.apply_proposals, args.update,
                  args.adopt_baseline]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
                    "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
-                   "--revert-proposal, --update, and --adopt-baseline are mutually exclusive")
+                   "--revert-proposal, --review-proposals, --apply-proposals, --update, "
+                   "and --adopt-baseline are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
+    if args.confirm and not args.apply_proposal:
+        return die("--confirm only applies to --apply-proposal")
     if args.json and not args.audit:
         return die("--json only applies to --audit")
     if args.package and not args.audit:
@@ -3181,9 +3447,13 @@ def main():
             return die("--audit requires --package <clone-dir>")
         return do_audit(target, Path(args.package).expanduser(), args.json)
     if args.apply_proposal:
-        return apply_proposal(target, args.apply_proposal)
+        return apply_proposal(target, args.apply_proposal, confirm=args.confirm)
     if args.revert_proposal:
         return revert_proposal(target, args.revert_proposal)
+    if args.review_proposals:
+        return review_proposals(target)
+    if args.apply_proposals:
+        return apply_proposals(target)
     return install(target, into=args.into)
 
 

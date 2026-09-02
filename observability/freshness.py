@@ -305,8 +305,14 @@ def evaluate(conn, now):
         elif not row["ok"]:
             tail = (row["error_tail"] or "").splitlines()
             note = tail[-1] if tail else f"exit {row['exit_code']}"
+            # Age belongs IN the detail here, not just the dict: FINDINGS.md
+            # renders detail only, and a snapshot row outlives the run it
+            # describes. An undated "last run failed" read 11h later cannot be
+            # told apart from one read 5 days later — measured 2026-08-26, when
+            # this row reported Monday's failure and the job had since gone
+            # green 35 min after the file was written.
             results.append({"job": job, "label": label, "status": "FAILING",
-                            "detail": f"last run failed: {note[:120]}",
+                            "detail": f"last run failed {_fmt_age(age)} ago: {note[:120]}",
                             "age": _fmt_age(age)})
         else:
             soft = None if spec.get("stderr_ok") else soft_failure(conn, job)

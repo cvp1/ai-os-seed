@@ -351,7 +351,29 @@ A control that reads stronger than it is, shipped to strangers, is worse
 than no control — so Principle 17 still ships as doctrine, and the
 enforcement does not ship at all. Phase 5.5 of the install says the same
 thing. It comes back when the binding rests on a boundary an agent cannot
-cross from inside the same user account.
+cross from inside the same user account. That shape is now decided (a
+three-frontier-model review converged on it independently, 2026-08-17): a
+broker under a *separate OS user* that mediates tool execution over a local
+socket — one-shot grants branded to a request id and command digest with a
+closed fail-closed outcome set (no answer = deny), audit written where the
+agent's user cannot truncate it, and the approval display rendered from the
+same canonical bytes that get signed. The acceptance bar is executable
+cheat-drills, not claims: replay a consumed grant, mutate one argv byte
+after granting, rewrite the staged proposal from the agent side, let an
+approval time out, try to truncate the audit sink — every one must deny.
+
+That boundary now exists — upstream, not here. As of 2026-08-20 the broker
+is built as a standalone project (four separate Unix identities, grants
+additionally bound to the executable's inode and working directory), and
+every cheat-drill named above passes on a real box: 22/22 in the drill
+suite, 21/21 in the real-uid permission matrix, live on one canary —
+including the exact attack that forced this withdrawal, where the agent
+rewrites both the staged proposal and the audit copy and the broker
+executes the operator-approved bytes anyway. What has *not* happened: this
+seed's own tool execution has never been routed through that broker. Until
+a seed install runs its tools through it end to end and these drills
+re-pass in that context, the layer stays withheld here. The return path is
+proven; the return is not.
 
 **Live-verified beyond CI**, in an isolated sandbox: STALE detection
 (backdate a run, confirm `freshness.py` flags it); crontab content-drift

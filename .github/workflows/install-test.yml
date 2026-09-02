@@ -401,6 +401,84 @@ jobs:
           grep -q "SENSITIVE VICTIM CONTENT 2" "$VICTIM/manifest.yml" || \
             (echo "SECURITY REGRESSION: revert-proposal wrote through the symlinked scheduler/"; exit 1)
 
+      - name: widened allowlist, validity checks, batch, and confirm-bound single apply (SEED-077)
+        # Every branch is asserted in BOTH directions: what must be written
+        # and what must NOT be. The settings.json target is the one whose
+        # whole point is a refusal (no token -> diff shown, nothing written),
+        # so a green run that only checked the happy path would prove
+        # nothing about the guard.
+        run: |
+          ROOT="${{ runner.temp }}/proposal-077-target"
+          python3 install.py --target "$ROOT"
+          mkdir -p "$ROOT/.claude"
+          printf '{\n  "permissions": {"defaultMode": "default"}\n}\n' > "$ROOT/.claude/settings.json"
+          python3 <<PYEOF
+          import hashlib, json, pathlib
+          root = pathlib.Path("$ROOT"); d = root / ".cc-seed/staged/proposals"
+          d.mkdir(parents=True, exist_ok=True)
+          def stage(slug, target, after):
+              before = (root / target).read_text()
+              (d / f"{slug}.json").write_text(json.dumps({
+                  "target": target,
+                  "before_sha256": "sha256:" + hashlib.sha256(before.encode()).hexdigest(),
+                  "before_content": before, "after_content": after, "rationale": f"ci {slug}"}))
+          stage("a-manifest", "scheduler/manifest.yml",
+                (root / "scheduler/manifest.yml").read_text() + "# ci 077\n")
+          f = json.loads((root / "observability/freshness.json").read_text()); f["ci_077"] = {"max_age": "2d"}
+          stage("b-fresh", "observability/freshness.json", json.dumps(f, indent=2) + "\n")
+          s = json.loads((root / ".claude/settings.json").read_text()); s["env"] = {"CI_077": "1"}
+          stage("c-settings", ".claude/settings.json", json.dumps(s, indent=2) + "\n")
+          stage("d-badjson", "observability/freshness.json", "{not json")
+          stage("e-nojobs", "scheduler/manifest.yml", "# nothing here\n")
+          stage("f-dupes", "scheduler/manifest.yml", "jobs:\n  - name: x\n  - name: x\n")
+          PYEOF
+
+          # review: read-only, correct status per item, token printed beside the SOLO diff
+          REVIEW="$(python3 install.py --target "$ROOT" --review-proposals)"
+          echo "$REVIEW"
+          echo "$REVIEW" | grep -q '^READY a-manifest' || { echo "FAIL: a-manifest not READY"; exit 1; }
+          echo "$REVIEW" | grep -q '^READY b-fresh'    || { echo "FAIL: b-fresh not READY"; exit 1; }
+          echo "$REVIEW" | grep -q '^SOLO  c-settings' || { echo "FAIL: c-settings not SOLO"; exit 1; }
+          echo "$REVIEW" | grep -q '^HELD  d-badjson'  || { echo "FAIL: d-badjson not HELD"; exit 1; }
+          echo "$REVIEW" | grep -q '^HELD  e-nojobs'   || { echo "FAIL: e-nojobs not HELD"; exit 1; }
+          echo "$REVIEW" | grep -q '^HELD  f-dupes'    || { echo "FAIL: f-dupes not HELD"; exit 1; }
+          echo "$REVIEW" | grep -q 'duplicate job name' || { echo "FAIL: dupes reason missing"; exit 1; }
+          echo "$REVIEW" | grep -q '+    "CI_077": "1"' || { echo "FAIL: SOLO diff not printed"; exit 1; }
+          TOKEN="$(echo "$REVIEW" | sed -n 's/.*--apply-proposal c-settings --confirm \([0-9a-f]\{12\}\).*/\1/p')"
+          test -n "$TOKEN" || { echo "FAIL: no confirm token printed for the SOLO item"; exit 1; }
+          grep -q 'ci 077' "$ROOT/scheduler/manifest.yml" && { echo "FAIL: review wrote the manifest"; exit 1; }
+
+          # batch: READY applied, invalid refused (exit 2), settings DEFERRED and byte-unchanged
+          if python3 install.py --target "$ROOT" --apply-proposals; then
+            echo "FAIL: batch with refused items must exit nonzero"; exit 1; fi
+          grep -q 'ci 077' "$ROOT/scheduler/manifest.yml"          || { echo "FAIL: batch did not apply a-manifest"; exit 1; }
+          grep -q 'ci_077' "$ROOT/observability/freshness.json"    || { echo "FAIL: batch did not apply b-fresh"; exit 1; }
+          grep -q 'CI_077' "$ROOT/.claude/settings.json"           && { echo "FAIL: batch applied a single-apply-only target"; exit 1; }
+          python3 -c "import json; json.load(open('$ROOT/observability/freshness.json'))" || { echo "FAIL: freshness.json unreadable after batch"; exit 1; }
+          test -f "$ROOT/.cc-seed/staged/proposals/c-settings.json" || { echo "FAIL: deferred proposal was consumed"; exit 1; }
+          test -f "$ROOT/.cc-seed/staged/proposals/d-badjson.json"  || { echo "FAIL: refused proposal was consumed"; exit 1; }
+
+          # settings.json: no token -> diff shown, nothing written; wrong token -> refused; right token -> applied
+          if python3 install.py --target "$ROOT" --apply-proposal c-settings; then
+            echo "FAIL: single-apply-only target applied without --confirm"; exit 1; fi
+          grep -q 'CI_077' "$ROOT/.claude/settings.json" && { echo "FAIL: tokenless apply wrote settings.json"; exit 1; }
+          if python3 install.py --target "$ROOT" --apply-proposal c-settings --confirm 000000000000; then
+            echo "FAIL: wrong token accepted"; exit 1; fi
+          grep -q 'CI_077' "$ROOT/.claude/settings.json" && { echo "FAIL: wrong token wrote settings.json"; exit 1; }
+          if python3 install.py --target "$ROOT" --confirm "$TOKEN" --review-proposals; then
+            echo "FAIL: --confirm accepted without --apply-proposal"; exit 1; fi
+          python3 install.py --target "$ROOT" --apply-proposal c-settings --confirm "$TOKEN"
+          grep -q 'CI_077' "$ROOT/.claude/settings.json" || { echo "FAIL: confirmed apply did not write"; exit 1; }
+          python3 -c "
+          import json
+          rec = json.load(open('$ROOT/.cc-seed/receipt.json'))['applied_proposals']
+          assert rec['c-settings']['target'] == '.claude/settings.json', rec
+          assert 'a-manifest' in rec and 'b-fresh' in rec, rec
+          "
+          python3 install.py --target "$ROOT" --revert-proposal c-settings
+          grep -q 'CI_077' "$ROOT/.claude/settings.json" && { echo "FAIL: revert did not restore settings.json"; exit 1; }
+          echo "SEED-077 fixture OK"
+
       - name: memory scaffold present (Phase 5 — the agent's own note-writing isn't scriptable here)
         run: |
           ROOT="${{ runner.temp }}/aios-target"

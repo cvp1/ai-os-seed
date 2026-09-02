@@ -94,8 +94,10 @@ class Mesh:
             for h in self.HOSTS))
 
     def env(self, h):
+        store = self.root / "stores" / h
+        store.mkdir(parents=True, exist_ok=True)
         e = {"MESH_ROOT": str(self.dirs[h]), "MESH_HOST": h,
-             "MESH_DRILL_LOCAL": "1"}
+             "MESH_DRILL_LOCAL": "1", "MESH_STORE_DIR": str(store)}
         key = self.root / "drillkey"
         if key.exists():
             e["MESH_SIGNING_KEY"] = str(key)
@@ -560,6 +562,8 @@ def drill_10(m):
     # runs against a THROWAWAY key precisely because the real one is
     # passphrase-gated — which is what makes "an agent cannot promote" true.
     fresh = next(q for q in f["quar"] if "FRESH" in q).split("|")[0]
+    (Path(m.env("hosta")["MESH_STORE_DIR"]) / "quar-fresh.md").write_text(
+        "a FRESH untrusted lesson, no rival claim")
     before = m.version("hosta")
     run([sys.executable, str(CODE / "sign.py"), "--promote", fresh,
          "--session", "drill-sign"], env=m.env("hosta"))
@@ -580,6 +584,8 @@ def drill_10(m):
 
     # Promoting INTO a served subject must warn rather than silently replace.
     contested = next(q for q in f["quar"] if "UNTRUSTED" in q).split("|")[0]
+    (Path(m.env("hosta")["MESH_STORE_DIR"]) / "quar-probe.md").write_text(
+        "the UNTRUSTED version, injected")
     r = run([sys.executable, str(CODE / "sign.py"), "--promote", contested,
              "--session", "drill-sign"], env=m.env("hosta"))
     check("promoting over a served fact warns about the clash",

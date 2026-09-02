@@ -1393,6 +1393,9 @@ def store_dir():
     and for any seed recipient's chosen root — and the harness keys the
     store by that path with / → - (e.g. {{HOME}}/{{REDACTED}} →
     -home-x-Github-CC)."""
+    override = os.environ.get("MESH_STORE_DIR")
+    if override and os.environ.get("MESH_DRILL_LOCAL"):
+        return Path(override)
     return (Path.home() / ".claude" / "projects"
             / str(CODE_DIR.parent).replace("/", "-") / "memory")
 
