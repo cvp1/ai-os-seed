@@ -1261,22 +1261,27 @@ def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
             return die(f"proposal '{slug}' is malformed — its own before_content doesn't "
                        f"hash to its own before_sha256. Refusing rather than trusting a "
                        f"proposal that can't even check itself.")
-        check = _PROPOSAL_CHECKS.get(rel_target)
-        if check is None:
-            return die(f"{rel_target} is allowlisted but has no _PROPOSAL_CHECKS entry — "
-                       f"the two registries have drifted. Failing closed rather than "
-                       f"writing unvalidated bytes; fix the registry first.")
-        reason = check(proposal.get("after_content", ""))
-        if reason is not None:
-            return die(f"proposal '{slug}' fails the {rel_target} validity check: "
-                       f"{reason}. Refusing before the write — ask the agent to "
-                       f"re-propose content that passes.")
-
+        # Path safety before content: resolve (and refuse a symlink-swapped
+        # directory component) BEFORE spending any effort validating
+        # after_content, so a malformed proposal never masks the TOCTOU
+        # refusal with the generic validity-check message (caught by the
+        # symlink regression test after SEED-077 inserted the content check
+        # ahead of this resolution, 2026-09-04).
         try:
             dir_fd, fname = _resolve_target_dir_fd(target, rel_target)
         except RuntimeError as e:
             return die(str(e))
         try:
+            check = _PROPOSAL_CHECKS.get(rel_target)
+            if check is None:
+                return die(f"{rel_target} is allowlisted but has no _PROPOSAL_CHECKS entry — "
+                           f"the two registries have drifted. Failing closed rather than "
+                           f"writing unvalidated bytes; fix the registry first.")
+            reason = check(proposal.get("after_content", ""))
+            if reason is not None:
+                return die(f"proposal '{slug}' fails the {rel_target} validity check: "
+                           f"{reason}. Refusing before the write — ask the agent to "
+                           f"re-propose content that passes.")
             try:
                 current = _read_bytes_at(dir_fd, fname)
             except RuntimeError as e:
