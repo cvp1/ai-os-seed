@@ -195,6 +195,40 @@ def prices_projection_drift():
                      f"{(r.stderr or r.stdout).strip()[:120]}"]
 
 
+def key_registry_problems():
+    """Run `keyvault/keys.py --check` so vault<->ROTATION.md coverage drift, a
+    broken sidecar, or a passed rotate_by reaches FINDINGS.md.
+
+    WHY: the weekly rotation_coverage job found 11 -> 27 -> 34 -> 40 -> 47
+    uncovered vault files across five Mondays (runs.db, 2026-08..09), exit 0
+    and ok=1 every time, and nobody saw it -- a checker that only prints to a
+    journal is the last-hop gap this file exists to close (same reasoning as
+    model_drift_problems). Coverage gaps are folded into ONE line with the
+    count, because a per-file line that repeats daily is how the whole file
+    gets skimmed past; the other finding classes are rare and stay itemised.
+    Never crashes the run; a locked vault is a skip, not a finding."""
+    keys = _HERE.parent / "keyvault" / "keys.py"
+    if not keys.exists():
+        return [f"keys.py missing at {keys}"]
+    try:
+        r = subprocess.run([sys.executable, str(keys), "--check"],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:  # noqa: BLE001 -- never let the backstop crash the job
+        return [f"keys.py --check failed to run: {e}"]
+    if r.returncode != 0:
+        if "locked" in (r.stderr + r.stdout):
+            return []
+        return [f"keys.py --check exit {r.returncode}: {(r.stderr or r.stdout).strip()[:120]}"]
+    items = [ln.strip()[2:] for ln in r.stdout.splitlines() if ln.strip().startswith("- ")]
+    uncovered = [i for i in items if i.startswith("no ROTATION.md row: ")]
+    other = [i for i in items if not i.startswith("no ROTATION.md row: ")]
+    out = []
+    if uncovered:
+        out.append(f"{len(uncovered)} vault file(s) without a ROTATION.md row "
+                   f"(keyvault/keys.py --check lists them; add a row per keyvault/ROTATION.md new-key checklist)")
+    return out + other
+
+
 def parse_age(s: str) -> timedelta:
     m = _DUR.match(s)
     if not m:
@@ -341,6 +375,7 @@ def main():
     repo = repo_hygiene_problems()  # Story 008: dirty/unpushed/untracked-exec drift
     prices = prices_projection_drift()  # prices.json must stay a projection of PRICING
     models = model_drift_problems()  # frontier pins vs what the providers actually serve
+    keys = key_registry_problems()  # vault<->ROTATION.md coverage, sidecars, rotate_by
 
     # STALE (went silent) and FAILING (crashed) are high-confidence — they page.
     # MISSING (never run) is weaker: usually a newly-instrumented job that hasn't
@@ -359,26 +394,28 @@ def main():
         findings += [f"[REPO] git hygiene: {rp}" for rp in repo]
         findings += [f"[DRIFT] price table projection: {p}" for p in prices]
         findings += [f"[MODEL] frontier drift: {m}" for m in models]
+        findings += [f"[KEYS] key registry: {k}" for k in keys]
         write_findings(findings, now)
 
     if args.json:
         print(json.dumps({"checked_at": now.isoformat(timespec="seconds"),
                           "problems": len(problems), "results": results,
                           "shim_drift": drift, "repo_hygiene": repo,
-                          "prices_drift": prices, "model_drift": models},
+                          "prices_drift": prices, "model_drift": models,
+                          "key_registry": keys},
                          indent=2))
         return 0
 
     shown = results if args.all else problems
-    if not shown and not drift and not repo and not prices and not models:
+    if not shown and not drift and not repo and not prices and not models and not keys:
         # Silent success: nothing printed, nothing found.
         return 0
-    if problems or drift or repo or prices or models:
+    if problems or drift or repo or prices or models or keys:
         # Found work is success (Story 008): report with a FINDINGS: first line
         # (log_run stores it as the run's summary) and exit 0 below.
         print(f"FINDINGS: {len(problems)} job problem(s), "
               f"{len(drift)} shim drift, {len(repo)} repo hygiene, "
-              f"{len(prices)} price drift, {len(models)} model drift")
+              f"{len(prices)} price drift, {len(models)} model drift, {len(keys)} key registry")
     for r in sorted(shown, key=lambda x: (x["status"] == "OK", x["job"])):
         print(f"[{r['status']:7}] {r['label']}: {r['detail']}")
     for d in drift:
@@ -389,6 +426,8 @@ def main():
         print(f"[{'DRIFT':7}] price table projection: {p}")
     for m in models:
         print(f"[{'MODEL':7}] frontier drift: {m}")
+    for k in keys:
+        print(f"[{'KEYS':7}] key registry: {k}")
     return 0
 
 

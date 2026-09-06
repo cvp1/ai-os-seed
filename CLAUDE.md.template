@@ -68,6 +68,21 @@ specific convention below, reason from there.
   a `freshness` run in `runs.db`, say that rather than reporting all-clear —
   a green report you cannot substantiate is worse than no report.
 
+## Asking another model — the window, never an API key by default
+
+- When you want a second opinion — a review pass, a rival read on a design,
+  a one-off "run this by Grok" — go through the window you already have:
+  `corral-light consult ask --lane <grok|codex|gemini|claude> --cwd . --prompt "…"`
+  (`consult lanes --table` lists what is signed in; `fanout` and `crossfeed`
+  are the ⌘↵ and ⇄ buttons from a script). The answer comes back as JSON and
+  the pane stays on the wall for the operator to watch, answer, or continue.
+- Why: each lane runs the vendor's own CLI under the operator's subscription.
+  A vendor API key is a second login, a second bill, and no permission rail;
+  reach for one only when the hub is down, and say so in what you write up.
+- If Corral Light is not installed on this host, say that plainly instead of
+  falling back to an API key on your own — which vendors may see which data
+  is the operator's call, not a default.
+
 ## Machine fleet (if you run more than one host)
 
 - Name this host here once you have a naming convention. If you run

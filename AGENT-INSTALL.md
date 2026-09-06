@@ -147,6 +147,14 @@ READMEs. Keep it short — it will grow with their system. Do NOT copy
 `CLAUDE.md.template` — it's a leak-scrubbed export kept only as a
 structural reference.
 
+One rule to carry over from the template regardless of who the user is —
+the "Asking another model" section: second opinions go through
+`corral-light consult` (the window's lanes, on the user's own subscription
+logins), never a vendor API key by default. If `corral-light` is not on the
+PATH yet, keep the rule and note that the window is the next install step;
+an agent that quietly falls back to an API key has changed which vendors see
+the user's data without asking.
+
 **If this was an `--into` install, `<ROOT>/CLAUDE.md` already exists and is
 theirs.** Draft a short addition instead (what the seed added, where the
 ops verbs live) — same stage-then-approve flow below, just shorter content.

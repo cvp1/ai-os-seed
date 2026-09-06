@@ -22,6 +22,7 @@ import os
 import re
 import socket
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -613,8 +614,41 @@ ALLOWED_SIGNERS = _signers_file()
 # Signer identity + key are per-operator (seed recipients set MESH_SIGNER /
 # MESH_SIGNING_KEY; the id must match a line in allowed_signers).
 SIGNER = os.environ.get("MESH_SIGNER", "craig@fleet")
-SIGNING_KEYS = {SIGNER: Path(os.environ.get(
-    "MESH_SIGNING_KEY", os.path.expanduser("~/.key/signing/craig2_ed25519")))}
+
+
+def _signing_key():
+    """Phase 1.1 of decisions/sk-migration-paused-at-grace-2026-07-31.md's
+    resume plan (cc-handoff/reviews/2026-07-31-sk-cutover-PLAN.md), done
+    2026-09-04 after a live failure: a Corral click opened a real signing
+    terminal on {{REDACTED}} and it crashed looking for `craig2_ed25519`, which
+    was never copied there (by design -- the pause explicitly did NOT
+    revoke craig2, but also never finished cutting memory-mesh over to the
+    token the way cc-handoff's sign_task.py already was). Same principal
+    (`craig@fleet`) either way -- allowed_signers already carries both
+    pubkeys, so this changes which key a NEW signature uses, never which
+    ones verify. MESH_SIGNING_KEY stays an absolute override (drills set it
+    unconditionally); otherwise probe the sk (YubiKey-resident) handle
+    first, same as _signers_file()'s own probe style, falling back to the
+    file key only while it exists -- exactly the plan's own wording, not a
+    new decision."""
+    override = os.environ.get("MESH_SIGNING_KEY")
+    if override:
+        return Path(override)
+    for cand in ("~/.key/signing/craig_sk_ed25519", "~/.key/signing/craig2_ed25519"):
+        p = Path(os.path.expanduser(cand))
+        if p.exists():
+            return p
+    return Path(os.path.expanduser("~/.key/signing/craig2_ed25519"))
+
+
+SIGNING_KEYS = {SIGNER: _signing_key()}
+# Apple's /usr/bin/ssh-keygen has no FIDO provider; an sk- (YubiKey-resident)
+# key cannot sign through it ("no FIDO SecurityKeyProvider"). Same probe
+# sign_task.py already uses for the same reason -- prefer Homebrew's build
+# when present, harmless on Linux where it never exists and the system
+# binary handles a plain file key fine either way.
+SSH_KEYGEN = next((p for p in ("/opt/homebrew/bin/ssh-keygen",)
+                   if Path(p).exists()), "ssh-keygen")
 
 
 def canonical_bytes(ev):
@@ -693,21 +727,51 @@ def sign_event(ev, signer="craig@fleet"):
     # agent path open by accident — the exact way v1.4's delegation outlived
     # the decision to end it.
     env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
-    r = subprocess.run(["ssh-keygen", "-Y", "sign", "-f", str(key),
-                        "-n", SIG_NAMESPACE, "-"],
-                       input=canonical_bytes(ev), capture_output=True,
-                       timeout=300, env=env)
-    if r.returncode != 0:
-        raise RuntimeError(
-            "signing failed: " + r.stderr.decode().strip()[:200] +
-            "\nSigning is deliberately interactive — it needs Craig at a "
-            "terminal to enter the key passphrase. Do not load this key into "
-            "ssh-agent to work around this: that hands every local process "
-            "Craig's authority (see this function's docstring).")
-    ev["signer"] = signer
-    ev["sig"] = r.stdout.decode()
-    ev["_signed_via"] = "key file"
-    return ev
+    # Sign a real TEMP FILE, never stdin ("-"). Found live 2026-09-04, the
+    # first attempt to sign a mesh promotion with the sk- (YubiKey-resident)
+    # key: `ssh-keygen -Y sign -f key -n ns -` with the payload piped via
+    # subprocess.run(input=...) failed with "ssh_askpass: exec(...): No such
+    # file or directory" the moment it needed the hardware touch
+    # confirmation. Signing FROM STDIN reads as a scripted/non-interactive
+    # call to ssh-keygen, which then prefers SSH_ASKPASS (a GUI helper
+    # Homebrew's openssh does not ship) over the real controlling terminal
+    # for that prompt — even though a human (Craig) was sitting right there.
+    # sign_task.py (the fleet-task/charter lane) has signed with this exact
+    # key for weeks by passing a real FILE PATH instead, which ssh-keygen
+    # treats as ordinary interactive use and prompts through the terminal
+    # normally. This mirrors that, byte for byte: temp file in, `<file>.sig`
+    # out, both removed after. The old file-key path (craig2_ed25519, no
+    # touch, only a passphrase) worked via stdin because it never needed
+    # this branch of ssh-keygen's logic — untouched by this change either
+    # way, since the same call now goes through a file for both key types.
+    tmp = tempfile.NamedTemporaryFile(delete=False)
+    tmp_path = Path(tmp.name)
+    try:
+        tmp.write(canonical_bytes(ev))
+        tmp.close()
+        sig_path = tmp_path.with_name(tmp_path.name + ".sig")
+        r = subprocess.run([SSH_KEYGEN, "-Y", "sign", "-f", str(key),
+                            "-n", SIG_NAMESPACE, str(tmp_path)],
+                           capture_output=True, timeout=300, env=env)
+        if r.returncode != 0:
+            raise RuntimeError(
+                "signing failed: " + r.stderr.decode().strip()[:200] +
+                "\nSigning is deliberately interactive — it needs Craig at a "
+                "terminal to enter the key's passphrase or PIN+touch. Do not "
+                "load this key into ssh-agent to work around this: that "
+                "hands every local process Craig's authority (see this "
+                "function's docstring).")
+        if not sig_path.exists():
+            raise RuntimeError(
+                "signing reported success but no .sig file was written — "
+                f"expected {sig_path}")
+        ev["signer"] = signer
+        ev["sig"] = sig_path.read_text()
+        ev["_signed_via"] = "key file"
+        return ev
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        tmp_path.with_name(tmp_path.name + ".sig").unlink(missing_ok=True)
 
 
 # ── subject registry ─────────────────────────────────────────────────────────

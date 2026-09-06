@@ -35,7 +35,7 @@ def append(ev, line):
 
 
 MEMORY_WRITE = Path(os.path.expanduser(
-    "~/{{REDACTED}}/cc-skills/improve/memory_write.py"))
+    "~/.claude/skills/improve/memory_write.py"))
 
 
 def reconcile_store(subject, approved_words=None):
@@ -134,6 +134,7 @@ def main():
                 "untrusted-lineage fact while recording nothing.")
 
     promote_id = args.promote or args.promote_verbal
+    prop = None
     if promote_id:
         events, _ = M.read_all_events()
         prop = next((e for e in events if e["id"] == promote_id), None)
@@ -191,18 +192,43 @@ def main():
     # body_sha256, so no lesson/* promotion event is ever created that
     # nothing can be checked against later.
     body_sha256 = None
+    shown_body = None
     if subject.startswith("lesson/"):
         slug = subject.split("/", 1)[1]
-        store_file = Path(M.store_dir()) / f"{slug}.md"
-        if not store_file.exists():
-            sys.exit(
-                f"sign: refusing to promote {subject!r} — no store file at "
-                f"{store_file}.\n"
-                "  A lesson subject with nothing to hash would sign an "
-                "unbound promotion (B3). If this is a mesh-only subject "
-                "with no store-file counterpart, that's expected — but it "
-                "can't be promoted through this path.")
-        body_sha256 = M.content_fingerprint(store_file.read_text())
+        # B4 (2026-09-04): a --promote'd event already carries its full
+        # store-file BODY in the synced mesh log -- verified 25/25
+        # byte-identical to {{REDACTED}}'s own store files the same day
+        # (corral consult, Grok: memory-mesh/reviews/2026-09-04-grok-mesh-
+        # promote-body.md). B3 below instead re-reads a LOCAL store file,
+        # which does not exist on {{REDACTED}} -- the ONLY host that can mint a
+        # signature, since the store is per-host and only the event log
+        # replicates. Every mesh promotion attempted from {{REDACTED}} refused
+        # here, before the PIN prompt, for every quarantined lesson written
+        # on a different host. Prefer the event's own carried body when
+        # promoting: same bytes Craig is about to be shown below, signature
+        # still binds to real content, just not a local re-read.
+        prop_body = prop.get("body") if prop else None
+        if prop_body:
+            body_sha256 = M.content_fingerprint(prop_body)
+            shown_body = prop_body
+        else:
+            # B3 (2026-08-06, Grok-reviewed — memory-mesh/reviews/2026-08-06
+            # -grok-b3-plan-review.md): bind the signature to the store
+            # file's ACTUAL bytes, not just the short --content description.
+            # Still the only path for a direct --subject/--content call (no
+            # --promote, no carried body) and for a promoted event that
+            # somehow lacks one — refuse rather than sign unbound.
+            store_file = Path(M.store_dir()) / f"{slug}.md"
+            if not store_file.exists():
+                sys.exit(
+                    f"sign: refusing to promote {subject!r} — no store file at "
+                    f"{store_file} and the event carries no body to hash.\n"
+                    "  A lesson subject with nothing to hash would sign an "
+                    "unbound promotion (B3/B4). If this is a mesh-only subject "
+                    "with no store-file counterpart, that's expected — but it "
+                    "can't be promoted through this path.")
+            body_sha256 = M.content_fingerprint(store_file.read_text())
+            shown_body = store_file.read_text()
 
     # A VERBAL promotion keeps lineage `contains-untrusted` on purpose. The
     # source of the content did not change because Craig approved it — only
@@ -225,6 +251,19 @@ def main():
                          supersedes=supersedes or None,
                          body_sha256=body_sha256,
                          verbal_approval=verbal)
+    # WYSIWYS (signing-window-plain-summary-above-pin, Craig): the PIN/touch
+    # (or, for a verbal approval, the typed --approved words) IS the
+    # signature, so what it attests to must be ON SCREEN before it happens,
+    # not just a short --content slogan. Grok's review (2026-09-04) named
+    # this gap directly: the charter path already prints full bytes before
+    # signing; mesh printed only `content` and never the body. This prints
+    # into whatever terminal is running sign.py -- on the mesh-card path
+    # that IS the window Craig reads before touching the key.
+    print(f"\n{'=' * 72}")
+    print(f"ABOUT TO {'VERBALLY APPROVE' if verbal else 'SIGN'}: {subject}")
+    print("=" * 72)
+    print(shown_body if shown_body else content)
+    print(f"{'=' * 72}\n")
     if verbal:
         # No signature by construction — that is what makes this the weaker
         # class. body_sha256 is still bound: it records WHICH bytes he approved,
