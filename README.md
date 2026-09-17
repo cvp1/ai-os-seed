@@ -127,7 +127,7 @@ Existing installs and `--into` stay as they are.
 Open Claude Code on that machine and paste this:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.6-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.7-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Default workspace is `~/aios`. Show me every command
 > before you run it.
@@ -156,7 +156,7 @@ this repo, never agent-transcribed.
 `AGENT-INSTALL.md` is written for an agent, but every step is a plain
 command. The short version:
 
-    git clone --branch v0.3.6-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
+    git clone --branch v0.3.7-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
     cd ~/tools/ai-os-seed
     python3 install.py --detect                      # read-only: any prior install?
 
