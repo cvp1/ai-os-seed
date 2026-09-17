@@ -8,6 +8,7 @@ CHANGES; a steady-state fold is silent (exit 0, no output).
 Exit codes: 0 ok (incl. found-work with FINDINGS line), 1 real breakage.
 """
 import argparse
+import datetime as _dt
 import json
 import os
 import subprocess
@@ -20,6 +21,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mesh_lib as M
+
+# How long a standing alarm may stay silent before the fold says it again.
+# Seven days: long enough that a fault fixed within the week never nags, short
+# enough that nothing rots for a month unseen (the 28 half-applied promotions
+# of 2026-09-12 had been silent since August).
+RESURFACE_DAYS = 7
 
 TG_ENV = os.path.expanduser(
     os.environ.get("TELEGRAM_ENV_PATH", "~/.claude/channels/telegram/.env"))
@@ -58,6 +65,12 @@ def _tg_push(text):
         print("fold: no OWNER_TG_CHAT_ID set — held-residency notice stays "
               "in the journal:\n" + text, file=sys.stderr)
         return False
+    # ontology: direct-telegram — fold.py SHIPS (cc-seed/dist, ai-os-seed) and
+    # deliberately has no default chat id: an operator's chat is theirs to set.
+    # _lib/telegram.py falls back to Craig's chat when OWNER_TG_CHAT_ID is unset,
+    # so importing it would send another operator's fold notices at Craig's id
+    # instead of staying silent. Deviation from HANDOFF-EXTENSIONS WP1b step 2,
+    # which listed this file for migration; the seed posture wins.
     data = urllib.parse.urlencode({
         "chat_id": TG_CHAT_ID, "text": text,
         "disable_web_page_preview": "true"}).encode()
@@ -146,6 +159,40 @@ def mark_live_index_held(harness):
     os.replace(tmp, live)
 
 
+def _peer_unreachable(host, timeout=3.0):
+    """Return a short reason if the peer's git transport is not answering, else
+    None. Resolves the remote URL (`<sshhost>:<path>`), then the ssh alias via
+    `ssh -G` (HostName/Port), then one TCP connect. Any resolution failure is
+    reported as unreachable rather than guessed (Principle 4)."""
+    import socket
+    url = M.git("remote", "get-url", host, check=False).strip()
+    if not url:
+        return "no remote url"
+    # A filesystem remote (the drills' fixture peers, or a same-host clone) has
+    # no transport to probe — git reads it directly.
+    if url.startswith(("/", ".", "file://")) or ":" not in url.split("/", 1)[0]:
+        return None
+    sshhost = url.split(":", 1)[0] if "://" not in url else url.split("://", 1)[1].split("/", 1)[0]
+    if "@" in sshhost:
+        sshhost = sshhost.split("@", 1)[1]
+    hostname, port = sshhost, 22
+    try:
+        cfg = subprocess.run(["ssh", "-G", sshhost], capture_output=True, text=True, timeout=5).stdout
+        for ln in cfg.splitlines():
+            k, _, v = ln.partition(" ")
+            if k == "hostname" and v:
+                hostname = v
+            elif k == "port" and v.isdigit():
+                port = int(v)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"ssh -G failed: {e}"
+    try:
+        with socket.create_connection((hostname, port), timeout=timeout):
+            return None
+    except OSError as e:
+        return f"{hostname}:{port} {e.strerror or e}"
+
+
 def fetch_peers():
     """git fetch each peer with the fast-forward guard (SPEC transport).
     A peer that rewrote history gets REFUSED, loudly — never merged.
@@ -196,8 +243,21 @@ def fetch_peers():
     state = json.loads(state_f.read_text()) if state_f.exists() else {}
     remotes = [r for r in M.git("remote", check=False).split() if r]
     for host in remotes:
-        r = subprocess.run(["git", "-C", str(M.MESH_ROOT), "fetch", "-q", host],
-                           capture_output=True, text=True, timeout=60)
+        # A sleeping peer ({{REDACTED}} naps) used to cost a 60 s TimeoutExpired
+        # that killed the whole fold (3 failed runs, week to 2026-09-08). Probe
+        # the transport first: no route / refused / no answer in 3 s -> skip
+        # this peer, keep folding the others. The fetch timeout stays as the
+        # outer bound for a peer that answers TCP but stalls git.
+        why = _peer_unreachable(host)
+        if why:
+            alarms.append(f"{host}: unreachable ({why}) — skipped")
+            continue
+        try:
+            r = subprocess.run(["git", "-C", str(M.MESH_ROOT), "fetch", "-q", host],
+                               capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            alarms.append(f"{host}: fetch timed out (60s) — skipped")
+            continue
         if r.returncode != 0:
             alarms.append(f"{host}: unreachable ({r.stderr.strip()[:80]})")
             continue
@@ -413,11 +473,45 @@ def main():
                  "unnormalized": len(fold["unnormalized"]),
                  "drift": {k: sorted(v) for k, v in drift.items()}}
     prev = json.loads(edge_f.read_text()) if edge_f.exists() else None
-    edge_f.write_text(json.dumps(now_state, indent=1))
+
+    # DECAY: an edge trigger alone cannot report a STANDING fault (2026-09-12).
+    #
+    # Edge-triggering is right for transitions and wrong for a condition that
+    # never self-heals. A drift alarm fires once, the state goes constant, and
+    # from the next run on the fault is indistinguishable from health — which is
+    # how 28 half-applied promotions sat silent for a month. They surfaced only
+    # because an unrelated write perturbed the state and reprinted the block.
+    #
+    # This is the same failure the freshness acks already forbid ("a park can
+    # never become silence" — acks EXPIRE and resurface). So give the alarm the
+    # same property: remember when each was first seen and last reported, and
+    # force it back into the output every RESURFACE_DAYS while it persists.
+    # Steady state stays silent (PRINCIPLES 7); a fault nobody fixed cannot.
+    today = _dt.date.today()
+    first_seen = dict((prev or {}).get("first_seen", {}))
+    last_reported = dict((prev or {}).get("last_reported", {}))
+    for a in alarms:
+        first_seen.setdefault(a, today.isoformat())
+
+    def _aged(a):
+        ref = last_reported.get(a) or first_seen.get(a)
+        try:
+            return (today - _dt.date.fromisoformat(ref)).days
+        except (TypeError, ValueError):
+            return 0
+
+    due = [a for a in alarms if _aged(a) >= RESURFACE_DAYS]
+    # Drop bookkeeping for alarms that are gone, so a repaired fault does not
+    # keep a first_seen date that would make a RECURRENCE look weeks old.
+    live_alarms = set(alarms)
+    first_seen = {k: v for k, v in first_seen.items() if k in live_alarms}
+    last_reported = {k: v for k, v in last_reported.items() if k in live_alarms}
 
     drifted = any(drift.values()) and (
         prev is None or prev.get("drift") != now_state["drift"])
-    changed = prev != now_state
+    changed = {k: v for k, v in (prev or {}).items()
+               if k not in ("first_seen", "last_reported")} != now_state \
+        if prev is not None else True
     if drifted:
         # The 62 legacy stumps make file_richer chronically non-empty, so the
         # summary names the DELTA classes; the full sets live in the edge state.
@@ -427,8 +521,18 @@ def main():
               f"{len(drift['disjoint'])} disjoint "
               f"(sets in state/alert-edge.json; file-richer = a producer "
               f"read a derivative, or a legacy stump awaiting repair)")
-    if changed and (now_state["parked"] or now_state["quarantined"]
-                    or alarms or problems):
+    if (changed or due) and (now_state["parked"] or now_state["quarantined"]
+                             or alarms or problems):
+        if due and not changed:
+            print(f"[STANDING] {len(due)} alarm(s) unfixed for "
+                  f"{RESURFACE_DAYS}+ days — resurfaced on decay, nothing "
+                  f"changed since the last report. Fix or park them "
+                  f"deliberately; they will return again in {RESURFACE_DAYS} "
+                  f"days for as long as they are true.")
+        # Anything shown NOW restarts its decay clock — whether it appeared
+        # because the picture changed or because it aged out.
+        for a in alarms:
+            last_reported[a] = today.isoformat()
         print(f"FINDINGS: {len(fold['parked'])} parked subject(s), "
               f"{len(fold['quarantined'])} quarantined, "
               f"{len(alarms)} alarm(s), {len(problems)} log problem(s)")
@@ -441,6 +545,12 @@ def main():
             print(f"[ALARM  ] {a}")
         for p in problems:
             print(f"[LOG    ] {p}")
+
+    # Written AFTER the report, not before: last_reported is only true once the
+    # printing has actually happened, and an early write would record a report
+    # that a crash in between meant nobody ever saw.
+    edge_f.write_text(json.dumps({**now_state, "first_seen": first_seen,
+                                  "last_reported": last_reported}, indent=1))
     # Views/state are NEVER committed: they are derived, per-host, and every
     # host writes the same paths — committing them would make the fold itself
     # violate the single-writer invariant (drill 1 caught exactly this on the

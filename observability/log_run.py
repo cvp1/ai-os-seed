@@ -30,6 +30,27 @@ from datetime import datetime, timezone
 import db
 import switches
 
+# The ledger's `host` column is the FLEET SLUG, never the raw hostname: on
+# {{REDACTED}} gethostname() is `iMac`, and until 2026-09-06 that split every
+# per-host query (94,271 `iMac` rows vs 44 `{{REDACTED}}` over 30d). Resolved
+# through _lib.fleet_host; if _lib is missing or broken we fall back to the raw
+# hostname rather than break the estate — this wrapper runs EVERY scheduled job.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from _lib import fleet_host as _fleet_host  # noqa: E402
+except Exception:  # noqa: BLE001
+    _fleet_host = None
+
+
+def _host() -> str:
+    try:
+        if _fleet_host is not None:
+            return _fleet_host.slug()
+    except Exception:  # noqa: BLE001
+        pass
+    return socket.gethostname()
+
+
 SUMMARY_MAX = 500      # chars stored for the first stdout line
 ERRTAIL_MAX = 2000     # chars stored for the stderr tail (any run that wrote one)
 
@@ -48,12 +69,48 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat(timespec="milliseconds")
 
 
-def _pump(src, dst, sink: list):
-    """Forward bytes from src to dst (live) while accumulating them for the row."""
+SINK_HEAD_MAX = 1 << 20     # bytes of a stream kept from the start
+SINK_TAIL_MAX = 64 << 10    # bytes kept from the end (error_tail lives here)
+
+
+class _Sink:
+    """Bounded accumulator for one stream (Principle 8, bug-bash 2026-09-08 A18).
+
+    Forwarding to the terminal stays live and unbounded; what is KEPT for the
+    runs.db row is the first SINK_HEAD_MAX bytes plus the last SINK_TAIL_MAX,
+    with the true total in `.total`. Before this every byte of a chatty job
+    was held in memory twice (list + join) until the row was written."""
+
+    def __init__(self):
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def add(self, chunk: bytes):
+        self.total += len(chunk)
+        room = SINK_HEAD_MAX - len(self.head)
+        if room > 0:
+            self.head += chunk[:room]
+            chunk = chunk[room:]
+        if chunk:
+            self.tail += chunk
+            if len(self.tail) > SINK_TAIL_MAX:
+                del self.tail[:len(self.tail) - SINK_TAIL_MAX]
+
+    def bytes(self) -> bytes:
+        if not self.tail:
+            return bytes(self.head)
+        elided = self.total - len(self.head) - len(self.tail)
+        marker = (b"\n... [%d bytes elided by log_run] ...\n" % elided) if elided > 0 else b""
+        return bytes(self.head) + marker + bytes(self.tail)
+
+
+def _pump(src, dst, sink):
+    """Forward bytes from src to dst (live) while accumulating a bounded copy."""
     for chunk in iter(lambda: src.readline(), b""):
         dst.buffer.write(chunk)
         dst.buffer.flush()
-        sink.append(chunk)
+        sink.add(chunk)
 
 
 def main() -> int:
@@ -78,14 +135,18 @@ def main() -> int:
         return 0
 
     started = _utc_now()
-    out_chunks: list = []
-    err_chunks: list = []
+    out_chunks = _Sink()
+    err_chunks = _Sink()
     exit_code = None
 
     # Hand the child a fresh file to append token usage to (it may ignore it).
     tokens_fd, tokens_path = tempfile.mkstemp(prefix="cc_obs_tok_")
     os.close(tokens_fd)
-    child_env = {**os.environ, TOKENS_ENV: tokens_path}
+    # CC_SCHEDULED_JOB is the positive "a supervised scheduled job" signal
+    # that _lib/mail.py and ontology/_sender require alongside systemd's
+    # INVOCATION_ID (2026-09-09: INVOCATION_ID alone let Corral panes -- an
+    # inherited environment under a systemd unit -- pass as scheduled).
+    child_env = {**os.environ, TOKENS_ENV: tokens_path, "CC_SCHEDULED_JOB": args.job}
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -109,11 +170,12 @@ def main() -> int:
     t_out.join(); t_err.join()
 
     finished = _utc_now()
-    stdout_b = b"".join(out_chunks)
-    stderr_b = b"".join(err_chunks)
+    stdout_b = out_chunks.bytes()
+    stderr_b = err_chunks.bytes()
     usage = _read_usage(tokens_path)
     _cleanup(tokens_path)
-    _record(args.job, started, finished, exit_code, stdout_b, stderr_b, usage)
+    _record(args.job, started, finished, exit_code, stdout_b, stderr_b, usage,
+            stdout_total=out_chunks.total, stderr_total=err_chunks.total)
     return exit_code if exit_code is not None else 1
 
 
@@ -157,7 +219,8 @@ def _cleanup(path):
         pass
 
 
-def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage):
+def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage,
+            stdout_total=None, stderr_total=None):
     """Insert one row; never raise into the caller — logging must not break jobs."""
     try:
         stdout_s = stdout_b.decode("utf-8", "replace")
@@ -191,8 +254,10 @@ def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage):
                     tokens_in, tokens_out, cost_usd, cache_read_tokens,
                     cache_creation_tokens, model)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job, socket.gethostname(), _iso(started), _iso(finished),
-                 duration_ms, exit_code, ok, len(stdout_b), len(stderr_b),
+                (job, _host(), _iso(started), _iso(finished),
+                 duration_ms, exit_code, ok,
+                 stdout_total if stdout_total is not None else len(stdout_b),
+                 stderr_total if stderr_total is not None else len(stderr_b),
                  summary, error_tail, tok_in, tok_out, cost, cache_read,
                  cache_creation, model),
             )

@@ -10,5 +10,14 @@
 !/PRINCIPLES-CORE.md
 !/ORIGINS.md
 !/audits/
+# Provider-connector import shims. Python cannot import a hyphenated directory,
+# and the connector pattern names the capability home `<provider>-connector/`
+# (MCP.md clause 1). Each shim is a SYMLINK to that directory, so `python3 -m
+# <provider>_connector` and `from <provider>_connector import dispatch` work
+# from the workspace root while all the code stays in the connector's own repo.
+# One tracked line per connector; no duplicated code. See _lib/CONNECTOR.md.
+!/google_connector
+!/proton_connector
+
 # Root-anchored tool config (outputDir points OUTSIDE the repo — story 002).
 !/playwright-mcp.config.json

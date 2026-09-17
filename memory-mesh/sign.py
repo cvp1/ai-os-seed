@@ -285,8 +285,25 @@ def main():
         print(f"signed {ev['id']} ({subject}) by {args.signer}")
     if supersedes:
         print(f"  supersedes: {', '.join(supersedes)}")
-    if promote_id:
-        reconcile_store(subject, approved_words=verbal["words"] if verbal else None)
+    # Reconcile the store on the CONDITION, not on the verb (2026-09-12).
+    #
+    # This was `if promote_id:` — so the store file was retagged only when a
+    # subject left quarantine via --promote. That is not how it happens in
+    # practice: of the 28 half-applied promotions found this day, 28 arrived by
+    # a signed `correct` superseding a quarantined lesson and ZERO by --promote.
+    # A rule keyed on one verb cannot see the others, and the drift it leaves is
+    # invisible to retrieval (the mesh is the serving authority) right up until
+    # something rebuilds from store frontmatter and reads Craig's own signed
+    # facts back as untrusted.
+    #
+    # So ask the store what it says. Any signature is Craig personally attesting
+    # this subject; if the file still calls that untrusted, the two surfaces
+    # disagree and this act is what resolves them — whichever verb got us here.
+    if subject.startswith("lesson/"):
+        slug = subject.split("/", 1)[1]
+        if promote_id or M.store_file_lineage(slug) == "contains-untrusted":
+            reconcile_store(subject,
+                            approved_words=verbal["words"] if verbal else None)
     return 0
 
 

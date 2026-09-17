@@ -146,6 +146,11 @@ def _repos() -> list:
     if (CC / ".git").is_dir():
         repos.append(CC)
     for child in sorted(CC.iterdir()):
+        # A symlinked dir is an import shim onto a real repo (google_connector
+        # -> google-connector/, 2026-09-16), not a second repo: following it
+        # reported every finding twice under two names.
+        if child.is_symlink():
+            continue
         if child.is_dir() and (child / ".git").is_dir():
             repos.append(child)
     return repos
@@ -256,6 +261,8 @@ def main() -> int:
     ap.add_argument("--days", type=int, default=DEFAULT_DAYS,
                     help=f"grace period before dirty/ahead pages (default {DEFAULT_DAYS})")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="behaviour checks on a scratch tree; no live repos touched")
     ap.add_argument("--root", metavar="PATH",
                     help="sweep root for this invocation, overriding CC_HYGIENE_ROOT "
                          "and the ~/{{REDACTED}} default — a CLI arg (not just the env "
@@ -273,6 +280,8 @@ def main() -> int:
                          "which reads problems() as data and never looks at this "
                          "exit code.")
     args = ap.parse_args()
+    if args.selftest:
+        return _selftest()
     if args.root:
         CC = Path(os.path.expanduser(args.root))
 
@@ -290,6 +299,33 @@ def main() -> int:
         tag = p["kind"].upper()
         print(f"[{tag:14}] {p['repo']}: {p['detail']}")
     return 0 if args.findings_exit0 else 1
+
+
+def _selftest() -> int:
+    """Behaviour, not source shape: build a scratch CC tree and assert what
+    _repos() enumerates. A symlinked dir onto a repo (an import shim) must not
+    appear as a second repo — it doubled every finding on 2026-09-16."""
+    global CC
+    import subprocess
+    import tempfile
+    fails = []
+    saved = CC
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "real").mkdir()
+            subprocess.run(["git", "init", "-q", str(root / "real")], check=True)
+            (root / "plain").mkdir()                       # dir, not a repo
+            (root / "shim").symlink_to("real", target_is_directory=True)
+            CC = root
+            names = sorted(p.name for p in _repos())
+            if names != ["real"]:
+                fails.append(f"enumeration: {names} != ['real']")
+            print(f"  {'FAIL' if fails else 'ok  '} symlinked shim is not a second repo ({names})")
+    finally:
+        CC = saved
+    print("repo_hygiene selftest: %s" % ("PASS" if not fails else "FAIL " + "; ".join(fails)))
+    return 1 if fails else 0
 
 
 if __name__ == "__main__":

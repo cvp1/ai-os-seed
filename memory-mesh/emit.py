@@ -20,9 +20,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import mesh_lib as M
 
-FACT_RX = M.re.compile(
-    r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\blocalhost:\d{2,5}\b")
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -70,13 +67,21 @@ def main():
                          "that refuses stumped or over-length lesson content. "
                          "Perpetuating a legacy stump adds no new loss; "
                          "minting one does — never use this for new content.")
+    ap.add_argument("--pointer", action="store_true",
+                    help="this lesson is a REFERENCE memory whose purpose is "
+                         "to point at a fact's home, so fact-shaped literals "
+                         "(an IP, a host:port) are admitted in its text. "
+                         "memory_write passes this for --type reference; no "
+                         "other caller should need it — a lesson that wants "
+                         "to state a fact points at the fact's home instead "
+                         "(one home per fact).")
     args = ap.parse_args()
 
-    # Fact-shape gate at the producer: a lesson carrying infrastructure
-    # literals without a home is a fact-copy being born (one home per fact).
-    if args.kind == "lesson" and FACT_RX.search(args.content) and not args.home:
-        sys.exit("emit: lesson carries fact literals but no --home pointer — "
-                 "put the fact in its home first, then point at it")
+    # The fact-shape gate used to sit here, over `--content` only, exempted by
+    # `--home`. It never looked at `--body`, which is where the 2026-09-13
+    # fact-copy actually was. It now lives in mesh_lib.make_event — the funnel
+    # every producer passes through — over content, hook AND body, with no
+    # home exemption. See mesh_lib.FACT_SHAPES.
 
     body = args.body
     if args.body_file:
@@ -151,7 +156,7 @@ def main():
         audience=args.audience, confidence=args.confidence,
         supersedes=supersedes, pin=args.pin, residency=args.residency,
         hook=hook, body=body, expires=args.expires,
-        carry_forward=args.carry_forward)
+        carry_forward=args.carry_forward, pointer=args.pointer)
 
     # Everything above is validation — make_event raises on a refused admission,
     # a bad schema or an oversized event, so reaching here means this event WOULD

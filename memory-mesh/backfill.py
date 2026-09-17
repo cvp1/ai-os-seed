@@ -64,7 +64,11 @@ def compose_content(slug, title, hook):
     desc = " ".join(m.group(1).strip().strip('"').split())
     if not desc:
         return None, "empty description:"
-    reject = M.admission_reject(desc)
+    # Both funnel refusals, pre-screened here so they land in the report
+    # instead of raising mid-batch: the index-line bound and (2026-09-16) the
+    # fact-shape gate — a legacy description restating an IP is exactly the
+    # copy the one-home rule exists to keep out of the always-on index.
+    reject = M.admission_reject(desc) or M.fact_refusal(desc)
     if reject:
         return None, reject
     return desc, ("unchanged" if desc == hook else

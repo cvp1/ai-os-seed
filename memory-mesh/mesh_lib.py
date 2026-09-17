@@ -98,6 +98,68 @@ HOOK_MAX_CHARS = 140
 # through the shared git transport, so this is a confidentiality boundary, not
 # a preference (SPEC v4 A2). family/host-private memories emit hook-only.
 BODY_AUDIENCES = {"operator", "shared"}
+# --- Fact-shape gate (2026-07-27, "one home per fact") -----------------------
+# Infrastructure facts (hosts, routes, endpoints, install state) have exactly
+# one home — FLEET.md, a CLAUDE.md, an OPS.md, the code — and memory POINTS at
+# it. A restated fact in memory is a drift liability: on 2026-07-27 a memory
+# asserting "no SSH key to .21 (Permission denied), verified" landed the same
+# afternoon Craig corrected the opposite in a sibling session.
+#
+# Until 2026-09-16 this lived ONLY in memory_write.py, over only what that door
+# wrote. emit.py carried its own two-pattern copy that looked at `--content`
+# alone and waved anything through on `--home`. So a lesson body carrying four
+# measured exit IPs entered through emit on 2026-09-13 with a home attached,
+# and no sanctioned door could later promote it into its store file, because
+# the stricter door refused text it had never been shown. The discriminator
+# now has ONE home, here, and make_event — the funnel every producer already
+# passes through — applies it to every text field of a lesson. memory_write
+# keeps a mirror and warns the moment it drifts (the HOOK_MAX_CHARS pattern).
+#
+# Surgical on purpose: an IPv4 literal is the strongest fact signal with
+# near-zero overlap with behavioral lessons; per fix-the-discriminator, widen
+# only on an observed miss, never speculatively. `0.0.0.0` is excluded by the
+# same rule in the other direction — it is the "all sources" CIDR idiom, not a
+# host, and it was an observed FALSE positive on 2026-09-16.
+FACT_SHAPES = [
+    (re.compile(r"\b(?!0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
+     "an IPv4 address"),
+    (re.compile(r"\blocalhost:\d{2,5}\b"), "a host:port endpoint"),
+    (re.compile(r"\bno ssh\b|\bssh (?:works|fails|key)\b|permission denied \(publickey\)",
+                re.I),
+     "an SSH reachability claim"),
+]
+FACT_HOMES = ("vault 00 Meta/Fleet/FLEET.md (hosts/reachability) · the owning "
+              "repo's CLAUDE.md/OPS.md/README (project facts) · the code itself "
+              "(policy/config)")
+
+
+def fact_shape(*texts):
+    """First (match, label) found in any text, else None."""
+    for t in texts:
+        for rx, label in FACT_SHAPES:
+            m = rx.search(t or "")
+            if m:
+                return m.group(0), label
+    return None
+
+
+def fact_refusal(content, hook=None, body=None):
+    """Why this lesson text may not enter the log, or None if it may.
+
+    The funnel (make_event) RAISES on this. The batch producers that mint
+    lesson content from legacy text — backfill.py, repair_from_description.py —
+    REPORT it in their refused list instead of dying mid-batch. Same
+    discriminator, same words, one home. Pairs with admission_reject(): that
+    one bounds the index line, this one keeps facts out of every field.
+    """
+    hit = fact_shape(content, hook, body)
+    if not hit:
+        return None
+    return (f"fact-shaped content ({hit[1]}: {hit[0]!r}) — memory stores "
+            f"behavior and pointers, never a second copy of an infrastructure "
+            f"fact (one home per fact). Put the fact in its home "
+            f"({FACT_HOMES}), then point at it; a reference memory passes "
+            f"pointer=True (emit --pointer).")
 
 # Audience visibility: which event audiences each view folds in.
 VIEW_INCLUDES = {"operator": {"operator", "shared"}, "family": {"family", "shared"}}
@@ -246,7 +308,8 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                lineage="operator-direct", audience="operator",
                confidence="inferred", supersedes=None, pin=False, ts=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
-               carry_forward=False, body_sha256=None, verbal_approval=None):
+               carry_forward=False, body_sha256=None, verbal_approval=None,
+               pointer=False):
     # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
     # this is the one place a stump can be refused before it becomes doctrine —
     # backfill.py was gated first and the same week five more stumps arrived
@@ -264,6 +327,21 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
         why = admission_reject(content)
         if why:
             raise ValueError(f"make_event refused {subject}: {why}")
+        # The fact-shape gate, at the funnel, over EVERY text field. Until
+        # 2026-09-16 only memory_write's door ran it, and only over what it
+        # wrote; emit.py's own copy checked `content` alone and exempted on
+        # `home`, so a body full of measured IPs entered on 2026-09-13 with a
+        # home pointer attached. A home justifies POINTING at a fact, not
+        # pasting it — there is no exemption here for having one.
+        #
+        # `pointer=True` is the reference-memory carve-out memory_write grants
+        # to `--type reference` (a memory whose whole job is to point at a
+        # fact's home). Carried as a per-call argument like carry_forward: the
+        # door that knows the memory's type asserts it, and nothing else can.
+        if not pointer:
+            why = fact_refusal(content, hook, body)
+            if why:
+                raise ValueError(f"make_event refused {subject}: {why}")
     ts = ts or datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     ev = {"id": event_id(HOST, session, ts, content, kind, subject), "ts": ts, "host": HOST,
           "session": session, "kind": kind, "subject": subject,
@@ -969,6 +1047,38 @@ def read_all_events(cwd=None):
     return events, problems
 
 
+def _contradiction_alarm(subj, evs, suffix=""):
+    """Word a parked contradiction by what ACTUALLY disagrees (2026-09-12).
+
+    Both callers used to hardcode "unsigned event contradicts SIGNED truth",
+    but neither trigger requires the dissenter to be unsigned: the test is
+    "some event here is signed AND the contents differ". On 2026-09-12 that
+    fired on a subject whose two contradicting events were BOTH signed by
+    Craig seven seconds apart — one promote had named an already-superseded
+    event id — and the message sent the diagnosis hunting for an unsigned
+    event that did not exist.
+
+    The two cases want different responses, so they get different words:
+      unsigned vs signed  the poisoned-session tripwire the rule was built for
+      signed vs signed    the operator signed two contradictory claims; no
+                          attacker needed, and the fix is to supersede one
+    Both can hold at once, and then both are said.
+    """
+    signed_contents = {e["content"] for e in evs if e.get("_signed")}
+    unsigned_contents = {e["content"] for e in evs if not e.get("_signed")}
+    parts = []
+    if unsigned_contents - signed_contents:
+        parts.append("unsigned event contradicts SIGNED truth")
+    if len(signed_contents) > 1:
+        parts.append(f"{len(signed_contents)} SIGNED events disagree "
+                     f"(operator signed contradictory claims — often a promote "
+                     f"naming an already-superseded event id; supersede the "
+                     f"stale one to clear)")
+    if not parts:                      # belt and braces: never a bare subject
+        parts.append("contradictory claims")
+    return f"{' AND '.join(parts)} on {subj}{suffix}"
+
+
 def fold_events(events, registry):
     """The deterministic rule pass. Returns a dict of fold results.
     Resolution is explicit (supersedes by id) — never temporal (invariant 4)."""
@@ -1112,12 +1222,14 @@ def fold_events(events, registry):
             parked[subj] = evs
             continue
         # LIVE as of v1.3 (was dormant while nothing signed): an operator-
-        # signed claim is truth; anything unsigned disagreeing with it parks
-        # AND alarms — that is the poisoned-session tripwire.
+        # signed claim is truth; anything disagreeing with it parks AND
+        # alarms — the poisoned-session tripwire, though as of 2026-09-12 the
+        # message no longer assumes the dissenter is unsigned (it may be a
+        # second signature; see _contradiction_alarm).
         signed = [e for e in evs if e.get("_signed")]
         if signed and len({e["content"] for e in evs}) > 1:
             parked[subj] = evs
-            alarms.append(f"unsigned event contradicts SIGNED truth on {subj}")
+            alarms.append(_contradiction_alarm(subj, evs))
     for e in events:
         if e.get("_badsig"):
             alarms.append(f"event {e['id']} carries a signature that DOES NOT "
@@ -1158,9 +1270,10 @@ def fold_events(events, registry):
             continue
         if len({e["content"] for e in evs}) > 1 and subj not in parked:
             parked[subj] = evs
-            alarms.append(f"unsigned event contradicts SIGNED truth on {subj} "
-                          f"(across kinds: "
-                          f"{', '.join(sorted({e['kind'] for e in evs}))})")
+            alarms.append(_contradiction_alarm(
+                subj, evs,
+                suffix=f" (across kinds: "
+                       f"{', '.join(sorted({e['kind'] for e in evs}))})"))
 
     parked_ids = {e["id"] for evs in parked.values() for e in evs}
     servable = [e for e in normalized
@@ -2111,6 +2224,27 @@ def write_harness_memory(fold, allow_residency_delta=False):
 
 _FRONT_LINEAGE = re.compile(r"^lineage:\s*(\S+)\s*$", re.M)
 
+
+def store_file_lineage(slug, store=None):
+    """The `lineage:` a store file ACTUALLY carries — the store's own answer.
+
+    Public because two callers need the same answer and got it from different
+    places until 2026-09-12: the fold's drift DETECTOR (below) and sign.py's
+    store reconciliation. sign.py used neither — it keyed reconciliation on the
+    --promote verb instead of on this condition, so every other path from
+    quarantined to served left the file tagged contains-untrusted forever
+    (28 subjects, all via signed `correct`; see store_quarantine_drift).
+
+    Returns the lineage string, "absent" for a file with no lineage line, or
+    None when there is no store file for this slug at all.
+    """
+    store = Path(store or store_dir())
+    p = store / f"{slug}.md"
+    if not p.exists():
+        return None
+    m = _FRONT_LINEAGE.search(p.read_text(encoding="utf-8", errors="replace"))
+    return m.group(1) if m else "absent"
+
 # The store's vocabulary for "the operator stands behind this" differs from the
 # mesh's (`craig-direct` vs `operator-direct`). Two names for one idea is itself
 # a seam, but renaming either side would rewrite 140 events or every memory file,
@@ -2140,11 +2274,7 @@ def store_quarantine_drift(fold, store=None):
     drift = []
 
     def file_lineage(slug):
-        p = store / f"{slug}.md"
-        if not p.exists():
-            return None
-        m = _FRONT_LINEAGE.search(p.read_text(encoding="utf-8", errors="replace"))
-        return m.group(1) if m else "absent"
+        return store_file_lineage(slug, store)
 
     # 1. Served by the mesh, still marked untrusted in the store.
     for subj in sorted(live_subjects):

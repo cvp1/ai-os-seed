@@ -1019,6 +1019,23 @@ def drill_14(m):
     check("14.15 non-lesson kinds are NOT gated (state/correct flow free)",
           (lambda: (M.make_event("assert", "s/t", "x" * 300, session="s",
                                  home="FLEET.md") and True))() is True)
+    # --- the fact-shape gate, moved to the funnel 2026-09-16: until then only
+    #     memory_write's door ran it, so a body could carry a fact-copy in
+    #     through emit with a home attached (the 2026-09-13 viewer-egress event)
+    check("14.23 a lesson BODY carrying an IP is REFUSED at the funnel, home or not",
+          _mk("clean content", home="corral/browser_ui.py",
+              body="exits 146.70.174.187 then 146.70.174.180") == "refused")
+    check("14.24 a home pointer does NOT exempt content — pointing is not pasting",
+          _mk("Envoy is at {{HOST_IP}}", home="FLEET.md") == "refused")
+    check("14.25 pointer=True admits a fact in a REFERENCE memory (memory_write --type reference)",
+          _mk("clean", body="Envoy is at {{HOST_IP}} — see FLEET.md", pointer=True) == "made")
+    check("14.26 carry_forward bypasses the fact gate too (retag never mints)",
+          _mk("clean", body="legacy {{HOST_IP}}", carry_forward=True) == "made")
+    check("14.27 0.0.0.0 is the all-sources idiom, not a host (false positive 2026-09-16)",
+          _mk("clean", body="never widen to 0.0.0.0/0") == "made")
+    check("14.28 fact_refusal REPORTS what the funnel raises (backfill/repair pre-screen)",
+          "fact-shaped" in (M.fact_refusal("at {{HOST_IP}}") or "")
+          and M.fact_refusal("clean") is None)
 
     # --- projection drift: all three classes, and the clean case
     droot = Path(m.root) / "dstore"; droot.mkdir()
