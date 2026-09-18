@@ -297,6 +297,37 @@ def fetch_peers():
     return notes, alarms
 
 
+def bodyless_promoted_rows(diff_text, store):
+    """Slugs the staged residency diff would publish that have NO body file in
+    `store` — i.e. index rows whose memory cannot be read on this host.
+
+    Residency and the store projection are two separate holds (this flag vs
+    `--project`), and one batch of peer events routinely stages both. Promoting
+    residency alone therefore publishes rows whose files were never
+    materialised here. Measured 2026-09-17: a 36-row promote went live while
+    all 36 bodies were missing, and nothing said so — the always-on hook text
+    still renders from the index, so only `/recall` saw the hole. The display
+    below is the only place an operator could have caught it (Principle 17: the
+    approval must show what is actually being approved).
+
+    Pure on purpose: `confirm_residency_promote` runs BEFORE the fold, so this
+    cannot consult the projection and must read the staged diff directly.
+    """
+    missing = []
+    for line in (diff_text or "").splitlines():
+        line = line.strip()
+        if not line.startswith("+ lesson/"):
+            continue
+        slug = line[len("+ lesson/"):].strip()
+        # Same path-safety stance as project_store: this is a subject string
+        # becoming a filesystem path, and the registry is not a trust boundary.
+        if not slug or "/" in slug or "\\" in slug or slug in (".", ".."):
+            continue
+        if not (store / f"{slug}.md").exists():
+            missing.append(slug)
+    return missing
+
+
 def confirm_residency_promote(assume_yes):
     """Show the staged residency change and get a real yes. Returns True to go.
 
@@ -324,6 +355,16 @@ def confirm_residency_promote(assume_yes):
     if live.exists() and staged.exists():
         a, b = len(live.read_bytes()), len(staged.read_bytes())
         print(f"\n  file: {a:,} B -> {b:,} B ({b - a:+,})")
+    bodyless = bodyless_promoted_rows(diff.read_text(encoding="utf-8"), store)
+    if bodyless:
+        print(f"\n  WARNING: {len(bodyless)} of these rows have NO body file on "
+              f"this host. They will publish as index rows whose memory cannot "
+              f"be read (/recall returns nothing). Materialise them with: "
+              f"fold.py --project")
+        for s in bodyless[:10]:
+            print(f"    - {s}")
+        if len(bodyless) > 10:
+            print(f"    … and {len(bodyless) - 10} more")
     if assume_yes:
         print("\n--yes: promoting without confirmation.")
         return True

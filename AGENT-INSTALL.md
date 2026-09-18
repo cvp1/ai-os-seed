@@ -102,7 +102,8 @@ Show, then run — fresh directory:
 
 Either way this copies the substrate (`_lib/`, `keyvault/`, `scheduler/`,
 `observability/`, `demo/`, `skills/`, `memory/`, `memory-mesh/`, `views/`,
-`PRINCIPLES.md`, the two `.template` reference files) into `<ROOT>`.
+`session-brief/`, `PRINCIPLES.md`, the two `.template` reference files)
+into `<ROOT>`.
 Without `--into` it refuses a non-empty target; with `--into` it refuses
 if a name it would write already exists there — the user's own content is
 never merged with or written over, and one collision stops the whole
@@ -118,12 +119,13 @@ error, stop.
 Show, then run, in order:
 
     python3 <ROOT>/_lib/selftest.py
+    python3 <ROOT>/session-brief/session_brief.py selftest
     python3 <ROOT>/observability/log_run.py --job hello_fleet -- python3 <ROOT>/demo/hello_fleet.py
     python3 <ROOT>/observability/log_run.py --job repo_hygiene -- python3 <ROOT>/observability/repo_hygiene.py --root <ROOT> --findings-exit0
     python3 <ROOT>/observability/report.py --job hello_fleet
     python3 <ROOT>/observability/freshness.py --all
 
-Expected: selftest passes; the demo prints one alive-line; repo_hygiene
+Expected: both selftests pass; the demo prints one alive-line; repo_hygiene
 prints nothing (a fresh `<ROOT>` starts clean — everything just got
 committed by nothing yet) or a `FINDINGS:` line if the user's own
 pre-existing content in an `--into` install has real drift; report shows

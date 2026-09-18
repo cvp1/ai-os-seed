@@ -58,7 +58,8 @@ except ImportError:  # non-POSIX (e.g. native Windows) — degrade to no lock, n
 HERE = Path(__file__).resolve().parent
 
 # What an install consists of — directories and files copied verbatim.
-COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "memory-mesh", "views"]
+COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "memory-mesh", "views",
+              "session-brief"]
 # Opt-in only (SEED-065): governance/ never ships via the default COMPONENTS
 # copy — a default `install.py --target <ROOT>` is byte-for-byte unchanged
 # by this wave. --enable-governance is the explicit "governance: none is
@@ -2324,7 +2325,10 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         if reason:
             problems.append(f"{link_rel}: {reason}")
 
-    runtime_writable_prefixes = ("observability/data/",)
+    # Paths a shipped tool writes INTO at runtime, by design: the run log and
+    # (SEED-079) the brief store /freeze and /capture fill. Content there is
+    # the user's, produced by using the system — never "unexpected".
+    runtime_writable_prefixes = ("observability/data/", "session-brief/briefs/")
     for live_p in sorted(target.rglob("*")):
         rel = live_p.relative_to(target).as_posix()
         if rel in checked_rel:

@@ -11,20 +11,25 @@ description: Answer "what do I know about X" or "have I dealt with Y
 # /recall — memory reaches the session
 
 Memory that nothing queries is a write-only diary. This skill searches the
-two sources this system actually has and answers with citations — never a
+three sources this system actually has and answers with citations — never a
 recalled fact stated as if it were common knowledge.
 
-## The two sources
+## The three sources
 
 1. **Memory notes** (`memory/*.md`, indexed by `memory/MEMORY.md`) — facts,
-   preferences, decisions, corrections recorded by `/improve` or by hand.
-   See `memory/CONVENTIONS.md` for the note format.
+   preferences, decisions, corrections recorded by `/improve`, `/capture`,
+   or by hand. See `memory/CONVENTIONS.md` for the note format.
 2. **Operational history** (`observability/report.py --json`, plus
    `observability/freshness.py --json` for current state) — the run log
    for every scheduled job: when it ran, whether it succeeded, what it said.
+3. **Session briefs** (`session-brief/briefs/*.md`, listed by
+   `session-brief/session_brief.py list`) — work-in-progress frozen by
+   `/freeze` or `/capture`: the goal, the decisions and why, what failed,
+   what's still open, the next action. The answer to "where did we leave
+   X" and "did we already try Y" lives here, not in memory notes.
 
 Nothing else. This system doesn't ship a vault, a wiki, or an embedding
-index — as your system grows past these two sources, add them here.
+index — as your system grows past these three sources, add them here.
 
 ## Procedure
 
@@ -43,10 +48,16 @@ index — as your system grows past these two sources, add them here.
    `observability/report.py --job <name> --json`,
    `--failures --json`, or `--since 7d --json` depending on the question.
    Read the actual rows; don't guess at what they'd say.
+3b. **Search the briefs** for a work-in-progress question ("where did we
+   leave X", "what did we try for Y", "what was the next step on Z"):
+   `session_brief.py list` for the goals, then grep the brief bodies —
+   the `Decisions and why`, `Paths tried that failed`, and `Next action`
+   sections carry the answer. Cite the brief id.
 4. **Rank and answer.** Lead with the most directly relevant fact. Cite
    what you found: the note's filename for a memory fact, the run's
    `started_at` + job name for an operational one. A recall without a
-   citation is indistinguishable from a guess — never give one.
+   citation is indistinguishable from a guess — never give one. For a
+   brief, the citation is its id (the filename) plus the section.
 5. **State what you did NOT find, plainly.** If the search comes up empty
    or partial, say so — "no memory note covers this" or "runs.db has no
    record before <date>" — rather than filling the gap with a plausible-

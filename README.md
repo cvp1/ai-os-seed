@@ -29,9 +29,12 @@ same session:
   can see it. This one can.
 - **A secrets vault** that's encrypted at rest, read at the point of use,
   and fails closed when locked — so credentials never land in a transcript.
-- **Four working verbs**: `/status` (one honest screen), `/improve` (a
+- **Six working verbs**: `/status` (one honest screen), `/improve` (a
   correction becomes durable memory), `/recall` (cited answers from your
-  own notes and run history), `/skill-center` (author your own).
+  own notes, run history and briefs), `/capture` (a session's decisions
+  and their *why*, filed where they'll be found), `/freeze` (unfinished
+  work becomes a brief any harness can resume), `/skill-center` (author
+  your own).
 - **A memory with a history** — corrections supersede instead of piling
   up, contradictions park loudly instead of one quietly winning, and
   `replay.py` reconstructs what your agent believed at any past moment.
@@ -127,7 +130,7 @@ Existing installs and `--into` stay as they are.
 Open Claude Code on that machine and paste this:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.7-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.8-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Default workspace is `~/aios`. Show me every command
 > before you run it.
@@ -156,7 +159,7 @@ this repo, never agent-transcribed.
 `AGENT-INSTALL.md` is written for an agent, but every step is a plain
 command. The short version:
 
-    git clone --branch v0.3.7-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
+    git clone --branch v0.3.8-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
     cd ~/tools/ai-os-seed
     python3 install.py --detect                      # read-only: any prior install?
 
@@ -210,12 +213,15 @@ seed's, and deleting it is your call.
 | `memory/` | two-tier memory scaffold — `MEMORY.md` index, one fact per note |
 | `memory-mesh/` | the layer underneath the notes: an append-only event log (plain git, your machine only) that folds into the index, parks contradictions instead of letting them coexist, and can replay the exact view your agent had at any past instant |
 | `skills/improve` | corrections and preferences you teach become durable memory notes |
-| `skills/recall` | "what do I know about X" over your notes and run history, with citations |
+| `skills/recall` | "what do I know about X" over your notes, run history and session briefs, with citations |
+| `skills/capture` | end-of-session write-back: decisions and their *why* routed to a memory note, your own notes, or a brief — the full loop `/improve` is half of |
+| `skills/freeze` | unfinished work becomes a session brief — goal, decisions, failed paths, next action — that any harness or model resumes cold |
+| `session-brief/` | the fifth transferable asset: the brief writer/reader, stdlib-only, bounded, every truncation reported |
 | `skills/status` | one honest screen answering "how is my system doing" — read-only, distrust-green by design |
 | `skills/skill-center` | authoring conventions plus a scaffold/audit tool, for the skills you build |
 | `views/weekly.py` | a weekly `NOW.md` derived from your own run history and git activity — "store facts, derive views," made concrete |
 
-The last six rows are **the cognitive spine**: the loop that makes this an
+The last nine rows are **the cognitive spine**: the loop that makes this an
 operating system rather than cron with logging. Jobs produce facts, facts
 become memory, memory makes the next session smarter.
 `memory/THE-LOOP.md` maps which piece serves which arrow.
