@@ -1,0 +1,7 @@
+[Unit]
+Description=memory-mesh fold — fetch peers, detect contradictions, materialize views
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/{{REDACTED}}/observability/log_run.py --job memory_fold -- /usr/bin/python3 %h/{{REDACTED}}/memory-mesh/fold.py
+TimeoutStartSec=180

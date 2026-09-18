@@ -130,7 +130,7 @@ Existing installs and `--into` stay as they are.
 Open Claude Code on that machine and paste this:
 
 > Set up AI-OS Seed for me. Clone
-> `https://github.com/cvp1/ai-os-seed` (tag `v0.3.8-alpha`) into
+> `https://github.com/cvp1/ai-os-seed` (tag `v0.4.0-alpha`) into
 > `~/tools/ai-os-seed`, then read `AGENT-INSTALL.md` inside the clone and
 > follow it exactly. Default workspace is `~/aios`. Show me every command
 > before you run it.
@@ -159,7 +159,7 @@ this repo, never agent-transcribed.
 `AGENT-INSTALL.md` is written for an agent, but every step is a plain
 command. The short version:
 
-    git clone --branch v0.3.8-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
+    git clone --branch v0.4.0-alpha https://github.com/cvp1/ai-os-seed ~/tools/ai-os-seed
     cd ~/tools/ai-os-seed
     python3 install.py --detect                      # read-only: any prior install?
 
@@ -296,7 +296,8 @@ change how your memory index is maintained. It copies your existing
 `MEMORY.md` to `MEMORY.md.pre-mesh`, backfills its entries into the event
 log, and from then on regenerates the index from that log — so it is no
 longer a file you edit by hand. Your notes and their content are kept;
-the *authoring* moves to `/improve` and `emit.py`. It is one marker file
+the *authoring* moves to `/improve` and the one door,
+`memory-mesh/memory_write.py`. It is one marker file
 to undo (`rm <store>/.mesh-generated`, restore the `.pre-mesh` copy), and
 if you'd rather keep hand-authored memory, skip Phase 5 step 3 entirely —
 everything else in the seed works without the mesh. Note also that the

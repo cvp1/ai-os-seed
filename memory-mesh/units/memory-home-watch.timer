@@ -1,0 +1,10 @@
+[Unit]
+Description=memory-mesh home watch hourly (edge-triggered; silent in steady state)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

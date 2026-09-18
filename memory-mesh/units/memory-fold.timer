@@ -1,0 +1,10 @@
+[Unit]
+Description=memory-mesh fold every 5 minutes (floor; emit nudges ride on top)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

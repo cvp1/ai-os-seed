@@ -21,6 +21,13 @@
 
   This file is a scaffold: empty on install. Your agent (or you) populate
   it as you go — see memory/CONVENTIONS.md and skills/improve/SKILL.md.
+
+  AFTER THE MESH IS BOOTSTRAPPED (Phase 5) this file stops being yours to
+  edit: the fold REGENERATES it from the event log every five minutes and
+  stamps a GENERATED header on it. Anything you type here after that point
+  is overwritten within minutes and lost. Write through the one door
+  instead — memory-mesh/memory_write.py, relative to your workspace root —
+  and the fold projects it here.
 -->
 
 # Memory

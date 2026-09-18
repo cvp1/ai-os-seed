@@ -32,7 +32,8 @@ that wrong" and "it was working from what it knew at the time.")
   else stands on.
 - **runs.db → operator** (`/status`) — the one-verb answer to "how is my
   system doing", read-only, distrust-green by default.
-- **incident → memory** (`/improve` → `memory-mesh/emit.py`) — a
+- **incident → memory** (`/improve` → `memory-mesh/memory_write.py`
+  → event log) — a
   correction or a taught lesson this session becomes an *event* appended
   to the log, not something re-explained next time. Once the mesh is
   bootstrapped, `MEMORY.md` is regenerated from that log by the fold

@@ -1,17 +1,21 @@
 {
-  "_comment": "Expected cadence for each SCHEDULED job. freshness.py flags a job as STALE if its newest run is older than max_age, MISSING if it has never run, or FAILING if its newest run exited non-zero. Only list jobs actually scheduled in scheduler/manifest.yml; max_age = the real interval plus slack for a missed beat. Durations: Nd / Nh / Nm. Ships pre-seeded with the demo job (SEED-017, opt-in via --enable-demo) and two jobs that are on by default: the repo-hygiene sweep (SEED-070) and the freshness backstop itself (SEED-074) — add an entry here for every real job you schedule.",
-  "jobs": {
-    "hello_fleet": {
-      "max_age": "20m",
-      "label": "hello-fleet demo heartbeat (every 15 min)"
-    },
-    "repo_hygiene": {
-      "max_age": "26h",
-      "label": "repo-hygiene sweep (daily 06:30) — dirty/unpushed/missing-remote drift"
-    },
-    "freshness": {
-      "max_age": "26h",
-      "label": "freshness backstop (daily 07:15) — this checker's own heartbeat"
-    }
+ "_comment": "Expected cadence for each SCHEDULED job. freshness.py flags a job as STALE if its newest run is older than max_age, MISSING if it has never run, or FAILING if its newest run exited non-zero. Only list jobs actually scheduled in scheduler/manifest.yml; max_age = the real interval plus slack for a missed beat. Durations: Nd / Nh / Nm. Ships pre-seeded with the demo job (SEED-017, opt-in via --enable-demo) and two jobs that are on by default: the repo-hygiene sweep (SEED-070) and the freshness backstop itself (SEED-074) \u2014 add an entry here for every real job you schedule.",
+ "jobs": {
+  "hello_fleet": {
+   "max_age": "20m",
+   "label": "hello-fleet demo heartbeat (every 15 min)"
+  },
+  "repo_hygiene": {
+   "max_age": "26h",
+   "label": "repo-hygiene sweep (daily 06:30) \u2014 dirty/unpushed/missing-remote drift"
+  },
+  "freshness": {
+   "max_age": "26h",
+   "label": "freshness backstop (daily 07:15) \u2014 this checker's own heartbeat"
+  },
+  "mesh_watch": {
+   "max_age": "2h",
+   "label": "memory-mesh watch (hourly :25) \u2014 fold liveness, index age, hook wiring, peers; the fold's timer is outside the scheduler, so this is the only thing that would notice it stopping"
   }
+ }
 }

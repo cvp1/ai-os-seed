@@ -34,6 +34,7 @@ docs/install-audit.md for the full design and its stated residuals.
 """
 import argparse
 import contextlib
+import difflib
 import filecmp
 import hashlib
 import json
@@ -116,6 +117,22 @@ JOB_FRESHNESS = """\
 """
 
 
+# SEED-080 M6: the fold runs on its own systemd/launchd timer, outside the
+# scheduler entirely — so nothing in runs.db would ever notice it stopping.
+# This job is the outside observer (PRINCIPLES 21): it runs UNDER the
+# scheduler, so its own liveness is covered by the freshness backstop, and it
+# reports on the fold, the served index, the approved hook wiring and the
+# peers. Default-on for the same reason repo_hygiene is: a memory system that
+# cannot report its own breakage is worse than none, because it is trusted.
+JOB_MESH_WATCH = """\
+  - name: mesh_watch
+    schedule: "25 * * * *"
+    command: >-
+      /usr/bin/python3 {root}/observability/log_run.py --job mesh_watch --
+      /usr/bin/python3 {root}/memory-mesh/fold_watch.py
+"""
+
+
 def _add_job(manifest: Path, job_name: str, block: str) -> bool:
     """Add one job's YAML block to scheduler/manifest.yml, idempotently.
     Comment-excluded, EXACT line match (not startswith — a job named e.g.
@@ -150,7 +167,8 @@ def _add_job(manifest: Path, job_name: str, block: str) -> bool:
 CC_SEED_DIR = ".cc-seed"
 RECEIPT_NAME = "receipt.json"
 STAGED_DIR = "staged"
-GATED_WRITES = {"claude-md", "mesh-bootstrap", "import-pack"}
+GATED_WRITES = {"claude-md", "mesh-bootstrap", "import-pack", "memory-hooks"}
+REVOCABLE_WRITES = {"memory-hooks"}
 MARKER_START = "<!-- cc-seed:start -->"
 MARKER_END = "<!-- cc-seed:end -->"
 _MAX_HASH_BYTES = 200 * 1024 * 1024  # Principle 8: bound the loop — don't hash unbounded files
@@ -718,6 +736,70 @@ def install(target: Path, into: bool = False):
     return 0
 
 
+# --- SEED-080: registration is decided by ORIGIN, not by name ---------------
+# A recipient who already runs these skills at USER scope (~/.claude/skills)
+# is the normal case on a fleet host, and registering a second project-scoped
+# copy of the same file is how two doors appear. Name alone cannot tell "the
+# same skill, already installed" from "a different skill that happens to
+# share a name", and a --defer flag cannot either: a flag has to be remembered
+# on every host, and that remembering is exactly what failed here in the week
+# this was written. So the question the installer asks is about ORIGIN: is the
+# file at user scope the same body as the one we ship?
+#
+# Same body  -> DEFER. Record it; register nothing; the user-scope copy wins.
+# Different  -> REFUSE, loudly, naming BOTH paths. Never overwrite, never
+#               silently shadow: the operator decides which one is theirs.
+# Absent     -> register, exactly as before.
+#
+# The hash is computed at install time from both files. Nothing is injected
+# into the shipped SKILL.md to carry it: a fleet copy has no such field to
+# read, so every fleet --update would hit the refuse branch, and injecting one
+# would break the byte-identical property that makes the seed copy and the
+# fleet copy one file rather than two.
+def _body_sha(path: Path) -> str:
+    """Identity of a skill's text, insensitive to trailing-newline churn."""
+    try:
+        return _sha256_bytes(path.read_bytes().replace(b"\r\n", b"\n").rstrip() + b"\n")
+    except OSError:
+        return ""
+
+
+def _user_scope_skill(name: str) -> Path:
+    return Path.home() / ".claude" / "skills" / name / "SKILL.md"
+
+
+def _origin_verdict(name: str, canonical: Path):
+    """Return (verdict, user_path, sha) — 'register' | 'defer' | 'refuse'."""
+    user = _user_scope_skill(name)
+    if not user.exists():
+        return "register", user, ""
+    ours, theirs = _body_sha(canonical), _body_sha(user)
+    if ours and ours == theirs:
+        return "defer", user, ours
+    return "refuse", user, theirs
+
+
+def _apply_origin_rule(name: str, canonical: Path, deferred: list) -> bool:
+    """True if the caller should go on to register this skill."""
+    verdict, user, sha = _origin_verdict(name, canonical)
+    if verdict == "register":
+        return True
+    if verdict == "defer":
+        deferred.append({"name": name, "user_path": str(user), "body_sha": sha,
+                         "at": _now()})
+        print(f"skill {name!r}: already installed at user scope with the SAME body "
+              f"({user}) — deferring to it, registering nothing here.")
+        return False
+    print(f"skill {name!r}: REFUSING to register — a DIFFERENT skill of this name "
+          f"is installed at user scope.\n"
+          f"  user scope: {user}\n"
+          f"  this seed:  {canonical}\n"
+          f"  Neither is overwritten and neither is shadowed. Compare them and "
+          f"keep the one you mean; re-run once they agree or one is renamed.",
+          file=sys.stderr)
+    return False
+
+
 def _iter_skill_dirs(skills_root: Path):
     """Yield (name, canonical SKILL.md path) for each real skill under a
     skills/ tree — a directory containing SKILL.md, not a shared doc like
@@ -737,6 +819,48 @@ def _shipped_skill_names() -> list:
     return [name for name, _ in _iter_skill_dirs(HERE / "skills")]
 
 
+def _record_deferred(target: Path, deferred: list):
+    """Deferrals go in the receipt so --audit can re-check them. A deferral is
+    a live dependency on a file OUTSIDE this install: if the user-scope twin
+    is edited later, this install is quietly running a skill it never saw."""
+    if not deferred:
+        return
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return
+    existing = {d["name"]: d for d in receipt["install"].get("deferred_skills", [])}
+    for d in deferred:
+        existing[d["name"]] = d
+    receipt["install"]["deferred_skills"] = [existing[k] for k in sorted(existing)]
+    _save_receipt(target, receipt)
+
+
+def _verify_deferred_skills(target: Path, receipt: dict) -> list:
+    """Re-run the origin question at audit time, against the file as it is
+    NOW. Recorded-and-forgotten is the failure mode: the twin was the same
+    body once, which says nothing about today."""
+    problems = []
+    for d in receipt.get("install", {}).get("deferred_skills", []) or []:
+        name, user = d["name"], Path(d["user_path"])
+        canonical = target / "skills" / name / "SKILL.md"
+        if not user.exists():
+            problems.append(f"skills/{name}: deferred to {user}, which is GONE — this "
+                            f"install now has no {name} skill registered at all")
+            continue
+        if not canonical.exists():
+            problems.append(f"skills/{name}: deferred, but this install no longer ships it")
+            continue
+        now = _body_sha(user)
+        if now != d.get("body_sha"):
+            problems.append(f"skills/{name}: the user-scope twin at {user} has CHANGED "
+                            f"since the deferral ({d.get('body_sha','')[:12]} -> {now[:12]}) "
+                            f"— re-read it, or re-run the install to re-decide")
+        elif now != _body_sha(canonical):
+            problems.append(f"skills/{name}: the SHIPPED copy has changed since the "
+                            f"deferral — the user-scope twin is now a different skill")
+    return problems
+
+
 def _register_new_skills(target: Path) -> list:
     """SEED-076's --update calls this, never _register_skills(): that
     function's own docstring says its assertion is a fresh-install-only
@@ -753,10 +877,15 @@ def _register_new_skills(target: Path) -> list:
     overwrite. Returns the list of NEWLY registered skill names."""
     claude_skills = target / ".claude" / "skills"
     registered, conflicts = [], []
+    deferred = []
     for name, canonical in _iter_skill_dirs(target / "skills"):
         link_dir = claude_skills / name
         link = link_dir / "SKILL.md"
         want_target = os.path.relpath(canonical, link_dir)
+        if link.is_symlink() and os.readlink(link) == want_target:
+            continue  # already correctly registered — the origin rule is for NEW links
+        if not _apply_origin_rule(name, canonical, deferred):
+            continue
         if link.is_symlink() and os.readlink(link) == want_target:
             continue  # already correctly registered — nothing to do
         if link.exists() or link.is_symlink():
@@ -768,6 +897,7 @@ def _register_new_skills(target: Path) -> list:
     if conflicts:
         print(f"update: {len(conflicts)} skill link(s) exist but don't point where expected — "
              f"left alone, review by hand: {', '.join(conflicts)}", file=sys.stderr)
+    _record_deferred(target, deferred)
     return registered
 
 
@@ -792,15 +922,19 @@ def _register_skills(target: Path) -> list:
     Returns the list of registered skill names."""
     claude_skills = target / ".claude" / "skills"
     registered = []
+    deferred = []
     for name, canonical in _iter_skill_dirs(target / "skills"):
         link_dir = claude_skills / name
         link = link_dir / "SKILL.md"
+        if not _apply_origin_rule(name, canonical, deferred):
+            continue
         assert not (link.exists() or link.is_symlink()), (
             f"{link} already exists — install()'s pre-write collision check "
             f"should have refused this install before skills/ was written")
         link_dir.mkdir(parents=True, exist_ok=True)
         link.symlink_to(os.path.relpath(canonical, link_dir))
         registered.append(name)
+    _record_deferred(target, deferred)
     return registered
 
 
@@ -824,8 +958,10 @@ def _install_default_jobs(target: Path) -> list:
     present, e.g. a repeat run somehow reached this point)."""
     manifest = target / "scheduler" / "manifest.yml"
     installed = []
-    for name, block in (("repo_hygiene", JOB_REPO_HYGIENE),
-                        ("freshness", JOB_FRESHNESS)):
+    jobs = [("repo_hygiene", JOB_REPO_HYGIENE), ("freshness", JOB_FRESHNESS)]
+    if (target / "memory-mesh" / "fold_watch.py").exists():
+        jobs.append(("mesh_watch", JOB_MESH_WATCH))
+    for name, block in jobs:
         if _add_job(manifest, name, block.format(root=target)):
             installed.append(name)
     return installed
@@ -1001,6 +1137,8 @@ def approve(target: Path, which: str, from_pack: str = None, replace: bool = Fal
                    f"installed with this install.py?")
     if which == "claude-md":
         return _approve_claude_md(target, receipt)
+    if which == "memory-hooks":
+        return _approve_memory_hooks(target, receipt)
     if which == "import-pack":
         return _approve_import_pack(target, receipt, from_pack, replace, tag,
                                      allowed_signers, allow_unsigned)
@@ -1088,6 +1226,174 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     if store:
         print(f"memory store: {store}")
     return 0
+
+
+# --- SEED-080: --approve memory-hooks ---------------------------------------
+# The mesh ships five hooks and, until this verb, wired none of them: the
+# retrieval channel sat inert and the one-door rule was prose. Wiring a hook
+# is self-modification of the agent's own harness, so it is a gated write with
+# a human at the gate — shown as an exact settings.json diff, applied in the
+# same step that records it, and REVOCABLE: --revoke memory-hooks removes
+# exactly the entries this recorded, restoring the prior bytes. An approval
+# with no undo is a trap, not a gate.
+MEMORY_HOOKS = [
+    # (event, matcher or None, command tail relative to the install root)
+    ("UserPromptSubmit", None, "memory-mesh/retrieve.py"),
+    ("PostToolUse", "Read|Grep|Glob|Bash", "memory-mesh/retrieve.py"),
+    ("PreToolUse", "Write|Edit|MultiEdit|NotebookEdit|Bash",
+     "memory-mesh/hooks/memory-write-guard.py"),
+    ("PreToolUse", "Bash|Write|Edit", "memory-mesh/hooks/memory-fresh.py"),
+    ("SessionStart", None, "memory-mesh/hooks/session_provenance.py record --event SessionStart"),
+    ("PreToolUse", "WebFetch|WebSearch|Bash|mcp__.*",
+     "memory-mesh/hooks/session_provenance.py record --event PreToolUse"),
+    ("Stop", None, "memory-mesh/capture_nudge.py"),
+]
+
+
+def _memory_hook_entries(target: Path) -> dict:
+    """The settings.json fragment this verb writes, with absolute paths into
+    THIS install — a relative hook command resolves against the agent's cwd,
+    which is not a promise any harness makes."""
+    out = {}
+    for event, matcher, tail in MEMORY_HOOKS:
+        parts = tail.split(" ", 1)
+        cmd = f"{sys.executable} {target / parts[0]}"
+        if len(parts) > 1:
+            cmd += " " + parts[1]
+        entry = {"hooks": [{"type": "command", "command": cmd}]}
+        if matcher:
+            entry["matcher"] = matcher
+        out.setdefault(event, []).append(entry)
+    return out
+
+
+def _settings_path(target: Path) -> Path:
+    return target / ".claude" / "settings.json"
+
+
+def _approve_memory_hooks(target: Path, receipt: dict) -> int:
+    mesh = target / "memory-mesh"
+    missing = [t.split(" ")[0] for _, _, t in MEMORY_HOOKS
+               if not (target / t.split(" ")[0]).exists()]
+    if not mesh.is_dir() or missing:
+        return die(f"memory-mesh hook files are missing from {target}: "
+                   f"{', '.join(sorted(set(missing))) or mesh} — run the install "
+                   f"(and --approve mesh-bootstrap) before wiring hooks.")
+    settings = _settings_path(target)
+    before = settings.read_bytes() if settings.exists() else b""
+    try:
+        doc = json.loads(before) if before.strip() else {}
+    except ValueError as e:
+        return die(f"{settings} is not valid JSON ({e}) — refusing to touch it.")
+    adding = _memory_hook_entries(target)
+    hooks = doc.setdefault("hooks", {})
+    already = json.dumps(hooks)
+    for event, entries in adding.items():
+        bucket = hooks.setdefault(event, [])
+        for entry in entries:
+            if entry["hooks"][0]["command"] in already:
+                continue
+            bucket.append(entry)
+    after = (json.dumps(doc, indent=2) + "\n").encode()
+    if after == before:
+        print("memory hooks already wired — nothing to do.")
+        return 0
+    print(f"--- {settings} (before)\n+++ {settings} (after)")
+    for line in difflib.unified_diff(
+            before.decode("utf-8", "replace").splitlines(),
+            after.decode().splitlines(), lineterm="", n=2):
+        print(line)
+    print(f"\n{len([e for v in adding.values() for e in v])} hook entr(ies): retrieval "
+          f"on every turn, the write guard, the staleness guard, session provenance "
+          f"and the capture nudge.")
+    if not _confirm_hook_write():
+        print("not written.")
+        return 1
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write(settings, after)
+    receipt.setdefault("gated_writes", {})["memory-hooks"] = {
+        "approved_at": _now(), "written": True,
+        "entries": {k: [e["hooks"][0]["command"] for e in v] for k, v in adding.items()},
+        "prior_sha": _sha256_bytes(before), "prior_bytes": before.decode("utf-8", "replace"),
+        "after_sha": _sha256_bytes(after),
+    }
+    _save_receipt(target, receipt)
+    print(f"memory hooks approved and written to {settings}; recorded in the receipt.")
+    print("M1 (one door, enforced) and M4 (memory reaches the session) do not hold "
+          "without these — check with: install.py --target ... --contract")
+    return 0
+
+
+def _confirm_hook_write() -> bool:
+    """CI applies the SAME staged diff non-interactively through the existing
+    --approve/--apply shape; it never gets a new --yes flag, because a flag
+    that means "skip the human" is one typo away from being passed by a human."""
+    if os.environ.get("CI") == "true" and "--apply" in sys.argv:
+        print("CI=true with --apply — applying the staged diff non-interactively.")
+        return True
+    try:
+        return input("write these entries? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def revoke(target: Path, which: str) -> int:
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"no receipt at {target} — nothing to revoke.")
+    record = (receipt.get("gated_writes") or {}).get(which)
+    if not record:
+        return die(f"{which!r} was never approved on this install — nothing to revoke.")
+    if which != "memory-hooks":
+        return die(f"{which!r} is not revocable.")
+    settings = _settings_path(target)
+    if not settings.exists():
+        return die(f"{settings} is gone — nothing to remove.")
+    before = settings.read_bytes()
+    doc = json.loads(before)
+    recorded = {cmd for cmds in record.get("entries", {}).values() for cmd in cmds}
+    hooks = doc.get("hooks", {})
+    for event in list(hooks):
+        kept = [e for e in hooks[event]
+                if not any(h.get("command") in recorded for h in e.get("hooks", []))]
+        if kept:
+            hooks[event] = kept
+        else:
+            del hooks[event]
+    if not hooks:
+        doc.pop("hooks", None)
+    after = (json.dumps(doc, indent=2) + "\n").encode()
+    print(f"--- {settings} (before)\n+++ {settings} (after)")
+    for line in difflib.unified_diff(
+            before.decode("utf-8", "replace").splitlines(),
+            after.decode().splitlines(), lineterm="", n=2):
+        print(line)
+    if not _confirm_hook_write():
+        print("not written.")
+        return 1
+    _atomic_write(settings, after)
+    receipt["gated_writes"][which] = dict(
+        record, revoked_at=_now(), written=False,
+        revoked_sha=_sha256_bytes(after))
+    _save_receipt(target, receipt)
+    print(f"{which} revoked — {len(recorded)} recorded entr(ies) removed from {settings}.")
+    return 0
+
+
+def contract(target: Path, harness: str = None) -> int:
+    """Run the six-property memory contract against this install."""
+    test = target / "memory-mesh" / "contract_test.py"
+    if not test.exists():
+        return die(f"{test} not found — this install has no memory mesh to check.")
+    argv = [sys.executable, str(test)]
+    if harness:
+        argv += ["--harness", harness]
+    elif shutil.which("claude"):
+        argv += ["--harness", "claude"]
+    else:
+        print("no harness on PATH — running the script half; the harness-turn "
+              "properties will report SKIP, which is not a pass.")
+    return subprocess.run(argv).returncode
 
 
 # --- SEED-072 (2026-08-09): human-applied exact-diff proposal loop ---------
@@ -2313,6 +2619,12 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         if reason:
             problems.append(f"{f}: {reason}")
 
+    problems.extend(_verify_deferred_skills(target, receipt))
+    for d in receipt["install"].get("deferred_skills", []) or []:
+        # A deferred skill has no project-scope link BY DESIGN — don't let the
+        # unexpected-path sweep below report its absence as drift.
+        checked_rel.add(f".claude/skills/{d['name']}")
+
     registered_skills = receipt["install"].get("registered_skills", [])
     if registered_skills:
         checked_rel.add(".claude")
@@ -2337,6 +2649,15 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             continue  # install.py's own receipt/staged scaffold
         if rel == "CLAUDE.md":
             continue  # owned by check 3
+        if rel in (".claude", ".claude/settings.json") and \
+                (receipt.get("gated_writes") or {}).get("memory-hooks"):
+            # SEED-080: settings.json is not shipped and is not baseline — it
+            # is the product of an approved gated write, and the receipt says
+            # so. Reporting it as UNEXPECTED taught the operator to ignore an
+            # UNEXPECTED line, which is the one line that must never become
+            # background noise. The entries themselves are checked by
+            # memory-mesh/fold_watch.py against that same record.
+            continue
         if "__pycache__" in rel.split("/") or rel.endswith((".pyc", ".pyo")):
             continue  # bytecode cache — a harmless side effect of running any shipped .py tool
         if any(rel == p.rstrip("/") or rel.startswith(p) for p in runtime_writable_prefixes):
@@ -3250,6 +3571,22 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
 
             _apply_update(target, receipt, new_tree, plan, new_snap)
             newly_registered = _register_new_skills(target)
+            # SEED-080 (the SEED-076 receipt-audit bug): --update refreshed
+            # receipt["shipped"] but never extended install.components or
+            # install.registered_skills — and _check_1 enumerates from exactly
+            # those two fields. A component that arrived by update was
+            # therefore never audited: not compared against the package, and
+            # (worse) reported as an unexpected path by the sweep at the end.
+            # Silent, and it got quieter the more the seed grew.
+            comps = receipt["install"].setdefault("components", [])
+            for rel in sorted(set(plan["create"]) | set(plan["update"])):
+                top = rel.split("/", 1)[0]
+                if top in COMPONENTS and top not in comps:
+                    comps.append(top)
+            regs = receipt["install"].setdefault("registered_skills", [])
+            for name in newly_registered:
+                if name not in regs:
+                    regs.append(name)
             updates = receipt.get("updates") or []
             updates.append({
                 "at": _now(), "from_version": current_version, "to_version": new_version,
@@ -3357,6 +3694,14 @@ def main():
                     help="SEED-077: apply ALL staged proposals through the same per-item "
                          "guards as --apply-proposal; refusals are skipped and reported, "
                          "exit is nonzero if any item was refused")
+    ap.add_argument("--revoke", choices=sorted(REVOCABLE_WRITES),
+                    help="undo a gated write, removing exactly the entries its "
+                         "approval recorded and restoring the prior shape")
+    ap.add_argument("--contract", action="store_true",
+                    help="run memory-mesh/contract_test.py against this install "
+                         "(the six properties that define 'the memory works')")
+    ap.add_argument("--harness", choices=["claude", "codex", "grok"],
+                    help="with --contract: also run the harness half against this CLI")
     ap.add_argument("--update", action="store_true",
                     help="SEED-076: check this install against the latest published cc-seed "
                          "content (pinned to an immutable release tag — never a mutable "
@@ -3397,12 +3742,12 @@ def main():
                  args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
                  bool(args.apply_proposal), bool(args.revert_proposal),
                  args.review_proposals, args.apply_proposals, args.update,
-                 args.adopt_baseline]
+                 args.adopt_baseline, bool(args.revoke), args.contract]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
                    "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
                    "--revert-proposal, --review-proposals, --apply-proposals, --update, "
-                   "and --adopt-baseline are mutually exclusive")
+                   "--adopt-baseline, --revoke and --contract are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.confirm and not args.apply_proposal:
@@ -3427,11 +3772,17 @@ def main():
         return die("--approve import-pack requires --from-pack <path>")
     if args.update_from and not args.update:
         return die("--from only applies to --update")
-    if args.apply and not args.update:
-        return die("--apply only applies to --update")
+    if args.apply and not (args.update or args.approve):
+        return die("--apply only applies to --update and --approve")
+    if args.harness and not args.contract:
+        return die("--harness only applies to --contract")
     if args.allow_downgrade and not args.update:
         return die("--allow-downgrade only applies to --update")
 
+    if args.contract:
+        return contract(target, args.harness)
+    if args.revoke:
+        return revoke(target, args.revoke)
     if args.update:
         return do_update(target, args.update_from, args.apply, args.allow_downgrade)
     if args.adopt_baseline:

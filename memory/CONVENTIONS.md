@@ -13,6 +13,23 @@ a note filed from the wrong cwd silently lands in a different store and
 won't show up next time you ask from this one. Confirm the real path with
 your agent at first use; don't assume.
 
+**After the mesh is bootstrapped** (Phase 5), two of the rules below change
+shape and one becomes load-bearing:
+
+- `MEMORY.md` is no longer a file anyone edits. The fold regenerates it from
+  the event log every five minutes; it carries a `GENERATED` header, and a
+  hand edit is overwritten within minutes.
+- Every write goes through the one door, `memory-mesh/memory_write.py`,
+  relative to your workspace root — not a text editor, not a shell redirect,
+  not `emit.py` (that is the emitter the door calls). The door is what sets
+  `lineage:` honestly, which is the boundary that keeps a memory poisoned by
+  a web page or an email from being served back as your own standing rule.
+- Re-teaching a subject SUPERSEDES the old wording rather than adding a
+  second note that disagrees with the first.
+
+Before the bootstrap, everything below is simply how you and your agent keep
+the files by hand.
+
 ## One fact per file
 
 Each note is its own file, named for what it's about (kebab-case, e.g.

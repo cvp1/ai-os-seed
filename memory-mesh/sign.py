@@ -34,8 +34,7 @@ def append(ev, line):
         M.git("commit", "-q", "-m", f"sign {ev['kind']} {ev['subject']} {ev['id']}")
 
 
-MEMORY_WRITE = Path(os.path.expanduser(
-    "~/.claude/skills/improve/memory_write.py"))
+MEMORY_WRITE = Path(__file__).resolve().parent / "memory_write.py"
 
 
 def reconcile_store(subject, approved_words=None):

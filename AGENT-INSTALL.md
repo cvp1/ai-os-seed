@@ -238,6 +238,42 @@ Nothing here to run. Skip to Phase 6. Principle 17 in `PRINCIPLES.md` — show
 what you're asking to approve — still stands; it was the doctrine that was
 right and the enforcement that was not.
 
+## Phase 5.6 — Wire the memory hooks (required, or memory is half-installed)
+
+The mesh ships five hooks and wires none of them until someone approves it.
+Until they are wired:
+
+- nothing reads memory back into a turn — the corpus grows and is never
+  served, which is a write-only diary;
+- the one-door rule is prose. Any tool call can write into the store
+  directly, which is the boundary that keeps a memory poisoned by an email
+  or a fetched page from coming back as a standing rule.
+
+Wiring a hook is self-modification of the agent's own harness, so it is a
+gated write with a human at the gate. Show the user this command and have
+**them** run it:
+
+    python3 install.py --target <ROOT> --approve memory-hooks
+
+It prints the exact `settings.json` diff first and writes nothing until they
+answer `y`. It records the entries and the prior bytes in the receipt, so
+`--revoke memory-hooks` puts it back exactly:
+
+    python3 install.py --target <ROOT> --revoke memory-hooks
+
+Then prove it, rather than declaring it:
+
+    python3 install.py --target <ROOT> --contract
+
+That runs the six properties that define a working memory — one door, one
+store, the fold projects, it reaches the session, recall cites, it reports
+its own breakage — against a disposable copy of this install. It never
+touches the real store, and it says so per run. A property it could not
+attempt reports SKIP by name; a SKIP is not a pass.
+
+If the user declines the hooks, say plainly which properties do not hold
+(M1's enforcement and M4) and move on — the rest of the install stands.
+
 ## Phase 6 — First win (scheduling for real)
 
 `repo_hygiene` is already in `<ROOT>/scheduler/manifest.yml` — Phase 2's

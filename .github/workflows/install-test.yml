@@ -746,3 +746,82 @@ jobs:
           assert_flagged 7 "edited directly rather than through install.py"
           cp "${{ runner.temp }}/receipt.json.orig" "$ROOT/.cc-seed/receipt.json"
           assert_passed 7
+
+      # --- SEED-080: the memory contract, and the origin rule ---------------
+      # What CI can prove without a harness, a network or a secret: the door,
+      # the store, the fold's projection and the mesh's own breakage report.
+      # M1's harness turn, M4's delivery and M5's citation need a real agent
+      # CLI, so they are SKIPped BY NAME here and proven by the daily drill on
+      # a host that has one. A SKIP is an unmet proof obligation, never a pass.
+      - name: memory contract (script half) + the hook approval round trip
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/mem-root"
+          rm -rf "$ROOT"
+          python3 install.py --target "$ROOT"
+
+          # The hooks are wired by the SAME --approve shape a human uses; CI
+          # never gets a --yes flag of its own, because a flag meaning "skip
+          # the human" is one typo from being passed by one.
+          CI=true python3 install.py --target "$ROOT" --approve memory-hooks --apply
+          grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json"
+
+          # The contract itself. No --harness: the harness properties report
+          # SKIP by name, and the run must still be green on the rest.
+          OUT="$(python3 "$ROOT/memory-mesh/contract_test.py" --json "${{ runner.temp }}/contract.json" 2>&1 || true)"
+          echo "$OUT"
+          echo "$OUT" | grep -q "0 fail" || (echo "contract has failures"; exit 1)
+          python3 - "${{ runner.temp }}/contract.json" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          fails = [r for r in d["results"] if r["status"] == "FAIL"]
+          skips = [r["property"] for r in d["results"] if r["status"] == "SKIP"]
+          assert not fails, fails
+          # Every skip must be a HARNESS skip. A skip anywhere else means a
+          # property silently stopped being checked.
+          assert all("harness" in s for s in skips), skips
+          print(f"contract: {len(d['results']) - len(skips)} proven, skipped here: {skips}")
+          PY
+
+          # --revoke puts settings.json back exactly, and the contract notices.
+          CI=true python3 install.py --target "$ROOT" --revoke memory-hooks --apply
+          grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json" && \
+            (echo "revoke left the hook entries behind"; exit 1) || true
+          python3 "$ROOT/memory-mesh/contract_test.py" --only M4 && \
+            (echo "M4 passed with no hooks wired — the contract is not measuring delivery"; exit 1) || true
+
+      - name: origin rule — same body defers, different body refuses
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ runner.temp }}/origin-root"
+          rm -rf "$ROOT" "$HOME/.claude/skills/improve"
+          mkdir -p "$HOME/.claude/skills/improve"
+
+          # SAME body at user scope -> defer, register nothing, record it.
+          cp skills/improve/SKILL.md "$HOME/.claude/skills/improve/SKILL.md"
+          OUT="$(python3 install.py --target "$ROOT")"
+          echo "$OUT" | grep -q "deferring to it" || (echo "$OUT"; exit 1)
+          test ! -e "$ROOT/.claude/skills/improve/SKILL.md"
+          python3 -c "
+          import json,sys
+          r=json.load(open('$ROOT/.cc-seed/receipt.json'))
+          d=[x['name'] for x in r['install'].get('deferred_skills',[])]
+          assert 'improve' in d, d"
+
+          # The deferral is re-checked at audit time: edit the twin, audit reds.
+          echo "changed after the deferral" >> "$HOME/.claude/skills/improve/SKILL.md"
+          python3 install.py --target "$ROOT" --audit --package . 2>&1 | \
+            grep -q "has CHANGED since the deferral" || \
+            (echo "audit did not notice the user-scope twin moving"; exit 1)
+
+          # DIFFERENT body at user scope -> refuse, loudly, naming both paths.
+          ROOT2="${{ runner.temp }}/origin-root-2"
+          rm -rf "$ROOT2"
+          printf -- "---\nname: improve\n---\na different skill entirely\n" > "$HOME/.claude/skills/improve/SKILL.md"
+          OUT="$(python3 install.py --target "$ROOT2" 2>&1)"
+          echo "$OUT" | grep -q "REFUSING to register" || (echo "$OUT"; exit 1)
+          echo "$OUT" | grep -q "$HOME/.claude/skills/improve/SKILL.md" || (echo "refusal did not name the user-scope file"; exit 1)
+          test ! -e "$ROOT2/.claude/skills/improve/SKILL.md"
+          rm -rf "$HOME/.claude/skills/improve"
