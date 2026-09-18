@@ -1327,7 +1327,17 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
 def _confirm_hook_write() -> bool:
     """CI applies the SAME staged diff non-interactively through the existing
     --approve/--apply shape; it never gets a new --yes flag, because a flag
-    that means "skip the human" is one typo away from being passed by a human."""
+    that means "skip the human" is one typo away from being passed by a human.
+
+    `--apply` means "I have seen the staged diff and affirm it", so it reads
+    the same on the way OUT as on the way in — --revoke stages a diff and
+    calls this gate exactly as --approve does. Until 2026-09-18 the arg gate
+    refused --apply alongside --revoke, which made a non-interactive revoke
+    unreachable by BOTH paths: with --apply the gate died at argv parsing,
+    and without it this function fell through to input() and took the
+    EOFError branch. Caught by the first CI run that ever exercised it
+    (0.4.0-alpha, run 35404705676); the live check passed because a human
+    typed y."""
     if os.environ.get("CI") == "true" and "--apply" in sys.argv:
         print("CI=true with --apply — applying the staged diff non-interactively.")
         return True
@@ -1376,7 +1386,11 @@ def revoke(target: Path, which: str) -> int:
         record, revoked_at=_now(), written=False,
         revoked_sha=_sha256_bytes(after))
     _save_receipt(target, receipt)
-    print(f"{which} revoked — {len(recorded)} recorded entr(ies) removed from {settings}.")
+    # `recorded` is a SET of command strings, so this is the number of distinct
+    # commands removed, which is <= the number of recorded hook entries (two
+    # events can register the same command). Say which, or the line reads as a
+    # short count against the receipt — 6 vs 7 on a stock install.
+    print(f"{which} revoked — {len(recorded)} distinct command(s) removed from {settings}.")
     return 0
 
 
@@ -3772,8 +3786,8 @@ def main():
         return die("--approve import-pack requires --from-pack <path>")
     if args.update_from and not args.update:
         return die("--from only applies to --update")
-    if args.apply and not (args.update or args.approve):
-        return die("--apply only applies to --update and --approve")
+    if args.apply and not (args.update or args.approve or args.revoke):
+        return die("--apply only applies to --update, --approve and --revoke")
     if args.harness and not args.contract:
         return die("--harness only applies to --contract")
     if args.allow_downgrade and not args.update:

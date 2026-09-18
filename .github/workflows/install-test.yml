@@ -785,11 +785,22 @@ jobs:
           PY
 
           # --revoke puts settings.json back exactly, and the contract notices.
+          #
+          # Both guards below are `if`, not `cmd && (...; exit 1) || true`.
+          # That older shape CANNOT FAIL: the parse is `(A && B) || true`, so
+          # the subshell's exit 1 is swallowed by the trailing `|| true` and
+          # the step goes green having printed its own alarm. Measured
+          # 2026-09-18 — `true && (echo X; exit 1) || true` exits 0. Two
+          # negative controls sat decorative here, which is the failure mode
+          # the contract exists to catch, one level up.
           CI=true python3 install.py --target "$ROOT" --revoke memory-hooks --apply
-          grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json" && \
-            (echo "revoke left the hook entries behind"; exit 1) || true
-          python3 "$ROOT/memory-mesh/contract_test.py" --only M4 && \
-            (echo "M4 passed with no hooks wired — the contract is not measuring delivery"; exit 1) || true
+          if grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json"; then
+            echo "revoke left the hook entries behind"; exit 1
+          fi
+          if python3 "$ROOT/memory-mesh/contract_test.py" --only M4; then
+            echo "M4 passed with no hooks wired — the contract is not measuring delivery"
+            exit 1
+          fi
 
       - name: origin rule — same body defers, different body refuses
         shell: bash
