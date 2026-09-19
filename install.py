@@ -550,6 +550,16 @@ def _package_sha(package: Path) -> str:
 # byte-identical copy of installed_sha() (it lives in the installed tree and
 # cannot import this file); tools/selftest_installed_sha.py asserts the two
 # agree, so the copies cannot drift apart silently.
+# Prefixes a shipped tool WRITES INTO at runtime, by design: the run log and
+# the brief store. Nothing is shipped under them, so hashing their contents
+# measures how much the system has been USED, not whether its bytes are
+# intact — runs.db alone changes on every scheduled job, so M0 went red
+# within minutes of any real install and stayed red (found on {{REDACTED}},
+# 2026-09-19, where it read as "the bytes running here are not the bytes
+# this install wrote"). check 1 already skipped exactly these; the hash had
+# never been told.
+RUNTIME_WRITABLE_PREFIXES = ("observability/data/", "session-brief/briefs/")
+
 INSTALLED_SHA_EXEMPT = {
     # --enable-demo legitimately rewrites this file in place, which is why
     # check 1 skips it too. Hashing it would make every post-demo install
@@ -574,6 +584,8 @@ def installed_sha(target: Path, components, root_files) -> str:
     for p in sorted(paths):
         rel = p.relative_to(Path(target)).as_posix()
         if "__pycache__" in p.parts or rel in INSTALLED_SHA_EXEMPT:
+            continue
+        if rel.startswith(RUNTIME_WRITABLE_PREFIXES):
             continue
         h.update(rel.encode())
         h.update(hashlib.sha256(p.read_bytes()).digest())
@@ -3006,7 +3018,7 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
     # Paths a shipped tool writes INTO at runtime, by design: the run log and
     # (SEED-079) the brief store /freeze and /capture fill. Content there is
     # the user's, produced by using the system — never "unexpected".
-    runtime_writable_prefixes = ("observability/data/", "session-brief/briefs/")
+    runtime_writable_prefixes = RUNTIME_WRITABLE_PREFIXES
     for live_p in sorted(target.rglob("*")):
         rel = live_p.relative_to(target).as_posix()
         if rel in checked_rel:
