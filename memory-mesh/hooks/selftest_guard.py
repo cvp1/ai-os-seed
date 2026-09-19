@@ -248,8 +248,16 @@ def run(tool, payload, want_stderr=False):
         event = {"tool_name": "Bash", "tool_input": {"command": payload}}
     else:
         event = {"tool_name": tool, "tool_input": {"file_path": payload}}
+    # cwd = the MESH DIRECTORY on purpose: that is the adversarial one. A
+    # relative `memory_write.py` resolves to the real door from here, so any
+    # case that lets the process cwd stand in for where the command actually
+    # `cd`-ed will sanction an impostor and show up as a FAIL. Run from
+    # anywhere else, the impostor-by-cd case passes for the wrong reason —
+    # which is how it stayed green on {{REDACTED}} while failing on {{REDACTED}}
+    # (2026-09-19).
     p = subprocess.run([sys.executable, HOOK], input=json.dumps(event),
-                       capture_output=True, text=True, timeout=30)
+                       capture_output=True, text=True, timeout=30,
+                       cwd=os.path.dirname(DOOR))
     return (p.returncode, p.stderr) if want_stderr else p.returncode
 
 

@@ -338,7 +338,7 @@ def opaque_inline_write(scannable):
         segments = split_segments(strip_shell_comments(scannable))
     except ValueError:
         return None                  # the parse failure is handled elsewhere
-    bases = _cd_targets(segments) + [os.getcwd(), WORKSPACE]
+    bases = _resolution_bases(segments)
     for seg in segments:
         if not store_referenced(seg):
             continue
@@ -508,6 +508,22 @@ def segment_program(seg):
     return prog
 
 
+def _resolution_bases(segments):
+    """Bases a RELATIVE program token may be resolved against.
+
+    The process cwd is dropped the moment the command contains a `cd`: the
+    shell has moved, and resolving `memory_write.py` against where the HOOK
+    happens to be running sanctions an impostor door that the command never
+    reached. `cd <impostor> && python3 memory_write.py … > STORE/f.md` was
+    ALLOWED for exactly this reason whenever the agent's cwd was the mesh
+    directory (caught on {{REDACTED}}, 2026-09-19 — it reproduces on any host, the
+    cwd is the variable, not the platform). A real `cd <mesh> && python3
+    memory_write.py` still resolves: the cd target IS the door's directory.
+    """
+    cd = _cd_targets(segments)
+    return cd + ([] if cd else [os.getcwd()]) + [WORKSPACE]
+
+
 def _cd_targets(segments):
     """Directories an earlier `cd`/`pushd` in the same command would move to.
 
@@ -571,7 +587,7 @@ def command_is_sanctioned(scannable):
         segments = split_segments(text)
     except ValueError as exc:
         return False, f"the guard could not parse this command ({exc})"
-    bases = _cd_targets(segments) + [os.getcwd(), WORKSPACE]
+    bases = _resolution_bases(segments)
     writing = []
     for seg in segments:
         if WRITE_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
