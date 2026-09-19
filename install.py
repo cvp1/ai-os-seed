@@ -583,7 +583,13 @@ def installed_sha(target: Path, components, root_files) -> str:
             paths.append(p)
     for p in sorted(paths):
         rel = p.relative_to(Path(target)).as_posix()
-        if "__pycache__" in p.parts or rel in INSTALLED_SHA_EXEMPT:
+        # .git is a working checkout's own churn — index, FETCH_HEAD and
+        # the ref logs move on every fetch, so a component kept under
+        # version control (memory-mesh on {{REDACTED}} is, by doctrine) was
+        # permanently "drifted": 446 measured paths differed, 400+ of
+        # them .git internals. Same reasoning as __pycache__.
+        if "__pycache__" in p.parts or ".git" in p.parts \
+                or rel in INSTALLED_SHA_EXEMPT:
             continue
         if rel.startswith(RUNTIME_WRITABLE_PREFIXES):
             continue
