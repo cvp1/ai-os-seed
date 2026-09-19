@@ -580,6 +580,37 @@ def installed_sha(target: Path, components, root_files) -> str:
     return h.hexdigest()
 
 
+def _refresh_installer(target: Path, new_tree: Path) -> bool:
+    """Replace the target's own install.py with the fetched tree's.
+
+    install.py is not a SHIPPED path, so --update never touched it: every
+    install kept the installer it was born with, forever. {{REDACTED}} was found
+    running the 0.3.8 installer after updating to 0.4.2 (2026-09-19) — its
+    default jobs, its receipt fields and its skill-shadowing behaviour were
+    all three versions stale, and no verb could move it. Replacing the file
+    mid-run is safe: Python has already read and compiled this module, and
+    the write is atomic, so the running process keeps its own bytes.
+    """
+    src = new_tree / "install.py"
+    dst = target / "install.py"
+    # ONLY refresh one that is already there. A fresh install does NOT place
+    # install.py in the target — the operator runs it from wherever they
+    # downloaded it — so creating one here would add a path the package audit
+    # rightly reports as unexpected (caught by selftest_skill_origin, which
+    # went FLAGGED the moment this wrote a file install() never writes).
+    if not src.is_file() or not dst.is_file():
+        return False
+    body = src.read_bytes()
+    if dst.read_bytes() == body:
+        return False
+    tmp = dst.with_suffix(".py.tmp")
+    tmp.write_bytes(body)
+    tmp.chmod(0o755)
+    tmp.replace(dst)
+    print(f"refreshed the installer itself: {dst}")
+    return True
+
+
 def _record_installed_sha(target: Path, receipt: dict) -> str:
     sha = installed_sha(target, receipt["install"].get("components", []), ROOT_FILES)
     receipt["install"]["installed_sha"] = sha
@@ -3915,6 +3946,20 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 print(f"update: already current (version {current_version}).")
                 if apply:
                     _redecide_skill_origins(target, receipt)
+                    # Same-version is still the moment to repair the two things
+                    # an old installer could not give this tree: its baseline
+                    # measurement and the installer itself. Without this, an
+                    # install that is already current is UNREPAIRABLE — there
+                    # is no other verb, and "already current" returns before
+                    # any plan is computed (found on {{REDACTED}}, 2026-09-19).
+                    changed = _refresh_installer(target, new_tree)
+                    if not receipt["install"].get("installed_sha"):
+                        _record_installed_sha(target, receipt)
+                        changed = True
+                        print("recorded this install's baseline measurement "
+                              "(installed_sha) — it had none.")
+                    if changed:
+                        _save_receipt(target, receipt)
                 else:
                     print("  (dry run — pass --apply to re-ask the skill origin "
                           "question for anything refused or unregistered)")
@@ -3974,9 +4019,27 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 # refused_skill_retry). The origin question is re-asked here.
                 if bootstrapped:
                     receipt["shipped"] = shipped_now
-                if not _redecide_skill_origins(target, receipt):
+                # An install that is ALREADY current still needs a baseline.
+                # installed_sha was only ever recorded on a non-empty apply, so
+                # a tree that reached the current version before R2 shipped
+                # could never obtain one: M0-package-integrity failed forever
+                # ("the receipt does not say what this install wrote"), with no
+                # verb that could fix it. An empty plan means the shipped bytes
+                # MATCHED the fetched tree, which is precisely a verified-clean
+                # moment, so recording here is sound. Only when ABSENT — this
+                # must never re-baseline a tree that already has one, which is
+                # the tamper-laundering path the R2 comment below guards.
+                sha_recorded = False
+                if not receipt["install"].get("installed_sha"):
+                    _record_installed_sha(target, receipt)
+                    sha_recorded = True
+                    print("recorded this install's baseline measurement "
+                          "(installed_sha) — it had none.")
+                refreshed = _refresh_installer(target, new_tree)
+                if not _redecide_skill_origins(target, receipt) \
+                        and not sha_recorded and not refreshed:
                     print("\nnothing to apply.")
-                elif bootstrapped:
+                elif bootstrapped or sha_recorded:
                     _save_receipt(target, receipt)
                 return 0
 
@@ -4014,6 +4077,7 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             # an --audit or --approve run must never re-baseline a tampered
             # tree, which is the whole point of recording it.
             _record_installed_sha(target, receipt)
+            _refresh_installer(target, new_tree)
             _save_receipt(target, receipt)
             print(f"\napplied: {len(plan['create'])} created, {len(plan['update'])} updated. "
                  f"{len(plan['skip_dirty'])} locally-modified path(s) left untouched — review "
