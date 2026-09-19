@@ -48,6 +48,7 @@ LAUNCHD_DIR = Path.home() / "Library" / "LaunchAgents"
 LAUNCHD_PREFIX = "dev.cc-seed."
 
 CRON_FIELD_RE = re.compile(r"^\*/(\d+) \* \* \* \*$")
+HOURLY_FIELD_RE = re.compile(r"^(\d{1,2}) \* \* \* \*$")
 DAILY_FIELD_RE = re.compile(r"^(\d{1,2}) (\d{1,2}) \* \* \*$")
 WEEKLY_FIELD_RE = re.compile(r"^(\d{1,2}) (\d{1,2}) \* \* (\d)$")
 
@@ -273,10 +274,18 @@ def _schedule_to_launchd(schedule, name):
         minute, hour = int(m.group(1)), int(m.group(2))
         return "calendar", {"Minute": minute, "Hour": hour}
 
+    # 'M * * * *' — hourly at a fixed minute. launchd runs a
+    # StartCalendarInterval dict with every field omitted as a wildcard, so a
+    # Minute-only dict fires once an hour at M, exactly like cron.
+    m = HOURLY_FIELD_RE.match(schedule)
+    if m:
+        return "calendar", {"Minute": int(m.group(1))}
+
     raise ScheduleError(
         f"job {name!r}: schedule {schedule!r} doesn't translate to launchd — "
-        f"only '*/N * * * *' (N divides 60) and a fixed 'M H * * *'/'M H * * D' "
-        f"are supported today. Refusing rather than guessing.")
+        f"only '*/N * * * *' (N divides 60), 'M * * * *', and a fixed "
+        f"'M H * * *'/'M H * * D' are supported today. "
+        f"Refusing rather than guessing.")
 
 
 def _render_plist(job):
