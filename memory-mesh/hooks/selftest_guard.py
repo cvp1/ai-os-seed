@@ -125,6 +125,20 @@ CASES = [
     (True, "Bash", f'echo "poison"->{STORE}/MEMORY.md',
      "arrow that IS a redirect into the store -- why the class cannot be exempted"),
 
+    # --- 2026-09-19: the store spelled through a symlink or `..` (P0) ---
+    # store_referenced matched STORE as a SUBSTRING, so the same file written
+    # under an equivalent spelling was not "the store" at all and every guard
+    # below it went quiet. Caught on macos-latest, where the sandbox store is
+    # /var/folders/... and its realpath is /private/var/folders/... -- but the
+    # `..` form below reproduces it on Linux too, so it is a real bypass, not
+    # a platform quirk. Control: both were rc=0 (ALLOWED) before the fix.
+    (True, "Bash", f'printf poison > {STORE}/../memory/x.md  # memory_write.py',
+     "store reached through a `..` segment, wearing the door's name"),
+    (True, "Bash", f'printf poison > {STORE}/./sub/../x.md',
+     "store reached through `.` and `..`"),
+    (False, "Bash", 'printf ok > /tmp/not-the-store/../elsewhere.md',
+     "a `..` path that does NOT land in the store is untouched"),
+
     # --- 2026-09-19: the SANCTIONED substring bypass (P0) ---
     # `SANCTIONED = "memory_write.py"` + `SANCTIONED not in cmd` made the
     # ELEVEN CHARACTERS the credential: any occurrence anywhere exempted the

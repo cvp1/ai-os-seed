@@ -245,6 +245,17 @@ def store_referenced(text):
         tok = raw.strip("\"'")
         if not tok:
             continue
+        # ANY token that RESOLVES into the store counts, whatever it is named.
+        # The substring test above only sees the store spelled literally, so
+        # the same path written through a symlink or a `..` segment slipped
+        # past it: `printf x > $TMP/a/../store/f.md  # memory_write.py` was
+        # ALLOWED. On macOS EVERY temp path is such a spelling
+        # (/var/folders -> /private/var/folders), which is why M1-bash-guard's
+        # comment bypass passed on Linux and failed on macos-latest
+        # (CI 2026-09-19). realpath is the instrument in_store already uses;
+        # this only widens what the guard calls the store, never narrows it.
+        if "/" in tok and in_store(tok):
+            return True
         if os.path.basename(tok) not in STORE_FILES:
             continue
         if "/" not in tok or in_store(tok):
