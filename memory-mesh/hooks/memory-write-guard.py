@@ -104,6 +104,7 @@ deny (they must KEEP denying) and asserting the token is named.
 import json
 import os
 import re
+import shlex
 import sys
 
 def _store():
@@ -120,7 +121,23 @@ def _store():
 
 
 STORE = _store()
-SANCTIONED = "memory_write.py"
+# The one sanctioned write path. 2026-09-19: this used to be a bare substring
+# test (`SANCTIONED not in cmd`) against the RAW command, so ANY occurrence of
+# the string anywhere -- in a trailing `# memory_write.py` comment, in a
+# filename, in an echoed word -- exempted the WHOLE command. Verified bypass:
+# `printf x > STORE/f.md # memory_write.py` was allowed, rc=0, file created.
+# Sanctioning is now structural and PER SEGMENT (command_is_sanctioned).
+# 2026-09-19 (round 2, grok-4.6): a basename is not a credential either.
+# `python3 /tmp/not-the-door/memory_write.py … > STORE/f.md` was ALLOWED, because
+# the sanction test was `basename(prog) == "memory_write.py"`. The door is a
+# FILE, not a name: this install's own memory_write.py, one directory up from
+# the hook, compared by realpath. WORKSPACE is the base a workspace-relative
+# invocation (`python3 memory-mesh/memory_write.py …`) is resolved against.
+SANCTIONED_BASENAME = "memory_write.py"
+DOOR = os.path.realpath(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+    SANCTIONED_BASENAME))
+WORKSPACE = os.path.dirname(os.path.dirname(DOOR))
 # The store's two named surfaces. A bare mention of either is treated as the
 # store even without a path, because the shell's cwd is unknowable here.
 STORE_FILES = {"MEMORY.md", "QUARANTINE.md"}
@@ -235,6 +252,335 @@ def store_referenced(text):
     return False
 
 
+# --- structural sanctioning (2026-09-19) -------------------------------------
+# A command is sanctioned only where a real invocation of memory_write.py is
+# the PROGRAM of the simple command that carries the write shape. The old
+# substring test made the word itself the credential; anyone who could get the
+# eleven characters into the command -- a comment, a quoted string, a path --
+# could write the store with no door and no lineage. Being conservative is the
+# whole point here: any shape this parser cannot read DENIES.
+
+# A shell comment cannot execute, so `#` to end-of-line is removed before the
+# sanction parse ONLY (mentions_store / the write-shape scan still see the raw
+# scannable text, so this can never make a denied command allowed).
+PY_INTERP = re.compile(r"^(?:python|python[0-9]+(?:\.[0-9]+)*|pypy[0-9]*)$")
+ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# Operators that end one simple command and start the next.
+SEGMENT_OPS = ("&&", "||", ";;", ";", "|", "&", "\n", "(", ")")
+
+# --- opaque inline code (2026-09-19, round 2, grok-4.6) ----------------------
+# WRITE_SHAPE reads SHELL. A language runtime handed inline code writes files
+# with no shell redirect at all, so all three of these named the store and were
+# ALLOWED:
+#   python3 -c "pathlib.Path('STORE/x.md').write_text('…')"
+#   node -e "require('fs').writeFileSync('STORE/x.md','…')"
+#   ruby -e "File.write('STORE/x.md','…')"
+# The guard cannot interpret an arbitrary program in an arbitrary language, and
+# a partial interpreter is worse than none. So it stops guessing: a segment that
+# NAMES THE STORE and runs inline code in a runtime is denied unless it is the
+# door. This is a fail-closed narrowing -- `python3 -c "print(1)"`, which does
+# not name the store, is untouched. The accepted false positive is a READ of the
+# store written as inline code (`python3 -c "print(open('…/MEMORY.md').read())"`);
+# it is the same trade the module docstring already makes for `grep … > /tmp/out`,
+# and the deny message says how to re-run.
+RUNTIMES = {
+    "node", "nodejs", "deno", "bun", "ruby", "irb", "perl", "php", "lua",
+    "luajit", "tclsh", "wish", "Rscript", "osascript", "bash", "sh", "zsh",
+    "ksh", "dash", "fish", "elixir", "erl", "groovy", "scala", "julia",
+}
+INLINE_FLAGS = {"-c", "-e", "-E", "-r", "-p", "-P", "-n", "--eval", "--exec",
+                "--execute", "--command", "--expression"}
+INLINE_FLAG_PREFIXES = ("--eval=", "--exec=", "--execute=", "--command=",
+                        "--expression=")
+
+
+def _is_runtime(prog):
+    base = os.path.basename(prog)
+    return base in RUNTIMES or bool(PY_INTERP.match(base))
+
+
+def inline_code_flag(seg):
+    """The inline-code flag a language runtime in this segment was handed, or
+    None. Raises ValueError when shlex cannot parse the segment."""
+    argv = shlex.split(seg)
+    k = 0
+    while k < len(argv) and (ENV_ASSIGN.match(argv[k]) or argv[k] == "env"):
+        k += 1
+    if k >= len(argv) or not _is_runtime(argv[k]):
+        return None
+    runtime = os.path.basename(argv[k])
+    for tok in argv[k + 1:]:
+        if tok in INLINE_FLAGS:
+            return f"{runtime} {tok}"
+        if tok.startswith(INLINE_FLAG_PREFIXES):
+            return f"{runtime} {tok.split('=', 1)[0]}"
+    return None
+
+
+def opaque_inline_write(scannable):
+    """(why, None) for a segment that names the store and runs inline code.
+
+    Returns None when nothing in the command matches. Sanctioned segments (the
+    real door) are exempt, but the door is never invoked as `-c`/`-e` anyway --
+    segment_program already refuses to look past an inline-code flag."""
+    try:
+        segments = split_segments(strip_shell_comments(scannable))
+    except ValueError:
+        return None                  # the parse failure is handled elsewhere
+    bases = _cd_targets(segments) + [os.getcwd(), WORKSPACE]
+    for seg in segments:
+        if not store_referenced(seg):
+            continue
+        try:
+            flag = inline_code_flag(seg)
+            if flag and not segment_is_sanctioned(seg, bases):
+                return flag
+        except ValueError:
+            continue
+    return None
+
+
+def heredoc_into_runtime(cmd):
+    """A heredoc fed to a language runtime whose BODY names the store.
+
+    strip_heredocs() drops bodies as data, which is right for `cat > doc.md
+    <<EOF`. It is wrong for `python3 <<EOF`, where the body IS the program --
+    the store reference would be stripped before it was ever looked for."""
+    lines = cmd.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = HEREDOC_OPEN.search(line)
+        i += 1
+        if not m:
+            continue
+        head = line[:m.start()]
+        body = []
+        delim = m.group(2)
+        while i < len(lines) and lines[i].strip() != delim:
+            body.append(lines[i])
+            i += 1
+        if i < len(lines):
+            i += 1
+        try:
+            argv = shlex.split(head)
+        except ValueError:
+            argv = head.split()
+        k = 0
+        while k < len(argv) and (ENV_ASSIGN.match(argv[k]) or argv[k] == "env"):
+            k += 1
+        if k < len(argv) and _is_runtime(argv[k]) and \
+                store_referenced("\n".join(body)):
+            return f"{os.path.basename(argv[k])} <<"
+    return None
+
+
+def strip_shell_comments(text):
+    """Drop `# ...` to end of line, outside quotes, line by line. bash starts a
+    comment only at the beginning of a word, so `foo#bar` is NOT a comment.
+
+    A quote left open at end-of-line means the line-by-line reading is wrong
+    (the next line is inside that string), so nothing is stripped at all --
+    stripping is an optimisation for the sanction parse, never a safety claim.
+    """
+    try:
+        return "\n".join(_strip_line_comment(ln) for ln in text.split("\n"))
+    except ValueError:
+        return text
+
+
+def _strip_line_comment(line):
+    quote, esc, prev = None, False, ""
+    for i, ch in enumerate(line):
+        if esc:
+            esc = False
+            prev = ch
+            continue
+        if quote:
+            if ch == "\\" and quote == '"':
+                esc = True
+            elif ch == quote:
+                quote = None
+            prev = ch
+            continue
+        if ch == "\\":
+            esc = True
+            prev = ch
+            continue
+        if ch in "'\"":
+            quote = ch
+            prev = ch
+            continue
+        if ch == "#" and (prev == "" or prev.isspace() or prev in ";|&()"):
+            return line[:i]
+        prev = ch
+    if quote is not None:
+        raise ValueError("unbalanced quote")
+    return line
+
+
+def split_segments(text):
+    """Quote-aware split into simple-command segments on ; && || | & ( ) and
+    newline. Raises ValueError on an unbalanced quote -- which DENIES."""
+    segs, buf, quote, esc = [], [], None, False
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if esc:
+            buf.append(ch)
+            esc = False
+            i += 1
+            continue
+        if quote:
+            if ch == "\\" and quote == '"':
+                esc = True
+            elif ch == quote:
+                quote = None
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            esc = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        matched = None
+        for op in SEGMENT_OPS:
+            if text.startswith(op, i):
+                matched = op
+                break
+        if matched:
+            segs.append("".join(buf))
+            buf = []
+            i += len(matched)
+            continue
+        buf.append(ch)
+        i += 1
+    if quote is not None:
+        raise ValueError("unbalanced quote")
+    segs.append("".join(buf))
+    return [s for s in segs if s.strip()]
+
+
+def segment_program(seg):
+    """The program a simple command would exec, or None if unreadable.
+
+    Leading `VAR=val` assignments and `env` are skipped; when the program is a
+    python interpreter the first non-flag argument is the real program, so
+    `python3 /abs/memory-mesh/memory_write.py write ...` resolves to
+    memory_write.py. Raises ValueError when shlex cannot parse the segment."""
+    argv = shlex.split(seg)          # ValueError on a bad quote -> deny
+    k = 0
+    while k < len(argv) and (ENV_ASSIGN.match(argv[k]) or argv[k] == "env"):
+        k += 1
+    if k >= len(argv):
+        return None
+    prog = argv[k]
+    if PY_INTERP.match(os.path.basename(prog)):
+        k += 1
+        while k < len(argv) and argv[k].startswith("-"):
+            if argv[k] in ("-c", "-m"):
+                return argv[k]       # code/module, never the writer
+            k += 1
+        if k >= len(argv):
+            return None
+        prog = argv[k]
+    # A token that still carries whitespace came out of a single quoted word
+    # (`"python3 memory_write.py"`); it is data, not a program path.
+    if not prog or any(c.isspace() for c in prog):
+        return None
+    return prog
+
+
+def _cd_targets(segments):
+    """Directories an earlier `cd`/`pushd` in the same command would move to.
+
+    A relative program token in a later segment is resolved against these too,
+    so `cd <workspace> && python3 memory-mesh/memory_write.py ...` still names
+    the real door. This can only ever make the DOOR reachable -- the comparison
+    below is realpath-equality with one exact file, so a wrong base cannot
+    sanction anything."""
+    out = []
+    for seg in segments:
+        try:
+            argv = shlex.split(seg)
+        except ValueError:
+            continue
+        k = 0
+        while k < len(argv) and ENV_ASSIGN.match(argv[k]):
+            k += 1
+        if k + 1 < len(argv) and argv[k] in ("cd", "pushd"):
+            target = argv[k + 1]
+            if not target.startswith("-"):
+                out.append(os.path.expanduser(target))
+    return out
+
+
+def resolves_to_door(prog, bases):
+    """Does this program token name THIS install's own memory_write.py?
+
+    2026-09-19 (round 2): the check used to be `basename(prog) ==
+    "memory_write.py"`, which sanctioned any file anywhere with that name --
+    `python3 /tmp/x/memory_write.py --text ... > STORE/f.md` was ALLOWED and
+    wrote the store with no door and no lineage. Sanction is now identity, not
+    a name: realpath of the token must equal DOOR. A token that resolves to
+    nothing resolves to nothing -- it simply is not the door, so it denies."""
+    if not prog:
+        return False
+    prog = os.path.expanduser(prog)
+    candidates = [prog] if os.path.isabs(prog) else [
+        os.path.join(b, prog) for b in bases]
+    for cand in candidates:
+        try:
+            if os.path.realpath(cand) == DOOR:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def segment_is_sanctioned(seg, bases):
+    prog = segment_program(seg)      # may raise ValueError
+    return resolves_to_door(prog, bases)
+
+
+def command_is_sanctioned(scannable):
+    """(sanctioned, why_not). Sanctioned only when EVERY segment that carries a
+    write-shaped token is itself an invocation of THIS install's memory_write.py
+    (resolved by realpath, never by basename). A sanctioned segment never
+    sanctions a sibling: `python3 memory_write.py x && printf y > STORE/f.md`
+    is denied on the second segment."""
+    try:
+        text = strip_shell_comments(scannable)
+        segments = split_segments(text)
+    except ValueError as exc:
+        return False, f"the guard could not parse this command ({exc})"
+    bases = _cd_targets(segments) + [os.getcwd(), WORKSPACE]
+    writing = []
+    for seg in segments:
+        if WRITE_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
+            writing.append(seg)
+    if not writing:
+        # The write shape is not in any executable segment (a comment, say).
+        # Preserve the historical verdict rather than trust this parser to be
+        # the only thing standing between a poisoned page and the store.
+        return False, "no executable segment carries the write; denying anyway"
+    for seg in writing:
+        try:
+            if not segment_is_sanctioned(seg, bases):
+                return False, (
+                    "the command that writes is not this install's "
+                    f"memory_write.py ({DOOR}): {seg.strip()[:120]!r}")
+        except ValueError as exc:
+            return False, f"the guard could not parse {seg.strip()[:80]!r} ({exc})"
+    return True, ""
+
+
 def deny(reason):
     print(reason, file=sys.stderr)
     sys.exit(2)
@@ -266,10 +612,33 @@ def main():
         # as a reference to it.
         scannable = strip_heredocs(strip_commit_message(cmd))
         mentions_store = store_referenced(scannable)
+        # Inline code in a language runtime is opaque to the shell-shaped
+        # write scan below, so it is decided first and on its own terms.
+        opaque = None
+        if mentions_store:
+            opaque = opaque_inline_write(scannable)
+        if opaque is None:
+            opaque = heredoc_into_runtime(strip_commit_message(cmd))
+        if opaque:
+            deny(
+                "memory-write-guard: this command names the auto-memory store "
+                f"and hands INLINE CODE to a language runtime ({opaque!r}). "
+                "Inline code is opaque to this guard -- it cannot tell a read "
+                "from a write in an arbitrary language -- so it is denied "
+                "without going through the lineage gate.\n"
+                "  * If it is a memory WRITE, use the workspace door, "
+                "memory-mesh/memory_write.py --commit.\n"
+                "  * If it is only a READ, re-run it as a plain command "
+                "(cat/grep/python3 <script.py>) that does not carry the "
+                "program on the command line."
+            )
         # /dev/null targets and fd dups cannot write; ignore them.
         scannable = NOT_A_WRITE.sub(" ", scannable)
         hit = WRITE_SHAPE.search(scannable)
-        if mentions_store and SANCTIONED not in cmd and hit:
+        sanctioned, why_not = (True, "")
+        if mentions_store and hit:
+            sanctioned, why_not = command_is_sanctioned(scannable)
+        if mentions_store and not sanctioned and hit:
             # Quote the token that matched. The guard cannot tell a redirect
             # from an arrow in a string (see the 2026-07-31 note: to bash they
             # are the same token), so it denies either way -- but naming the
@@ -289,7 +658,8 @@ def main():
                 "  * If it is a READ redirected elsewhere, re-run without the "
                 "redirect/pipe-to-file.\n"
                 "  * If it is a legitimate memory write, use "
-                "the workspace door, memory-mesh/memory_write.py --commit."
+                "the workspace door, memory-mesh/memory_write.py --commit.\n"
+                f"  * Not sanctioned because: {why_not}"
             )
         return
 

@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -513,6 +514,78 @@ def _target_slug(target: Path) -> str:
     return hashlib.sha256(str(target).encode()).hexdigest()
 
 
+def _package_sha(package: Path) -> str:
+    """One hash over every shipped path and its content in the package this
+    install is being made FROM — the identical construction as
+    tools/contract_evidence.dist_sha(), so a contract run inside the install
+    can name the exact dist/ it is evidence for (2026-09-19: evidence used to
+    be bound to dist at RECORD time, so a green run from one build could be
+    stamped onto another)."""
+    h = hashlib.sha256()
+    try:
+        for p in sorted(Path(package).rglob("*")):
+            if not p.is_file() or "__pycache__" in p.parts:
+                continue
+            h.update(p.relative_to(package).as_posix().encode())
+            h.update(hashlib.sha256(p.read_bytes()).digest())
+    except OSError:
+        return "unknown"
+    return h.hexdigest()
+
+
+# --- SEED-080 round 2 (R2): what actually RAN, not what the receipt claims ---
+# `package_sha` above names the dist/ the install came FROM, and contract_test
+# copied it into the evidence as `tested_sha`. That is a CLAIM, not a
+# measurement: sabotage <root>/memory-mesh/memory_write.py after the install and
+# the contract still reported the clean dist sha, went 14/14 GREEN, and
+# contract_evidence recorded and verified it. Reproduced on {{REDACTED}}
+# 2026-09-19 — the publish gate was proving the bytes in dist/, never the bytes
+# that ran.
+#
+# INSTALLED_SHA_EXEMPT / installed_sha() are the answer: the SAME algorithm as
+# contract_evidence.dist_sha() — sorted relative posix path, then the sha256 of
+# each file's bytes — run over the shipped files AS THEY SIT IN THE TARGET.
+# Recorded at install time and recomputed live by the contract, so drift
+# between them is a measurement, not a story. contract_test.py carries a
+# byte-identical copy of installed_sha() (it lives in the installed tree and
+# cannot import this file); tools/selftest_installed_sha.py asserts the two
+# agree, so the copies cannot drift apart silently.
+INSTALLED_SHA_EXEMPT = {
+    # --enable-demo legitimately rewrites this file in place, which is why
+    # check 1 skips it too. Hashing it would make every post-demo install
+    # permanently "drifted".
+    "scheduler/manifest.yml",
+}
+
+
+def installed_sha(target: Path, components, root_files) -> str:
+    """One hash over every shipped file as it exists in the TARGET."""
+    h = hashlib.sha256()
+    paths = []
+    for comp in components:
+        base = Path(target) / comp
+        if not base.is_dir():
+            continue
+        paths.extend(p for p in base.rglob("*") if p.is_file())
+    for f in root_files:
+        p = Path(target) / f
+        if p.is_file():
+            paths.append(p)
+    for p in sorted(paths):
+        rel = p.relative_to(Path(target)).as_posix()
+        if "__pycache__" in p.parts or rel in INSTALLED_SHA_EXEMPT:
+            continue
+        h.update(rel.encode())
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+def _record_installed_sha(target: Path, receipt: dict) -> str:
+    sha = installed_sha(target, receipt["install"].get("components", []), ROOT_FILES)
+    receipt["install"]["installed_sha"] = sha
+    return sha
+
+
 def _anchor_path(target: Path) -> Path:
     return Path.home() / ".cache" / "cc-seed" / "receipt-anchors" / f"{_target_slug(target)}.json"
 
@@ -584,10 +657,26 @@ def _init_receipt(target: Path, mode: str) -> dict:
     fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     receipt = {
-        "schema": 1,
+        # 2 (2026-09-19, SEED-080 bug bash). What changed:
+        #   install.refused_skills[]        — a skill the origin rule REFUSED
+        #   gated_writes.memory-hooks.entries        — now ONLY what was added
+        #   gated_writes.memory-hooks.already_present — what was already wired
+        #   gated_writes.memory-hooks.adopted        — wired before we arrived
+        #   gated_writes.memory-hooks.prior_bytes_len — replaces prior_bytes,
+        #       which copied the user's whole settings.json (API key and all)
+        #       into the receipt AND the out-of-target anchor
+        #   install.package_sha              — the dist the install came from
+        # Nothing READS `schema`, and every reader of the fields above uses
+        # .get() with a default, so a schema-1 receipt keeps working: a
+        # missing refused_skills is no refusals, a missing prior_bytes_len is
+        # simply not reported, and prior_bytes on an old receipt is left alone
+        # rather than rewritten (an uninstall removes it with the receipt).
+        # Migration note: docs/install-audit.md.
+        "schema": 2,
         "install": {
             "target": str(target), "mode": mode,
             "installer_version": _installer_version(), "installer_commit": _installer_commit(),
+            "package_sha": _package_sha(HERE),
             "components": [], "skipped": [], "at": _now(),
         },
         "baseline": {},
@@ -709,16 +798,24 @@ def install(target: Path, into: bool = False):
         shutil.copytree(HERE / comp, target / comp)
     for f in ROOT_FILES:
         shutil.copy2(HERE / f, target / f)
-    registered_skills = _register_skills(target) if "skills" in written else []
+    registered_skills, deferred_skills, refused_skills = (
+        _register_skills(target) if "skills" in written else ([], [], []))
     default_jobs = _install_default_jobs(target) if "scheduler" in written else []
     receipt["install"]["components"] = written
     receipt["install"]["registered_skills"] = registered_skills
+    # Merge BEFORE the _save_receipt below, not from inside _register_skills —
+    # that save is the one that used to clobber the deferrals.
+    _merge_deferred(receipt, deferred_skills)
+    _merge_refused(receipt, refused_skills)
     receipt["install"]["default_jobs"] = default_jobs
     # SEED-076: snapshot exactly what THIS install wrote, scoped to `written`
     # (never a skipped-as-satisfied-by-existing component) — so --update has
     # real per-file history from day one and never needs the historical-
     # commit-fetch legacy-bootstrap fallback for anything installed from here on.
     receipt["shipped"] = _shipped_snapshot(target, written + ROOT_FILES)
+    # R2: the bytes that landed, measured, so the contract can prove the tree
+    # it ran inside is still the tree this install wrote.
+    _record_installed_sha(target, receipt)
     _save_receipt(target, receipt)
 
     mode = "composed into your existing workspace at" if into else "->"
@@ -779,7 +876,8 @@ def _origin_verdict(name: str, canonical: Path):
     return "refuse", user, theirs
 
 
-def _apply_origin_rule(name: str, canonical: Path, deferred: list) -> bool:
+def _apply_origin_rule(name: str, canonical: Path, deferred: list,
+                       refused: list = None) -> bool:
     """True if the caller should go on to register this skill."""
     verdict, user, sha = _origin_verdict(name, canonical)
     if verdict == "register":
@@ -790,6 +888,16 @@ def _apply_origin_rule(name: str, canonical: Path, deferred: list) -> bool:
         print(f"skill {name!r}: already installed at user scope with the SAME body "
               f"({user}) — deferring to it, registering nothing here.")
         return False
+    # A refusal used to leave NO trace anywhere: no link, no deferral, no
+    # receipt field. The install exited 0, --audit check 1 said PASS, and the
+    # operator had an install with a silently missing skill and nothing that
+    # would ever mention it again (2026-09-19 review, finding 5, executed as
+    # refusal_not_recorded). A decision the system made is state the system
+    # owns.
+    if refused is not None:
+        refused.append({"name": name, "user_scope_path": str(user),
+                        "user_sha": sha, "seed_sha": _body_sha(canonical),
+                        "at": _now()})
     print(f"skill {name!r}: REFUSING to register — a DIFFERENT skill of this name "
           f"is installed at user scope.\n"
           f"  user scope: {user}\n"
@@ -819,20 +927,64 @@ def _shipped_skill_names() -> list:
     return [name for name, _ in _iter_skill_dirs(HERE / "skills")]
 
 
-def _record_deferred(target: Path, deferred: list):
-    """Deferrals go in the receipt so --audit can re-check them. A deferral is
-    a live dependency on a file OUTSIDE this install: if the user-scope twin
-    is edited later, this install is quietly running a skill it never saw."""
+def _merge_deferred(receipt: dict, deferred: list):
+    """Merge deferrals INTO the caller's in-memory receipt. A deferral is a
+    live dependency on a file OUTSIDE this install: if the user-scope twin is
+    edited later, this install is quietly running a skill it never saw, and
+    _verify_deferred_skills re-checks exactly these records at audit time.
+
+    In-memory, and returning nothing, ON PURPOSE. Until 2026-09-18 this
+    function loaded the receipt from disk, merged, and saved — while BOTH its
+    callers sat between an earlier `_init_receipt`/`_load_receipt` and a later
+    `_save_receipt(target, receipt)` of their own. That final save wrote a dict
+    that had never seen the deferrals and silently erased them: a textbook lost
+    update, on every fresh install and every --update. The deferral was decided
+    and printed correctly, so the only visible symptom was that
+    _verify_deferred_skills had ZERO subjects and could never fire — a watchdog
+    watching nothing. Caught by CI run 35406434862 (`assert 'improve' in d` ->
+    AssertionError: []) on the first publish that ever ran the step.
+
+    Keeping this pure means a future caller cannot reintroduce the race: there
+    is no second writer to lose to."""
     if not deferred:
-        return
-    receipt = _load_receipt(target)
-    if receipt is None:
         return
     existing = {d["name"]: d for d in receipt["install"].get("deferred_skills", [])}
     for d in deferred:
         existing[d["name"]] = d
     receipt["install"]["deferred_skills"] = [existing[k] for k in sorted(existing)]
-    _save_receipt(target, receipt)
+
+
+def _merge_refused(receipt: dict, refused: list, seen: list = None):
+    """Merge refusals INTO the caller's in-memory receipt — same seam, and the
+    same purity rule, as _merge_deferred (see its docstring for why this must
+    not load-and-save on its own).
+
+    `seen` is the set of skill names this pass actually re-decided; a name in
+    it that is NOT in `refused` has been resolved, and its record is dropped.
+    Accretion needs a removal path (PRINCIPLES 23), or the receipt just gets
+    less true while looking the same size."""
+    existing = {d["name"]: d for d in receipt["install"].get("refused_skills", [])}
+    for name in (seen or []):
+        existing.pop(name, None)
+    for d in refused or []:
+        existing[d["name"]] = d
+    if existing or "refused_skills" in receipt["install"]:
+        receipt["install"]["refused_skills"] = [existing[k] for k in sorted(existing)]
+
+
+def _verify_refused_skills(target: Path, receipt: dict) -> list:
+    """A refused skill is a live, unresolved collision. It is FLAGGED on every
+    audit until it is resolved — never silence."""
+    problems = []
+    for d in receipt.get("install", {}).get("refused_skills", []) or []:
+        name = d["name"]
+        user = d.get("user_scope_path", "?")
+        problems.append(
+            f"skills/{name}: REFUSED at install — a different skill of this "
+            f"name is at {user}, so nothing is registered here and this "
+            f"install has no {name} skill. Resolve the collision (rename or "
+            f"reconcile the two) and re-run install.py --update --apply.")
+    return problems
 
 
 def _verify_deferred_skills(target: Path, receipt: dict) -> list:
@@ -861,7 +1013,7 @@ def _verify_deferred_skills(target: Path, receipt: dict) -> list:
     return problems
 
 
-def _register_new_skills(target: Path) -> list:
+def _register_new_skills(target: Path) -> tuple:
     """SEED-076's --update calls this, never _register_skills(): that
     function's own docstring says its assertion is a fresh-install-only
     backstop that "must never be the first place a collision is
@@ -877,14 +1029,15 @@ def _register_new_skills(target: Path) -> list:
     overwrite. Returns the list of NEWLY registered skill names."""
     claude_skills = target / ".claude" / "skills"
     registered, conflicts = [], []
-    deferred = []
+    deferred, refused, seen = [], [], []
     for name, canonical in _iter_skill_dirs(target / "skills"):
         link_dir = claude_skills / name
         link = link_dir / "SKILL.md"
         want_target = os.path.relpath(canonical, link_dir)
         if link.is_symlink() and os.readlink(link) == want_target:
             continue  # already correctly registered — the origin rule is for NEW links
-        if not _apply_origin_rule(name, canonical, deferred):
+        seen.append(name)
+        if not _apply_origin_rule(name, canonical, deferred, refused):
             continue
         if link.is_symlink() and os.readlink(link) == want_target:
             continue  # already correctly registered — nothing to do
@@ -897,11 +1050,10 @@ def _register_new_skills(target: Path) -> list:
     if conflicts:
         print(f"update: {len(conflicts)} skill link(s) exist but don't point where expected — "
              f"left alone, review by hand: {', '.join(conflicts)}", file=sys.stderr)
-    _record_deferred(target, deferred)
-    return registered
+    return registered, deferred, refused, seen
 
 
-def _register_skills(target: Path) -> list:
+def _register_skills(target: Path) -> tuple:
     """SEED-071: shipping skills/<name>/SKILL.md is not enough — Claude Code
     only discovers skills at ~/.claude/skills/ (user-level) or .claude/skills/
     (project-level, searched upward from the working directory). Nothing
@@ -922,11 +1074,11 @@ def _register_skills(target: Path) -> list:
     Returns the list of registered skill names."""
     claude_skills = target / ".claude" / "skills"
     registered = []
-    deferred = []
+    deferred, refused = [], []
     for name, canonical in _iter_skill_dirs(target / "skills"):
         link_dir = claude_skills / name
         link = link_dir / "SKILL.md"
-        if not _apply_origin_rule(name, canonical, deferred):
+        if not _apply_origin_rule(name, canonical, deferred, refused):
             continue
         assert not (link.exists() or link.is_symlink()), (
             f"{link} already exists — install()'s pre-write collision check "
@@ -934,8 +1086,7 @@ def _register_skills(target: Path) -> list:
         link_dir.mkdir(parents=True, exist_ok=True)
         link.symlink_to(os.path.relpath(canonical, link_dir))
         registered.append(name)
-    _record_deferred(target, deferred)
-    return registered
+    return registered, deferred, refused
 
 
 def enable_demo(target: Path):
@@ -1212,7 +1363,16 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     print(f"running: bash {script}")
     r = subprocess.run(["bash", str(script)])
     if r.returncode != 0:
-        return die(f"memory-mesh/install.sh exited {r.returncode} — not recorded as approved.")
+        # Recorded as a FAILED attempt, not left absent: an operator who reruns
+        # --audit should see that bootstrap was tried and did not complete,
+        # rather than an install that looks like it was never bootstrapped.
+        receipt.setdefault("gated_writes", {})["mesh-bootstrap"] = {
+            "approved_at": _now(), "written": False,
+            "error": f"memory-mesh/install.sh exited {r.returncode}",
+        }
+        _save_receipt(target, receipt)
+        return die(f"memory-mesh/install.sh exited {r.returncode} — not recorded "
+                   f"as approved (the failing step is named above).")
     store = _mesh_store_dir(target)  # re-derive: install.sh itself may be what created mesh_lib's importability
     post_memory_md = (store / "MEMORY.md") if store else None
     post_hash = _sha256_file(post_memory_md) if post_memory_md and post_memory_md.exists() else None
@@ -1257,7 +1417,11 @@ def _memory_hook_entries(target: Path) -> dict:
     out = {}
     for event, matcher, tail in MEMORY_HOOKS:
         parts = tail.split(" ", 1)
-        cmd = f"{sys.executable} {target / parts[0]}"
+        # Quoted: a legal --target containing a space installed and approved
+        # cleanly, then bash split the hook command and python could not open
+        # the script (2026-09-19 review, finding 13, executed as
+        # hook_path_spaces: exit 2 naming the truncated path).
+        cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(target / parts[0]))}"
         if len(parts) > 1:
             cmd += " " + parts[1]
         entry = {"hooks": [{"type": "command", "command": cmd}]}
@@ -1287,15 +1451,45 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
         return die(f"{settings} is not valid JSON ({e}) — refusing to touch it.")
     adding = _memory_hook_entries(target)
     hooks = doc.setdefault("hooks", {})
-    already = json.dumps(hooks)
+    # Dedup on (event, matcher, command), not on "this string appears anywhere
+    # in the hooks blob". A pre-existing UserPromptSubmit entry for retrieve.py
+    # used to suppress the PostToolUse entry for the SAME script — which was
+    # then still recorded in the receipt as approved, so the audit and the
+    # watcher looked for something that had never been written (2026-09-19
+    # review, finding 4, executed as existing_command_skips_other_event).
+    present = _wired_hook_keys(doc)
+    added, already_present = {}, {}
     for event, entries in adding.items():
         bucket = hooks.setdefault(event, [])
         for entry in entries:
-            if entry["hooks"][0]["command"] in already:
+            cmd = entry["hooks"][0]["command"]
+            # (event, matcher, command) — the comment above has said this since
+            # round 1; the code keyed on (event, command) until round 2 (R4).
+            if (entry.get("matcher") or "", cmd) in present.get(event, ()):
+                already_present.setdefault(event, []).append(cmd)
                 continue
             bucket.append(entry)
+            added.setdefault(event, []).append(cmd)
+    for event in [e for e, v in hooks.items() if not v]:
+        del hooks[event]
     after = (json.dumps(doc, indent=2) + "\n").encode()
     if after == before:
+        # Nothing new to write — but if there is no record at all, revoke and
+        # the audit have no subject, and `--revoke memory-hooks` then dies with
+        # "was never approved on this install" on an install whose hooks ARE
+        # wired (Grok, 2026-09-19). Record the adoption with an empty `entries`.
+        if not (receipt.get("gated_writes") or {}).get("memory-hooks"):
+            receipt.setdefault("gated_writes", {})["memory-hooks"] = {
+                "approved_at": _now(), "written": True, "adopted": True,
+                "entries": {}, "already_present": already_present,
+                "prior_sha": _sha256_bytes(before), "prior_bytes_len": len(before),
+                "after_sha": _sha256_bytes(after),
+            }
+            _save_receipt(target, receipt)
+            print("memory hooks already wired — adopting them in the receipt so "
+                  "--revoke and --audit have a subject (no entries are owned by "
+                  "this install).")
+            return 0
         print("memory hooks already wired — nothing to do.")
         return 0
     print(f"--- {settings} (before)\n+++ {settings} (after)")
@@ -1313,8 +1507,19 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
     _atomic_write(settings, after)
     receipt.setdefault("gated_writes", {})["memory-hooks"] = {
         "approved_at": _now(), "written": True,
-        "entries": {k: [e["hooks"][0]["command"] for e in v] for k, v in adding.items()},
-        "prior_sha": _sha256_bytes(before), "prior_bytes": before.decode("utf-8", "replace"),
+        # ONLY what this install actually added. It used to record every
+        # INTENDED command, including ones the dedup skipped, which made the
+        # receipt a statement of intent rather than of fact — and revoke then
+        # deleted entries it had never written.
+        "entries": added, "already_present": already_present,
+        # The IDENTITY of the prior file, never its CONTENT. Until 2026-09-19
+        # this recorded `prior_bytes` -- the user's whole prior
+        # settings.json, which routinely holds env.ANTHROPIC_API_KEY -- and
+        # _save_anchor then copied the entire receipt to
+        # ~/.cache/cc-seed/receipt-anchors/, OUTSIDE the target, where no
+        # uninstall removes it and no audit looks. Nothing ever read the
+        # bytes: revoke removes the recorded entries structurally.
+        "prior_sha": _sha256_bytes(before), "prior_bytes_len": len(before),
         "after_sha": _sha256_bytes(after),
     }
     _save_receipt(target, receipt)
@@ -1344,6 +1549,14 @@ def _confirm_hook_write() -> bool:
     try:
         return input("write these entries? [y/N] ").strip().lower() in ("y", "yes")
     except EOFError:
+        # Interactive BY DESIGN — but say WHY, or an automation author sees a
+        # silent "not written." and a rc of 1 with nothing to act on
+        # (2026-09-19, Grok P2).
+        print("no TTY to ask on, and CI is not 'true' — this gate is "
+              "interactive by design. In automation, run it as: "
+              "CI=true install.py --target ... --approve memory-hooks --apply "
+              "(which means 'I have read the staged diff above and affirm it').",
+              file=sys.stderr)
         return False
 
 
@@ -1361,13 +1574,25 @@ def revoke(target: Path, which: str) -> int:
         return die(f"{settings} is gone — nothing to remove.")
     before = settings.read_bytes()
     doc = json.loads(before)
-    recorded = {cmd for cmds in record.get("entries", {}).values() for cmd in cmds}
+    # Per EVENT, and per individual hook ITEM. Revoke used to drop every entry
+    # in a group that contained any recorded command, taking a pre-existing
+    # operator hook and anything they had appended to the same group with it
+    # (2026-09-19 review, finding 4, executed as revoke_deletes_user_hooks).
+    recorded = {event: set(cmds) for event, cmds in (record.get("entries") or {}).items()}
     hooks = doc.get("hooks", {})
     for event in list(hooks):
-        kept = [e for e in hooks[event]
-                if not any(h.get("command") in recorded for h in e.get("hooks", []))]
-        if kept:
-            hooks[event] = kept
+        mine = recorded.get(event, set())
+        if not mine:
+            continue
+        kept_entries = []
+        for e in hooks[event]:
+            inner = [h for h in e.get("hooks", []) if h.get("command") not in mine]
+            if inner:
+                kept_entries.append(dict(e, hooks=inner))
+            elif not e.get("hooks"):
+                kept_entries.append(e)      # a group we never touched
+        if kept_entries:
+            hooks[event] = kept_entries
         else:
             del hooks[event]
     if not hooks:
@@ -2596,6 +2821,97 @@ def _verify_registered_skill_link(target: Path, package: Path, name: str):
     return None
 
 
+def _wired_hook_keys(doc: dict) -> dict:
+    """event -> {(matcher, command), ...} — the dedup identity of a hook.
+
+    2026-09-19 round 2 (R4). The approve dedup used _wired_hooks(), which keys
+    on the COMMAND alone, so a pre-existing entry running one of our scripts
+    under ANY matcher suppressed ours under every matcher. Reproduced on
+    {{REDACTED}}: seed `.claude/settings.json` with PreToolUse matcher "Bash"
+    running memory-write-guard.py, then --approve memory-hooks --apply. The
+    shipped entry (matcher Write|Edit|MultiEdit|NotebookEdit|Bash) was skipped
+    as already-present, and the write guard did not run on Write or Edit at all
+    — the exact tool calls it exists to stop. A matcher is part of WHEN a hook
+    runs, so it is part of whether the hook we need is there.
+
+    A missing matcher and an empty matcher are the same thing to the harness
+    (match everything), so both normalise to "".
+    """
+    out = {}
+    for event, entries in (doc.get("hooks") or {}).items():
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            matcher = e.get("matcher") or ""
+            for h in (e.get("hooks") or []):
+                if isinstance(h, dict) and h.get("command"):
+                    out.setdefault(event, set()).add((matcher, h["command"]))
+    return out
+
+
+def _wired_hooks(doc: dict) -> dict:
+    """event -> {command, ...} actually present as runnable hooks."""
+    out = {}
+    for event, entries in (doc.get("hooks") or {}).items():
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            for h in (e.get("hooks") or []):
+                if isinstance(h, dict) and h.get("command"):
+                    out.setdefault(event, set()).add(h["command"])
+    return out
+
+
+def _verify_hook_wiring(target: Path, record: dict) -> list:
+    """settings.json, checked STRUCTURALLY against what the receipt says was
+    approved (2026-09-19, SEED-080 review finding 2).
+
+    check 1 used to exempt settings.json from the audit entirely whenever a
+    memory-hooks record existed, and fold_watch -- the check it delegated to --
+    searched the file as raw TEXT. So replacing the whole `hooks` block with a
+    `notes` field holding the same command strings passed BOTH, with nothing
+    runnable wired; `disableAllHooks: true` passed both as well. An exemption
+    that delegates to a text match is not an exemption, it is a blind spot."""
+    settings = _settings_path(target)
+    problems = []
+    if not settings.exists():
+        return [f".claude/settings.json: the receipt records approved memory "
+                f"hooks, but the file is gone — nothing is wired"]
+    raw = settings.read_bytes()
+    try:
+        doc = json.loads(raw or b"{}")
+    except ValueError as e:
+        return [f".claude/settings.json: not valid JSON ({e}) — the approved "
+                f"hooks cannot be running"]
+    if doc.get("disableAllHooks") is True:
+        problems.append(".claude/settings.json: disableAllHooks is true — every "
+                        "approved hook is present in the file and none of them runs")
+    wired = _wired_hooks(doc)
+    for event, cmds in (record.get("entries") or {}).items():
+        for cmd in cmds:
+            if cmd not in wired.get(event, ()):
+                problems.append(f".claude/settings.json: approved hook is not "
+                                f"wired under {event}: {cmd}")
+    after_sha = record.get("after_sha")
+    if after_sha and _sha256_bytes(raw) != after_sha:
+        recorded = {c for cmds in (record.get("entries") or {}).values() for c in cmds}
+        live = {c for cmds in wired.values() for c in cmds}
+        added = sorted(live - recorded)
+        removed = sorted(recorded - live)
+        problems.append(
+            ".claude/settings.json: DRIFT since the approved write "
+            f"(sha {_sha256_bytes(raw)[:12]} != recorded {after_sha[:12]})"
+            + (f"; hooks added since: {added}" if added else "")
+            + (f"; approved hooks missing: {removed}" if removed else "")
+            + ("; the hook set is unchanged, so the difference is elsewhere in "
+               "the file" if not added and not removed else ""))
+    return problems
+
+
 def _check_1(target: Path, package: Path, receipt: dict) -> dict:
     written = receipt["install"].get("components", [])
     baseline = receipt.get("baseline", {})
@@ -2634,6 +2950,11 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             problems.append(f"{f}: {reason}")
 
     problems.extend(_verify_deferred_skills(target, receipt))
+    problems.extend(_verify_refused_skills(target, receipt))
+    for d in receipt["install"].get("refused_skills", []) or []:
+        # A refused skill has no project-scope link BY DESIGN — the FLAG above
+        # is the report; don't ALSO call its absence unexpected drift.
+        checked_rel.add(f".claude/skills/{d['name']}")
     for d in receipt["install"].get("deferred_skills", []) or []:
         # A deferred skill has no project-scope link BY DESIGN — don't let the
         # unexpected-path sweep below report its absence as drift.
@@ -2663,15 +2984,23 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             continue  # install.py's own receipt/staged scaffold
         if rel == "CLAUDE.md":
             continue  # owned by check 3
-        if rel in (".claude", ".claude/settings.json") and \
-                (receipt.get("gated_writes") or {}).get("memory-hooks"):
+        hook_record = (receipt.get("gated_writes") or {}).get("memory-hooks")
+        if rel == ".claude" and hook_record:
+            continue
+        if rel == ".claude/settings.json" and hook_record:
             # SEED-080: settings.json is not shipped and is not baseline — it
             # is the product of an approved gated write, and the receipt says
             # so. Reporting it as UNEXPECTED taught the operator to ignore an
             # UNEXPECTED line, which is the one line that must never become
-            # background noise. The entries themselves are checked by
-            # memory-mesh/fold_watch.py against that same record.
-            continue
+            # background noise. But the exemption is only earned by an ACTIVE
+            # record, and it is no longer a free pass: the entries are checked
+            # here, structurally, against that same record (2026-09-19).
+            if hook_record.get("written"):
+                problems.extend(_verify_hook_wiring(target, hook_record))
+                continue
+            # A REVOKED record grants nothing. The file is then just a file
+            # this package does not own; it falls through to the baseline
+            # comparison or to UNEXPECTED, as any other unmanaged path would.
         if "__pycache__" in rel.split("/") or rel.endswith((".pyc", ".pyo")):
             continue  # bytecode cache — a harmless side effect of running any shipped .py tool
         if any(rel == p.rstrip("/") or rel.startswith(p) for p in runtime_writable_prefixes):
@@ -2683,6 +3012,17 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             continue
         problems.append(f"{_escape_path(rel)}: UNEXPECTED — not shipped by the package, not in "
                          f"the pre-install baseline, not a declared runtime path")
+
+    # The sweep above walks what IS on disk, so a baseline path that has since
+    # been DELETED was never a subject of any check — a pre-existing operator
+    # note could be removed and check 1 still said PASS (2026-09-19, SEED-080
+    # review finding 5, executed as baseline_deletion_not_audited). Absence is
+    # a change to pre-existing content like any other.
+    for rel in sorted(baseline):
+        if not os.path.lexists(str(target / rel)):
+            problems.append(f"{_escape_path(rel)}: pre-existing path recorded in "
+                            f"the baseline is GONE — it was removed after the "
+                            f"install without a gated-write record")
 
     return _flagged("1", "package trace", problems) if problems else _pass("1", "package trace")
 
@@ -3484,7 +3824,22 @@ def do_adopt_baseline(target: Path) -> int:
     present = [c for c in SHIPPED_PATHS if (target / c).exists()]
     shipped = _shipped_snapshot(target, present)
     receipt = {
-        "schema": 1,
+        # 2 (2026-09-19, SEED-080 bug bash). What changed:
+        #   install.refused_skills[]        — a skill the origin rule REFUSED
+        #   gated_writes.memory-hooks.entries        — now ONLY what was added
+        #   gated_writes.memory-hooks.already_present — what was already wired
+        #   gated_writes.memory-hooks.adopted        — wired before we arrived
+        #   gated_writes.memory-hooks.prior_bytes_len — replaces prior_bytes,
+        #       which copied the user's whole settings.json (API key and all)
+        #       into the receipt AND the out-of-target anchor
+        #   install.package_sha              — the dist the install came from
+        # Nothing READS `schema`, and every reader of the fields above uses
+        # .get() with a default, so a schema-1 receipt keeps working: a
+        # missing refused_skills is no refusals, a missing prior_bytes_len is
+        # simply not reported, and prior_bytes on an old receipt is left alone
+        # rather than rewritten (an uninstall removes it with the receipt).
+        # Migration note: docs/install-audit.md.
+        "schema": 2,
         "install": {
             "target": str(target), "mode": "adopted",
             "installer_version": _installer_version_of(target),
@@ -3503,6 +3858,33 @@ def do_adopt_baseline(target: Path) -> int:
          f"exactly what's on disk today as the known-good reference point. Run "
          f"--update to check for anything newer.")
     return 0
+
+
+def _redecide_skill_origins(target: Path, receipt: dict) -> int:
+    """Re-ask the ORIGIN question for every shipped skill that is not already
+    correctly registered, and reconcile the receipt. Returns how many were
+    newly registered.
+
+    This is the repair path for a REFUSED skill. Until 2026-09-19 there wasn't
+    one: the refusal left no link and no record, and `--update` returned early
+    on "already current (version X) — nothing to do" (and again on "nothing to
+    apply"), so removing the colliding user-scope file and re-running --update
+    --apply exited 0 and still registered nothing (2026-09-19 review, finding
+    5, executed as refused_skill_retry). "No files to write" is not "nothing to
+    do"."""
+    registered, deferred, refused, seen = _register_new_skills(target)
+    _merge_deferred(receipt, deferred)
+    _merge_refused(receipt, refused, seen)
+    regs = receipt["install"].setdefault("registered_skills", [])
+    for name in registered:
+        if name not in regs:
+            regs.append(name)
+    if registered or refused or seen:
+        _save_receipt(target, receipt)
+    if registered:
+        print(f"registered {len(registered)} skill(s) whose origin question could "
+              f"now be answered: {', '.join(registered)}")
+    return len(registered)
 
 
 def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -> int:
@@ -3530,7 +3912,12 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                           f"installed {current_version!r} — refusing (pass --allow-downgrade "
                           f"if this is deliberate, e.g. --from a specific local clone)")
             if new_version != "unknown" and new_version == current_version:
-                print(f"update: already current (version {current_version}) — nothing to do.")
+                print(f"update: already current (version {current_version}).")
+                if apply:
+                    _redecide_skill_origins(target, receipt)
+                else:
+                    print("  (dry run — pass --apply to re-ask the skill origin "
+                          "question for anything refused or unregistered)")
                 return 0
 
             shipped_now = receipt.get("shipped")
@@ -3577,14 +3964,27 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 print("\n(dry run — pass --apply to write these changes)")
                 return 0
             if not plan["create"] and not plan["update"]:
-                print("\nnothing to apply.")
+                # No FILES to write is not the same as nothing to DO. A skill
+                # refused at install (a different user-scope twin) leaves no
+                # link, and the only way to repair it is to re-ask the origin
+                # question — which used to be unreachable, because the same
+                # version had nothing to apply and this branch returned first.
+                # Remove the collision, re-run --update --apply, exit 0, still
+                # no link (2026-09-19 review, finding 5, executed as
+                # refused_skill_retry). The origin question is re-asked here.
                 if bootstrapped:
                     receipt["shipped"] = shipped_now
+                if not _redecide_skill_origins(target, receipt):
+                    print("\nnothing to apply.")
+                elif bootstrapped:
                     _save_receipt(target, receipt)
                 return 0
 
             _apply_update(target, receipt, new_tree, plan, new_snap)
-            newly_registered = _register_new_skills(target)
+            newly_registered, newly_deferred, newly_refused, seen_names = \
+                _register_new_skills(target)
+            _merge_deferred(receipt, newly_deferred)
+            _merge_refused(receipt, newly_refused, seen_names)
             # SEED-080 (the SEED-076 receipt-audit bug): --update refreshed
             # receipt["shipped"] but never extended install.components or
             # install.registered_skills — and _check_1 enumerates from exactly
@@ -3609,6 +4009,11 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             })
             receipt["updates"] = updates
             receipt["install"]["installer_version"] = new_version
+            # R2: an update legitimately rewrites shipped bytes, so the
+            # measurement is retaken here. Only install and update refresh it —
+            # an --audit or --approve run must never re-baseline a tampered
+            # tree, which is the whole point of recording it.
+            _record_installed_sha(target, receipt)
             _save_receipt(target, receipt)
             print(f"\napplied: {len(plan['create'])} created, {len(plan['update'])} updated. "
                  f"{len(plan['skip_dirty'])} locally-modified path(s) left untouched — review "
@@ -3740,11 +4145,22 @@ def main():
     args = ap.parse_args()
 
     if args.detect:
-        if (args.target or args.enable_demo or args.enable_governance or args.uninstall
-                or args.approve or args.audit or args.list_packs or args.remove_pack
-                or args.set_engagement or args.apply_proposal or args.revert_proposal
-                or args.review_proposals or args.apply_proposals):
-            return die("--detect takes no other flags (it's a read-only report)")
+        # Enumerated from the PARSER, not from a hand-maintained list of
+        # flags. The hand-maintained one silently stopped covering new
+        # operations: `--detect --revoke memory-hooks --apply`,
+        # `--detect --contract` and `--detect --update` all returned 0 having
+        # run only the survey, never the operation the caller asked for
+        # (2026-09-19 review, finding 14, executed as
+        # parse_ignored_operation). Anything a future wave adds is covered on
+        # the day it is added.
+        DETECT_COMPATIBLE = {"detect", "from_pack", "verbose"}
+        defaults = ap.parse_args([])
+        combined = sorted(
+            k for k, v in vars(args).items()
+            if k not in DETECT_COMPATIBLE and v != getattr(defaults, k, None))
+        if combined:
+            return die(f"--detect takes no other flags (it's a read-only report); "
+                       f"got: {', '.join('--' + c.replace('_', '-') for c in combined)}")
         return detect()
     if not args.target:
         return die("--target is required (or use --detect for a read-only survey)")

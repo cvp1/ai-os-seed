@@ -43,6 +43,7 @@ Stdlib only; targets /usr/bin/python3.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,8 +76,23 @@ def record(prop, status, detail=""):
     print(f"  {tag}: {prop}" + (f" — {detail}" if detail else ""))
 
 
+# Every ambient variable that can move the store, the event log or the
+# provenance log out from under a sandboxed run. Until 2026-09-19 run() merged
+# the sandbox's values INTO os.environ without clearing these, so a shell that
+# happened to export MEMORY_WRITE_STORE/MESH_ROOT — the drill's own shape —
+# made M1's real writer plant its probe OUTSIDE the sandbox and the contract
+# then passed on a file it had not written there (SEED-080 review, finding 7,
+# executed as ambient_override_actual_write: intended=False, outside=True).
+SCRUB_PREFIXES = ("MESH_", "MEMORY_WRITE_", "SESSION_PROVENANCE_")
+
+
+def scrubbed_environ():
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith(SCRUB_PREFIXES)}
+
+
 def run(cmd, env=None, cwd=None, timeout=TIMEOUT, stdin=None):
-    e = dict(os.environ)
+    e = scrubbed_environ()
     e.update(env or {})
     return subprocess.run([str(c) for c in cmd], capture_output=True, text=True,
                           env=e, cwd=cwd, timeout=timeout, input=stdin)
@@ -144,6 +160,18 @@ class Sandbox:
         self.store.mkdir(parents=True)
         # The fold only generates MEMORY.md for a store that has opted in.
         (self.store / ".mesh-generated").write_text("contract_test\n")
+        # Checked, not assumed (PRINCIPLES 1): the environment a sandboxed
+        # child will actually receive must carry no override but the
+        # sandbox's own.
+        composed = dict(scrubbed_environ(), **self.env)
+        leaked = sorted(k for k in composed if k.startswith(SCRUB_PREFIXES)
+                        and k not in self.env)
+        assert not leaked, (
+            f"a sandboxed child would inherit live overrides: {leaked} — "
+            f"SCRUB_PREFIXES does not cover them")
+        stray = sorted(k for k in self.env if k.startswith(SCRUB_PREFIXES)
+                       and k not in ("MESH_HOST", "MESH_SESSION_ID"))
+        assert not stray, f"the sandbox itself sets unexpected overrides: {stray}"
         for cmd in (["git", "init", "-q", str(self.store)],
                     ["git", "-C", str(self.store), "config", "user.email", "mesh@test"],
                     ["git", "-C", str(self.store), "config", "user.name", "contract"]):
@@ -161,6 +189,114 @@ class Sandbox:
     def fold(self):
         return run([sys.executable, str(HERE / "fold.py"), "--project"],
                    env=self.env)
+
+
+# ── what was tested ─────────────────────────────────────────────────────────
+def tested_identity():
+    """The identity of the PACKAGE this contract is running inside, or None.
+
+    2026-09-19 (SEED-080 bug bash, finding 3): the evidence file used to be
+    bound to dist/ at RECORD time, so a green run produced against one build
+    could be stamped onto a different one — publish.sh then gated on a proof
+    about bytes nobody had tested. A run now carries the sha of the package
+    it was installed from, straight out of that install's own receipt, and
+    contract_evidence.record() refuses when it does not match the dist being
+    published.
+    """
+    doc = install_receipt()
+    if doc is None:
+        return None, None
+    return str(HERE.parent), (doc.get("install") or {}).get("package_sha")
+
+
+def install_receipt():
+    """This install's receipt, or None when these bytes are not an install."""
+    try:
+        return json.loads((HERE.parent / ".cc-seed" / "receipt.json")
+                          .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+# ── M0: what actually ran ───────────────────────────────────────────────────
+# 2026-09-19 round 2 (R2). `tested_sha` above was the receipt's CLAIM about the
+# dist the install came from — never a measurement of the bytes under test.
+# Reproduced on {{REDACTED}}: append one line to <root>/memory-mesh/
+# memory_write.py after installing, and the contract still reported the clean
+# dist sha, went 14/14 GREEN, and contract_evidence recorded AND verified it.
+# The publish gate was proving dist/, not the tree the contract ran inside.
+#
+# installed_sha() below is a BYTE-IDENTICAL copy of install.py's function of
+# the same name (this file lives in the installed tree and cannot import the
+# installer). cc-seed/tools/selftest_installed_sha.py asserts the two agree on
+# the same tree, so the copies cannot drift apart unnoticed. The algorithm is
+# contract_evidence.dist_sha()'s exactly: sorted relative posix path, then the
+# sha256 of each file's bytes.
+INSTALLED_SHA_EXEMPT = {
+    "scheduler/manifest.yml",
+}
+
+
+def installed_sha(target, components, root_files):
+    """One hash over every shipped file as it exists in the TARGET."""
+    import hashlib
+    h = hashlib.sha256()
+    paths = []
+    for comp in components:
+        base = Path(target) / comp
+        if not base.is_dir():
+            continue
+        paths.extend(p for p in base.rglob("*") if p.is_file())
+    for f in root_files:
+        p = Path(target) / f
+        if p.is_file():
+            paths.append(p)
+    for p in sorted(paths):
+        rel = p.relative_to(Path(target)).as_posix()
+        if "__pycache__" in p.parts or rel in INSTALLED_SHA_EXEMPT:
+            continue
+        h.update(rel.encode())
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()
+
+
+ROOT_FILES = ["PRINCIPLES.md", "PROPOSALS.md", "CLAUDE.md.template",
+              "README.md.template", "VERSION"]
+
+
+def m0_package_integrity():
+    """Do the bytes under test still match what the install wrote?
+
+    Recorded ONLY inside an install. Run from a working copy (the fleet's own
+    memory-mesh) there is no receipt and nothing claims what these bytes should
+    be, so there is no property to score — and a run with no M0 row cannot be
+    recorded as evidence, because contract_evidence requires it. That is the
+    intended shape: evidence comes from an install, never from a working copy.
+
+    Returns the live hash, or None when this is not an install.
+    """
+    doc = install_receipt()
+    if doc is None:
+        return None
+    root = HERE.parent
+    components = (doc.get("install") or {}).get("components", [])
+    live = installed_sha(root, components, ROOT_FILES)
+    claimed = (doc.get("install") or {}).get("installed_sha")
+    if not claimed:
+        record("M0-package-integrity", "FAIL",
+               "the receipt does not say what this install wrote "
+               "(no install.installed_sha) — nothing can be compared, so "
+               "these bytes are unproven")
+        return live
+    if live != claimed:
+        record("M0-package-integrity", "FAIL",
+               f"the installed tree DRIFTED from its receipt: live "
+               f"{live[:16]} != recorded {claimed[:16]} — the bytes running "
+               f"here are not the bytes this install wrote")
+        return live
+    record("M0-package-integrity", "PASS",
+           f"the installed tree still matches its receipt ({live[:16]})")
+    return live
 
 
 # ── M1 ──────────────────────────────────────────────────────────────────────
@@ -198,11 +334,84 @@ def m1_one_door(sb, harness):
                        "content": "---\nname: bypass\n---\nwritten around the door\n"},
     })
     g = run([sys.executable, str(guard)], env=sb.env, stdin=payload)
-    blocked = g.returncode != 0 or "deny" in (g.stdout + g.stderr).lower()
+    # rc==2 specifically: the hook contract's "block" code. `!= 0` would have
+    # scored a guard that crashed on its own input as a successful denial
+    # (2026-09-19 review, M1 row).
+    blocked = g.returncode == 2 and "memory-write-guard" in (g.stdout + g.stderr)
     record("M1-guard", "PASS" if blocked else "FAIL",
            "direct store write refused" if blocked
-           else f"guard allowed a write around the door (rc={g.returncode})")
+           else f"guard did not refuse a write around the door "
+                f"(rc={g.returncode}) {(g.stdout + g.stderr)[-200:]}")
+    m1_bash_guard(sb, guard)
     return door
+
+
+def _guard_says(guard, sb, command):
+    """The guard's DECISION on a Bash command. The command is never executed —
+    only the hook is run, on a synthetic PreToolUse event."""
+    payload = json.dumps({
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+    })
+    return run([sys.executable, str(guard)], env=sb.env, stdin=payload)
+
+
+def m1_bash_guard(sb, guard):
+    """M1's Write-tool denial says nothing about the SHELL, which is where the
+    2026-09-19 bypass lived: `printf x > STORE/f.md # memory_write.py` was
+    allowed, because sanctioning was a substring test on the raw command.
+
+    Healthy baseline first (a plain read must be ALLOWED), so a guard that
+    denies everything — or crashes on every input — cannot score a pass here.
+    """
+    target = sb.store / "bash-bypass-probe.md"
+    healthy = _guard_says(guard, sb, f"grep -c foo {sb.store}/MEMORY.md")
+    if healthy.returncode != 0:
+        record("M1-bash-guard", "FAIL",
+               f"the guard refused a plain READ (rc={healthy.returncode}); "
+               "a guard that denies everything proves nothing")
+        return
+    # 2026-09-19 round 2: an IMPOSTOR door — a real file named memory_write.py
+    # that is not this install's — plus inline code in a runtime, which writes
+    # the store with no shell redirect at all. Both were ALLOWED by the
+    # round-1 guard. The impostor has to be a real file on disk, or the case
+    # proves only that an unresolvable path denies.
+    impostor_dir = Path(sb.mesh_root).parent / "impostor-door"
+    impostor_dir.mkdir(parents=True, exist_ok=True)
+    impostor = impostor_dir / "memory_write.py"
+    impostor.write_text("#!/usr/bin/env python3\nraise SystemExit('not the door')\n")
+    door = Path(guard).resolve().parent.parent / "memory_write.py"
+
+    bypasses = [
+        (f"printf poison > {target}  # memory_write.py",
+         "a shell write wearing the writer's name in a comment"),
+        (f"python3 {impostor} write --commit > {target}",
+         "an impostor memory_write.py that is not this install's door"),
+        (f"python3 -c \"import pathlib; pathlib.Path('{target}')"
+         ".write_text('poison')\"",
+         "inline code in a runtime writing the store with no redirect"),
+    ]
+    for cmd, what in bypasses:
+        r = _guard_says(guard, sb, cmd)
+        if not (r.returncode == 2 and
+                "memory-write-guard" in (r.stdout + r.stderr)):
+            record("M1-bash-guard", "FAIL",
+                   f"ALLOWED (rc={r.returncode}): {what}")
+            return
+    # ...and the REAL door must still get through, or "denies everything" would
+    # score a pass on the three cases above.
+    genuine = _guard_says(
+        guard, sb,
+        f"/usr/bin/python3 {door} write --slug x --text 'MEMORY.md' --commit")
+    if genuine.returncode != 0:
+        record("M1-bash-guard", "FAIL",
+               f"the guard refused the REAL door (rc={genuine.returncode}); "
+               "a guard that denies the writer too proves nothing")
+        return
+    record("M1-bash-guard", "PASS",
+           "the comment bypass, an impostor door and inline runtime code are "
+           "all refused; the install's own door is not")
 
 
 def m1_harness(sb, door, harness):
@@ -312,14 +521,108 @@ def m3_fold_projects(sb):
         except Exception:
             servable = False
     ok = memory.is_file() and index.is_file() and decided and servable
-    record("M3-fold", "PASS" if ok else "FAIL",
-           f"file={memory.is_file()} index={index.is_file()} decided={decided} "
-           f"servable={servable}"
-           + ("" if ok else f" rc={r.returncode} {r.stdout[-300:]}{r.stderr[-300:]}"))
-    return ok
+    detail = (f"file={memory.is_file()} index={index.is_file()} "
+              f"decided={decided} servable={servable}")
+    if not ok:
+        record("M3-fold", "FAIL",
+               detail + f" rc={r.returncode} {r.stdout[-300:]}{r.stderr[-300:]}")
+        return False
+
+    # The property is PROJECTION — the fold rebuilding the store from the
+    # event log — and until 2026-09-19 nothing here made the fold do any of
+    # it: M1 had already written the file, so dropping `--project` entirely
+    # left M3 green (SEED-080 review finding 8, executed as
+    # m3_does_not_require_projection). Delete the body and make the fold put
+    # it back from the log. fold.py's contract is explicit about this: without
+    # --project it says "WOULD project (run with --project)", with it, it
+    # creates. So the store is a PROJECTION, not the source of truth, and
+    # this is the assertion that says so.
+    faults.append("deleted the probe's store file to force a re-projection")
+    memory.unlink()
+    r2 = sb.fold()
+    reprojected = memory.is_file()
+    faults.append("the fold re-projected it from the event log"
+                  if reprojected else "the fold did NOT re-project it")
+    record("M3-fold", "PASS" if reprojected else "FAIL",
+           detail + "; re-projected from the log after deletion"
+           if reprojected else
+           detail + f"; the fold could NOT rebuild {memory.name} from the "
+                    f"event log (rc={r2.returncode}) "
+                    f"{r2.stdout[-300:]}{r2.stderr[-300:]}")
+    return reprojected
 
 
 # ── M4 ──────────────────────────────────────────────────────────────────────
+def _retrieve_hook_wired(settings_path):
+    """Is THIS install's retrieve.py a real UserPromptSubmit hook in that
+    settings file? Structure, not substring; disableAllHooks disqualifies the
+    whole file, because a hook that is present and disabled does not run."""
+    if not settings_path.is_file():
+        return False
+    try:
+        doc = json.loads(settings_path.read_text(encoding="utf-8") or "{}")
+    except ValueError:
+        return False
+    if not isinstance(doc, dict) or doc.get("disableAllHooks") is True:
+        return False
+    want = str(HERE / "retrieve.py")
+    for entry in (doc.get("hooks") or {}).get("UserPromptSubmit") or []:
+        if not isinstance(entry, dict):
+            continue
+        for h in entry.get("hooks") or []:
+            if isinstance(h, dict) and _command_runs(h.get("command") or "", want):
+                return True
+    return False
+
+
+def _command_runs(command, want):
+    """Does this hook command RUN `want`, or merely mention it?
+
+    2026-09-19 round 2 (R4). The test was `want in command` — a substring of
+    the command STRING. Reproduced on {{REDACTED}}: all three of these scored
+    as wiring, and none of them delivers a single memory.
+
+        /usr/bin/python3 /opt/other/wrapper.py --about <want>   (an argument)
+        echo <want> >/dev/null                                  (an echo)
+        /usr/bin/python3 <want>.disabled                        (another file)
+
+    The path has to be the PROGRAM: argv0, or the first non-flag argument when
+    argv0 is a python interpreter, skipping leading VAR=val and `env` — the
+    exact shape the installer writes and the memory-write guard already parses.
+    Compared by realpath as well as literally, so a symlinked install still
+    counts. A hook wired through some other wrapper will FAIL this and say so;
+    that is the fail-closed direction, and the remedy it names
+    (`install.py --approve memory-hooks`) is one command.
+    """
+    import shlex
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    k = 0
+    while k < len(argv) and (argv[k] == "env" or
+                             re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argv[k])):
+        k += 1
+    if k >= len(argv):
+        return False
+    prog = argv[k]
+    if re.match(r"^(?:python|python[0-9.]*|pypy[0-9]*)$", os.path.basename(prog)):
+        k += 1
+        while k < len(argv) and argv[k].startswith("-"):
+            if argv[k] in ("-c", "-m"):
+                return False          # inline code / a module, not our script
+            k += 1
+        if k >= len(argv):
+            return False
+        prog = argv[k]
+    if prog == want:
+        return True
+    try:
+        return os.path.realpath(prog) == os.path.realpath(want)
+    except OSError:
+        return False
+
+
 def m4_reaches_session(sb, harness):
     payload = json.dumps({"hook_event_name": "UserPromptSubmit",
                           "prompt": PROBE_TURN})
@@ -338,17 +641,23 @@ def m4_reaches_session(sb, harness):
         # whole contract exists to make impossible.
         local = WORKSPACE / ".claude" / "settings.json"
         user = Path.home() / ".claude" / "settings.json"
+        # PARSED, not grepped. A substring match on the settings TEXT passed
+        # for a file whose entire `hooks` block had been replaced by a `notes`
+        # field holding the same strings, and for disableAllHooks: true — both
+        # executed in the 2026-09-19 review (no_hooks_green,
+        # disabled_hooks_green). Free text is not wiring.
         hit = next((p for p in (local, user)
-                    if p.is_file() and str(HERE) in p.read_text(encoding="utf-8")), None)
+                    if _retrieve_hook_wired(p)), None)
         if hit is None:
             # Nothing names THIS mesh. A hook naming some other install's
             # retrieve.py does not deliver this install's memory.
             looked = f"{local}, {user}"
             record("M4-wiring", "FAIL",
-                   f"no hook in {looked} runs {HERE}/retrieve.py — run "
-                   f"install.py --approve memory-hooks")
+                   f"no UserPromptSubmit hook in {looked} runs "
+                   f"{HERE}/retrieve.py — run install.py --approve memory-hooks")
         else:
-            record("M4-wiring", "PASS", f"{HERE.name}/retrieve.py wired in {hit}")
+            record("M4-wiring", "PASS", f"{HERE.name}/retrieve.py wired as a "
+                                        f"UserPromptSubmit hook in {hit}")
     else:
         record("M4-wiring", "SKIP",
                f"{harness} has no pre-prompt hook event — accepted exception "
@@ -372,40 +681,82 @@ def m5_recall_cites(sb):
         out = r.stdout
         surface = "retrieve.py (no recall.py CLI yet — Step 4b)"
     hit = PROBE_SLUG in out
-    # A citation is "where this came from", resolvable by the reader.
-    cited = hit and (sb.store / f"{PROBE_SLUG}.md").is_file()
+    # A citation is "where this came from", IN THE OUTPUT and resolvable by
+    # the reader. Until 2026-09-19 this accepted a bare slug in stdout plus
+    # the existence of a file the reader was never told about — so a surface
+    # that cited nothing at all passed (SEED-080 review finding 8, executed as
+    # weak_delivery_and_citation_assertions). Either the wiki-link form
+    # recall.py emits, or the store path itself, counts.
+    body = sb.store / f"{PROBE_SLUG}.md"
+    citation = next((c for c in (f"[[{PROBE_SLUG}]]", str(body), body.name)
+                     if c in out), None)
+    cited = hit and citation is not None and body.is_file()
     record("M5-recall", "PASS" if cited else "FAIL",
-           f"{surface}: hit={hit} resolvable={cited}")
+           f"{surface}: hit={hit} citation={citation!r} resolvable={body.is_file()}"
+           + ("" if cited else
+              f" — the output names the memory but not where to read it: "
+              f"{out[-240:]!r}"))
 
 
 # ── M6 ──────────────────────────────────────────────────────────────────────
+def _crashed(proc):
+    """Did this instrument fall over rather than report? A traceback is a
+    broken instrument, and a broken instrument is a FAIL — never a pass that
+    happens to be non-zero."""
+    err = (proc.stderr or "") + (proc.stdout or "")
+    return ("Traceback (most recent call last)" in err
+            or "ImportError" in err or "ModuleNotFoundError" in err
+            or "SyntaxError" in err)
+
+
 def m6_reports_breakage(sb):
     """Fault injection: the instruments must FAIL on a broken channel. An
     instrument that stays green on a dark corpus is the failure it was built
     to catch."""
     manifest = sb.mesh_root / "state" / "servable.json"
     saved = manifest.read_text(encoding="utf-8") if manifest.is_file() else None
-    try:
-        faults.append("removed the servable manifest from the sandbox store")
-        if manifest.is_file():
-            manifest.unlink()
-        c = run([sys.executable, str(HERE / "canary.py")], env=sb.env)
-        loud = c.returncode != 0
-        record("M6-dark-corpus", "PASS" if loud else "FAIL",
-               "canary.py exits non-zero on a dark corpus" if loud
-               else "canary.py reported health with no servable manifest")
-    finally:
-        if saved is not None:
-            manifest.write_text(saved, encoding="utf-8")
-            faults.append("restored the servable manifest")
+    # HEALTHY FIRST. `returncode != 0` alone scored ANY crash as a successful
+    # fault report: make both instruments raise ImportError and both negative
+    # checks passed (SEED-080 review finding 8, executed as
+    # unrelated_crash_passes_m6). An instrument that cannot run is not an
+    # instrument that detected something.
+    base = run([sys.executable, str(HERE / "canary.py")], env=sb.env)
+    if base.returncode != 0 or _crashed(base):
+        record("M6-dark-corpus", "FAIL",
+               f"canary.py does not pass on a HEALTHY corpus (rc="
+               f"{base.returncode}) — nothing it says about a broken one "
+               f"means anything: {(base.stdout + base.stderr)[-300:]}")
+    else:
+        try:
+            faults.append("removed the servable manifest from the sandbox store")
+            if manifest.is_file():
+                manifest.unlink()
+            c = run([sys.executable, str(HERE / "canary.py")], env=sb.env)
+            out = c.stdout + c.stderr
+            loud = c.returncode != 0 and not _crashed(c) and "dark" in out.lower()
+            record("M6-dark-corpus", "PASS" if loud else "FAIL",
+                   "canary.py exits non-zero on a dark corpus, naming it" if loud
+                   else (f"canary.py CRASHED rather than reporting it "
+                         f"(rc={c.returncode}): {out[-300:]}" if _crashed(c) else
+                         f"canary.py rc={c.returncode} and did not name a dark "
+                         f"corpus: {out[-300:]}"))
+        finally:
+            if saved is not None:
+                manifest.write_text(saved, encoding="utf-8")
+                faults.append("restored the servable manifest")
 
     # The fold cannot certify its own liveness (PRINCIPLES 21): something
     # outside its failure domain has to watch the timer, and be watched in
     # turn. Two shapes are legitimate — a seed install schedules fold_watch.py
     # as mesh_watch under its own scheduler; the fleet registers the fold's
     # systemd timer with the freshness checker directly.
-    freshness = WORKSPACE / "observability" / "freshness.json"
-    sched = WORKSPACE / "scheduler" / "manifest.yml"
+    # THIS install's scheduler, not the fleet's. contract_test.py running from
+    # inside a seed install used to read WORKSPACE — which on a fleet host is
+    # the fleet's own freshness.json — so a fresh install with nothing
+    # scheduled at all passed on the fleet's observer (codex, 2026-09-19).
+    observer_root = HERE.parent if (HERE.parent / ".cc-seed").is_dir() else WORKSPACE
+    freshness = observer_root / "observability" / "freshness.json"
+    sched = observer_root / "scheduler" / "manifest.yml"
     watchers = []
     if freshness.is_file():
         text = freshness.read_text(encoding="utf-8")
@@ -416,7 +767,7 @@ def m6_reports_breakage(sb):
     if sched.is_file() and "fold_watch.py" in sched.read_text(encoding="utf-8"):
         watchers.append("the scheduler runs fold_watch.py")
     record("M6-outside-observer", "PASS" if watchers else "FAIL",
-           "; ".join(watchers) if watchers
+           "; ".join(watchers) + f" [{observer_root}]" if watchers
            else f"nothing outside the fold watches it ({freshness}, {sched})")
 
     # And the watcher has to be able to FAIL — a green watcher that cannot go
@@ -429,16 +780,29 @@ def m6_reports_breakage(sb):
         record("M6-watcher-can-fail", "SKIP", "the sandbox fold wrote no state")
     else:
         stamps = {f: (f.stat().st_atime, f.stat().st_mtime) for f in state}
+        healthy = run([sys.executable, str(watch)], env=sb.env)
+        if healthy.returncode != 0 or _crashed(healthy):
+            record("M6-watcher-can-fail", "FAIL",
+                   f"fold_watch is not green on a HEALTHY sandbox "
+                   f"(rc={healthy.returncode}) — a watcher that is always red "
+                   f"proves nothing by going red: "
+                   f"{(healthy.stdout + healthy.stderr)[-300:]}")
+            return
         try:
             faults.append("backdated the sandbox fold's state files by 2h")
             old_ts = time.time() - 7200
             for f in state:
                 os.utime(f, (old_ts, old_ts))
             r = run([sys.executable, str(watch)], env=sb.env)
-            record("M6-watcher-can-fail", "PASS" if r.returncode != 0 else "FAIL",
-                   "fold_watch goes red on a stopped fold timer"
-                   if r.returncode != 0 else
-                   f"fold_watch stayed green with a 2h-old fold: {r.stdout[-200:]}")
+            out = r.stdout + r.stderr
+            loud = r.returncode != 0 and not _crashed(r) and "fold" in out.lower()
+            record("M6-watcher-can-fail", "PASS" if loud else "FAIL",
+                   "fold_watch goes red on a stopped fold timer, naming it"
+                   if loud else
+                   (f"fold_watch CRASHED instead of reporting: {out[-300:]}"
+                    if _crashed(r) else
+                    f"fold_watch rc={r.returncode} and did not name the fold: "
+                    f"{out[-300:]}"))
         finally:
             for f, ts in stamps.items():
                 os.utime(f, ts)
@@ -489,9 +853,21 @@ def main(argv=None):
     ap.add_argument("--json", metavar="PATH",
                     help="write the evidence file publish.sh gates on")
     args = ap.parse_args(argv)
-    want = {m.upper() for m in (args.only or ["M1", "M2", "M3", "M4", "M5", "M6"])}
+    ALL = ["M1", "M2", "M3", "M4", "M5", "M6"]
+    want = {m.upper() for m in (args.only or ALL)}
+    # `--only M7` used to run NOTHING and exit 0 — and `--json` then wrote
+    # `green: true` over an empty result set, which contract_evidence happily
+    # recorded and verified (2026-09-19 review, finding 3b).
+    unknown = sorted(want - set(ALL))
+    if unknown:
+        print(f"no such property: {', '.join(unknown)} — known: {', '.join(ALL)}",
+              file=sys.stderr)
+        return 2
 
     started = time.time()
+    # R2: the FIRST thing measured, before any property runs — whether the
+    # bytes about to be exercised are the bytes this install wrote.
+    live_sha = m0_package_integrity()
     print(f"contract_test — memory-mesh, {WORKSPACE}"
           + (f", harness={args.harness}" if args.harness else ""))
     with tempfile.TemporaryDirectory(prefix="mesh-contract-") as tmp:
@@ -534,9 +910,20 @@ def main(argv=None):
         for f in faults:
             print(f"  - {f}")
     if args.json:
+        tested_root, package_sha = tested_identity()
         Path(args.json).write_text(json.dumps({
             "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "workspace": str(WORKSPACE),
+            "tested_root": tested_root,
+            # R2: `tested_sha` is now a MEASUREMENT of the installed tree these
+            # properties ran against, taken at test time. `tested_package_sha`
+            # is the receipt's claim about the dist it came from — the binding
+            # contract_evidence.record() checks against the dist being
+            # published. Two different facts; they used to be one, and the one
+            # was the claim.
+            "tested_sha": live_sha,
+            "tested_package_sha": package_sha,
+            "selected": sorted(want),
             "harness": args.harness,
             "green": not fails and not skips,
             "results": [{"property": n, "status": s, "detail": d}

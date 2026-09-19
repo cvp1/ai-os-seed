@@ -8,6 +8,46 @@ import retrieve
 import learning
 import effectiveness
 
+class FoldWatchPeerLivenessTests(unittest.TestCase):
+    """SEED-080 review finding 6: fold.py wrote bare git SHAs into
+    last-seen.json and fold_watch did `float(ts)` on them. The ValueError fell
+    through a bare `continue`, dropping the peer from consideration entirely --
+    and the function then announced "N peer(s) seen recently" about peers whose
+    age it had never established. A 24h-old file naming an offline peer
+    returned OK."""
+
+    def _check(self, data, max_age=1800):
+        import json
+        import fold_watch
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "state"
+            state.mkdir()
+            (state / "last-seen.json").write_text(json.dumps(data))
+            with mock.patch.object(fold_watch.M, "MESH_ROOT", Path(td)):
+                return fold_watch.check_peers(max_age)
+
+    def test_fresh_timestamp_is_green(self):
+        import time
+        name, status, _ = self._check({"peer": {"sha": "a" * 40,
+                                                "ts": int(time.time())}})
+        self.assertEqual((name, status), ("peers", "OK"))
+
+    def test_old_timestamp_is_red(self):
+        import time
+        name, status, detail = self._check(
+            {"peer": {"sha": "a" * 40, "ts": int(time.time()) - 25 * 3600}})
+        self.assertEqual((name, status), ("peers", "FAIL"))
+        self.assertIn("peer", detail)
+
+    def test_legacy_bare_sha_is_unknown_age_not_ok(self):
+        # The exact pre-fix shape. It must NEVER read as "seen recently".
+        name, status, detail = self._check({"peer": "8f2c1d9e" * 5})
+        self.assertEqual(name, "peers")
+        self.assertEqual(status, "UNKNOWN")
+        self.assertIn("UNKNOWN AGE", detail)
+        self.assertNotIn("seen recently", detail)
+
+
 class MeshCoreTests(unittest.TestCase):
     def test_event_validation_and_residency_caps(self):
         ev, line = mesh_lib.make_event("assert", "home/x", "fact", session="s", home="vault/x", residency="pinned")

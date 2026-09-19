@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 # Defaults to the INSTALLED hook; pass a path to vet a candidate before it goes
 # live. The hook is symlinked from ~/.claude/hooks, so editing it in place is
@@ -17,6 +18,23 @@ HOOK = sys.argv[1] if len(sys.argv) > 1 else \
 _ws = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 STORE = os.environ.get("MEMORY_WRITE_GUARD_STORE") or os.path.realpath(os.path.join(
     os.path.expanduser("~"), ".claude", "projects", _ws.replace("/", "-"), "memory"))
+# 2026-09-19 (round 2): the sanctioned door is a FILE identity, not a basename,
+# so the cases must name the door of the guard UNDER TEST -- one directory up
+# from the hook. Hardcoding this workspace's path made the shipped selftest
+# wrong for every install but this one. WORKSPACE is the base a
+# workspace-relative invocation resolves against.
+DOOR = os.path.realpath(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(HOOK))), "memory_write.py"))
+WORKSPACE = os.path.dirname(os.path.dirname(DOOR))
+MESH = os.path.basename(os.path.dirname(DOOR))
+# A file that is NOT the door but wears its name -- the round-2 P1. A fixed
+# path under the temp dir: rewritten each run, never accumulating, never
+# removed (nothing in this tree gets rm'd).
+IMPOSTOR_DIR = os.path.join(tempfile.gettempdir(),
+                            "memory-write-guard-selftest-impostor")
+os.makedirs(IMPOSTOR_DIR, exist_ok=True)
+with open(os.path.join(IMPOSTOR_DIR, "memory_write.py"), "w") as _fh:
+    _fh.write("#!/usr/bin/env python3\nraise SystemExit('not the door')\n")
 
 CASES = [
     # (must_deny, tool, payload, label)
@@ -50,7 +68,7 @@ CASES = [
 
     # --- must ALLOW: the false positives ---
     (False, "Bash",
-     'git -C /home/{{REDACTED}}/{{REDACTED}}/memory-mesh commit -qm "fix: an event '
+     f'git -C {WORKSPACE}/{MESH} commit -qm "fix: an event '
      'never folds into MEMORY.md; see events/<host>.ndjson"',
      "commit message naming MEMORY.md and containing >"),
     (False, "Bash", 'git commit -m "rewrite MEMORY.md handling"',
@@ -58,25 +76,25 @@ CASES = [
     (False, "Bash", "cat MEMORY.md 2>/dev/null", "read with /dev/null"),
     (False, "Bash", f"grep foo {STORE}/MEMORY.md", "plain read"),
     (False, "Bash",
-     f"/usr/bin/python3 memory-mesh/memory_write.py write "
+     f"/usr/bin/python3 {MESH}/memory_write.py write "
      f"--slug x --commit > /tmp/out", "sanctioned writer"),
-    (False, "Write", "/home/{{REDACTED}}/{{REDACTED}}/notes.md", "Write outside store"),
+    (False, "Write", f"{WORKSPACE}/notes.md", "Write outside store"),
 
     # --- 2026-07-30: the four false positives that motivated the narrowing ---
     (False, "Bash",
-     "cat > /home/{{REDACTED}}/{{REDACTED}}/evals/reviews/note.md <<'EOF'\n"
+     f"cat > {WORKSPACE}/evals/reviews/note.md <<'EOF'\n"
      "The fold writes MEMORY.md every five minutes, and QUARANTINE.md\n"
      "holds what it will not serve.\nEOF",
      "heredoc doc write whose PROSE names the store"),
     (False, "Bash",
-     "cat >> /home/{{REDACTED}}/{{REDACTED}}/memory-mesh/README.md <<'EOF'\n"
+     f"cat >> {WORKSPACE}/{MESH}/README.md <<'EOF'\n"
      "See MEMORY.md for the generated index.\nEOF",
      "README append mentioning MEMORY.md"),
     (False, "Bash",
-     "echo x > /home/{{REDACTED}}/{{REDACTED}}/memory-mesh/MEMORY.md",
+     f"echo x > {WORKSPACE}/{MESH}/MEMORY.md",
      "a MEMORY.md that is NOT the store"),
     (False, "Bash",
-     "rm /home/{{REDACTED}}/{{REDACTED}}/docs/notes-about-MEMORY.md",
+     f"rm {WORKSPACE}/docs/notes-about-MEMORY.md",
      "a filename merely containing MEMORY.md"),
     # The guard denied this shape minutes after the narrowing shipped: a
     # /dev/null redirect inside a command substitution ends at `)`, which was
@@ -106,6 +124,86 @@ CASES = [
      "arrow in a git --format spec"),
     (True, "Bash", f'echo "poison"->{STORE}/MEMORY.md',
      "arrow that IS a redirect into the store -- why the class cannot be exempted"),
+
+    # --- 2026-09-19: the SANCTIONED substring bypass (P0) ---
+    # `SANCTIONED = "memory_write.py"` + `SANCTIONED not in cmd` made the
+    # ELEVEN CHARACTERS the credential: any occurrence anywhere exempted the
+    # whole command. Sanctioning is now structural and per-segment. Each of
+    # these was ALLOWED (rc=0) before the fix; (a) really created its file.
+    (True, "Bash", f"printf poison > {STORE}/bypass.md  # memory_write.py",
+     "trailing-comment bypass"),
+    (True, "Bash", f"echo memory_write.py > {STORE}/x.md",
+     "the writer's name as DATA being written"),
+    (True, "Bash",
+     f"/usr/bin/python3 {MESH}/memory_write.py --selftest && "
+     f"printf x > {STORE}/sibling.md",
+     "a sanctioned segment must not sanction its sibling"),
+    (True, "Bash", f'echo "memory_write.py" | tee {STORE}/MEMORY.md',
+     "writer name in a quoted string piped to tee"),
+    (True, "Bash", f"cp /tmp/evil {STORE}/MEMORY.md # memory_write.py did it",
+     "comment bypass on a cp"),
+    # ...and the genuine writer must still be allowed, by either spelling.
+    (False, "Bash",
+     f"/usr/bin/python3 {MESH}/memory_write.py write --slug x "
+     f"--text 'the fold writes MEMORY.md' --commit",
+     "genuine writer, workspace-relative path, prose naming the store"),
+    (False, "Bash",
+     f"/usr/bin/python3 {DOOR} "
+     f"write --slug x --text 'see {STORE}/MEMORY.md' --commit",
+     "genuine writer, absolute path, store path in an argument"),
+    (False, "Bash",
+     f"cd {WORKSPACE} && python3 {MESH}/memory_write.py "
+     f"write --slug x --text 'MEMORY.md' --commit",
+     "genuine writer behind a cd"),
+    (False, "Bash",
+     f"env python3 {DOOR} write --slug x --text 'MEMORY.md' --commit",
+     "genuine writer behind env"),
+    # An unparseable command DENIES rather than failing open.
+    (True, "Bash", f"printf x > {STORE}/MEMORY.md \"unbalanced",
+     "shlex parse error denies (fail closed)"),
+
+    # --- 2026-09-19 round 2 (R1): the IMPOSTOR door (P1, grok-4.6) ---
+    # Sanction was `basename(prog) == "memory_write.py"`, so any file anywhere
+    # with that name was the door. Both of these were ALLOWED (rc=0): a silent
+    # store write with no lineage, wearing the writer's name. Sanction is now
+    # realpath-identity with THIS install's own door.
+    (True, "Bash",
+     f"python3 {IMPOSTOR_DIR}/memory_write.py write --text 'MEMORY.md' "
+     f"--commit > {STORE}/impersonate.md",
+     "an impostor memory_write.py by absolute path"),
+    (True, "Bash",
+     f"cd {IMPOSTOR_DIR} && python3 memory_write.py write --commit "
+     f"> {STORE}/impersonate.md",
+     "an impostor memory_write.py reached by cd"),
+    (True, "Bash",
+     f"python3 /nonexistent-dir/memory_write.py write > {STORE}/x.md",
+     "a door token that resolves to no file at all denies"),
+
+    # --- 2026-09-19 round 2 (R3): inline code in a language runtime (P2) ---
+    # WRITE_SHAPE reads shell. These three write the store with no redirect,
+    # and all three were ALLOWED before this fix.
+    (True, "Bash",
+     f"python3 -c \"import pathlib; pathlib.Path('{STORE}/x.md')"
+     f".write_text('poison')\"",
+     "python3 -c writing the store through pathlib"),
+    (True, "Bash",
+     f"node -e \"require('fs').writeFileSync('{STORE}/x.md','poison')\"",
+     "node -e writeFileSync into the store"),
+    (True, "Bash",
+     f"ruby -e \"File.write('{STORE}/x.md','poison')\"",
+     "ruby -e File.write into the store"),
+    (True, "Bash",
+     f"perl -e \"open(F,'>','{STORE}/x.md')\"",
+     "perl -e into the store"),
+    (True, "Bash",
+     f"python3 <<'EOF'\nimport pathlib\n"
+     f"pathlib.Path('{STORE}/x.md').write_text('poison')\nEOF",
+     "a heredoc PROGRAM fed to python3 -- the body is code, not prose"),
+    # ...and inline code that does not name the store is untouched.
+    (False, "Bash", 'python3 -c "print(1)"',
+     "inline code that never names the store"),
+    (False, "Bash", "node -e \"console.log('hi')\"",
+     "node -e that never names the store"),
 ]
 
 # The deny message must NAME the token that matched, so the operator can see
@@ -114,6 +212,20 @@ MESSAGE_CASES = [
     (f"""wc -c {STORE}/MEMORY.md; python3 -c "print(1, '->', 2)" """, ">"),
     (f'echo poison > {STORE}/MEMORY.md', ">"),
     (f'cp /tmp/x {STORE}/MEMORY.md', "cp"),
+]
+
+# The deny must say WHY the command was not sanctioned, so an operator who
+# expected the writer exemption can see which segment failed to earn it.
+WHY_CASES = [
+    (f"printf poison > {STORE}/bypass.md  # memory_write.py",
+     "not this install's memory_write.py"),
+    (f"printf x > {STORE}/MEMORY.md \"unbalanced", "could not parse"),
+    # R1: the deny must name the ONE door it will accept, so an operator who
+    # ran a namesake can see which file the guard means.
+    (f"python3 {IMPOSTOR_DIR}/memory_write.py write --commit > {STORE}/i.md",
+     DOOR),
+    # R3: and say that inline code is what tripped it.
+    (f"python3 -c \"open('{STORE}/x.md','w')\"", "INLINE CODE"),
 ]
 
 
@@ -146,7 +258,14 @@ def main():
             bad += 1
         print(f"  {'PASS' if ok else 'FAIL'}  deny message names {token!r}")
 
-    total = len(CASES) + len(MESSAGE_CASES)
+    for cmd, phrase in WHY_CASES:
+        rc, err = run("Bash", cmd, want_stderr=True)
+        ok = rc == 2 and phrase in err
+        if not ok:
+            bad += 1
+        print(f"  {'PASS' if ok else 'FAIL'}  deny message explains {phrase!r}")
+
+    total = len(CASES) + len(MESSAGE_CASES) + len(WHY_CASES)
     print(f"\n{total - bad} passed, {bad} failed")
     return 1 if bad else 0
 

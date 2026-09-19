@@ -510,7 +510,13 @@ jobs:
           # existing memory/ must SATISFY, not collide (the AI-OS Core case)
           python3 install.py --target "$WS" --into
           python3 "$WS/_lib/selftest.py"
-          test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          # Two lines, not `test A && test B`: the first term of an && list is
+          # exempt from errexit, so a MISSING CLAUDE.md.mine returned 1 in a
+          # position bash forgives and the next command ran green
+          # (2026-09-19 review, finding 10, executed as
+          # compose_preservation_guard_masked).
+          test -f "$WS/CLAUDE.md.mine"
+          test -f "$WS/my-project/notes.txt"
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
           if [ -f "$WS/memory/CONVENTIONS.md" ]; then
             echo "seed scaffold was written into the user's memory/"; exit 1; fi
@@ -551,7 +557,13 @@ jobs:
             (echo "expected a clean audit once the tamper is reverted; got:"; echo "$OUT"; exit 1)
           # surgical uninstall: seed components go, user content AND memory stay
           python3 install.py --target "$WS" --uninstall
-          test -f "$WS/CLAUDE.md.mine" && test -f "$WS/my-project/notes.txt"
+          # Two lines, not `test A && test B`: the first term of an && list is
+          # exempt from errexit, so a MISSING CLAUDE.md.mine returned 1 in a
+          # position bash forgives and the next command ran green
+          # (2026-09-19 review, finding 10, executed as
+          # compose_preservation_guard_masked).
+          test -f "$WS/CLAUDE.md.mine"
+          test -f "$WS/my-project/notes.txt"
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
           test -f "$WS/memory/my-note.md"
           if [ -d "$WS/_lib" ]; then echo "uninstall left seed components"; exit 1; fi
@@ -675,8 +687,20 @@ jobs:
             echo "$OUT" | grep -q "\[FLAGGED\] check $CHECK:" || \
               (echo "expected check $CHECK to be FLAGGED; got:"; echo "$OUT"; exit 1)
             if [ -n "$REASON" ]; then
-              echo "$OUT" | grep -qi -- "$REASON" || \
-                (echo "expected check $CHECK's flag to mention '$REASON'; got:"; echo "$OUT"; exit 1)
+              # SCOPED to this check's own block. The reason grep used to run
+              # over the WHOLE report, so check 1 flagged for an unrelated
+              # reason plus check 2 containing the expected text satisfied
+              # `assert_flagged 1 "content differs"` (2026-09-19 review,
+              # finding 16, executed as reason_from_wrong_check). The comment
+              # claiming the 2026-08-06 fix covered this described behaviour
+              # the implementation did not have.
+              BLOCK="$(echo "$OUT" | awk -v c="$CHECK" '
+                $0 ~ ("^\\[ *[A-Z]+\\] check " c ":") { on=1; print; next }
+                /^\[ *[A-Z]+\] check / { on=0 }
+                on { print }')"
+              echo "$BLOCK" | grep -qi -- "$REASON" || \
+                (echo "expected check $CHECK's OWN flag to mention '$REASON'; got block:";
+                 echo "$BLOCK"; echo "--- full report ---"; echo "$OUT"; exit 1)
             fi
           }
 
@@ -771,7 +795,8 @@ jobs:
           # SKIP by name, and the run must still be green on the rest.
           OUT="$(python3 "$ROOT/memory-mesh/contract_test.py" --json "${{ runner.temp }}/contract.json" 2>&1 || true)"
           echo "$OUT"
-          echo "$OUT" | grep -q "0 fail" || (echo "contract has failures"; exit 1)
+          # Anchored: "10 fail" contains "0 fail" (2026-09-19 review).
+          echo "$OUT" | grep -qE '(^|[^0-9])0 fail' || (echo "contract has failures"; exit 1)
           python3 - "${{ runner.temp }}/contract.json" <<'PY'
           import json, sys
           d = json.load(open(sys.argv[1]))
@@ -797,8 +822,18 @@ jobs:
           if grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json"; then
             echo "revoke left the hook entries behind"; exit 1
           fi
-          if python3 "$ROOT/memory-mesh/contract_test.py" --only M4; then
-            echo "M4 passed with no hooks wired — the contract is not measuring delivery"
+          # M4-WIRING, not M4. `--only M4` also runs M4-serve, which fails
+          # here for an unrelated reason (no manifest, because M1/M3 were
+          # never seeded in this invocation) — so the negative control went
+          # green while measuring nothing about wiring at all (2026-09-19
+          # review, finding 11, executed as
+          # revoke_negative_control_without_revoke: M4-wiring PASSED and the
+          # command still exited 1). The full contract above already proved
+          # M4-wiring GREEN with the hooks in place; this is the same
+          # property after the revoke, and it must now fail.
+          if python3 "$ROOT/memory-mesh/contract_test.py" --only M4 2>&1 | \
+               grep -q "ok: M4-wiring"; then
+            echo "M4-wiring still passes after --revoke — the contract is not measuring delivery"
             exit 1
           fi
 
@@ -814,7 +849,10 @@ jobs:
           cp skills/improve/SKILL.md "$HOME/.claude/skills/improve/SKILL.md"
           OUT="$(python3 install.py --target "$ROOT")"
           echo "$OUT" | grep -q "deferring to it" || (echo "$OUT"; exit 1)
+          # -e follows the link, so a DANGLING symlink satisfies `! -e` while
+          # very much existing (2026-09-19 review). -L catches it.
           test ! -e "$ROOT/.claude/skills/improve/SKILL.md"
+          test ! -L "$ROOT/.claude/skills/improve/SKILL.md"
           python3 -c "
           import json,sys
           r=json.load(open('$ROOT/.cc-seed/receipt.json'))
@@ -823,9 +861,21 @@ jobs:
 
           # The deferral is re-checked at audit time: edit the twin, audit reds.
           echo "changed after the deferral" >> "$HOME/.claude/skills/improve/SKILL.md"
-          python3 install.py --target "$ROOT" --audit --package . 2>&1 | \
-            grep -q "has CHANGED since the deferral" || \
+          # Captured, not piped: the audit is EXPECTED to exit 1 here, and
+          # under `set -o pipefail` that nonzero killed the step even when
+          # detection worked perfectly (2026-09-19 review, finding 12,
+          # executed as origin_pipeline_false_failure, shell_rc=1). And the
+          # exit code IS part of the property — a changed twin must make the
+          # audit red, not merely make it talk.
+          set +e
+          AUDIT_OUT="$(python3 install.py --target "$ROOT" --audit --package . 2>&1)"
+          AUDIT_RC=$?
+          set -e
+          echo "$AUDIT_OUT"
+          echo "$AUDIT_OUT" | grep -q "has CHANGED since the deferral" || \
             (echo "audit did not notice the user-scope twin moving"; exit 1)
+          test "$AUDIT_RC" -eq 1 || \
+            (echo "audit exited $AUDIT_RC on a changed twin; expected 1 (FLAGGED)"; exit 1)
 
           # DIFFERENT body at user scope -> refuse, loudly, naming both paths.
           ROOT2="${{ runner.temp }}/origin-root-2"
@@ -835,4 +885,5 @@ jobs:
           echo "$OUT" | grep -q "REFUSING to register" || (echo "$OUT"; exit 1)
           echo "$OUT" | grep -q "$HOME/.claude/skills/improve/SKILL.md" || (echo "refusal did not name the user-scope file"; exit 1)
           test ! -e "$ROOT2/.claude/skills/improve/SKILL.md"
+          test ! -L "$ROOT2/.claude/skills/improve/SKILL.md"
           rm -rf "$HOME/.claude/skills/improve"

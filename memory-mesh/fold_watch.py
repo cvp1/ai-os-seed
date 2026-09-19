@@ -129,12 +129,41 @@ def check_hook_wiring():
                 "memory hooks were never approved on this install — M1's "
                 "enforcement and M4 do not hold, by the operator's choice")
     settings = ROOT / ".claude" / "settings.json"
-    text = settings.read_text(encoding="utf-8") if settings.exists() else ""
-    missing = [cmd for cmds in approved.get("entries", {}).values()
-               for cmd in cmds if cmd not in text]
+    if not settings.exists():
+        return ("hooks", "FAIL",
+                f"{settings} is gone, but the receipt says memory hooks are "
+                f"approved — nothing is wired")
+    try:
+        doc = json.loads(settings.read_text(encoding="utf-8") or "{}")
+    except ValueError as e:
+        return ("hooks", "FAIL", f"{settings} is not valid JSON: {e}")
+    # Parsed, not grepped. Until 2026-09-19 this searched the settings file as
+    # raw TEXT for each approved command, so replacing the whole `hooks` block
+    # with a `notes` field holding the same strings left this check green with
+    # nothing runnable wired at all -- and `disableAllHooks: true` passed too
+    # (SEED-080 review, finding 2, executed as no_hooks_green /
+    # disabled_hooks_green).
+    if doc.get("disableAllHooks") is True:
+        return ("hooks", "FAIL",
+                f"{settings} sets disableAllHooks: true — every approved hook "
+                f"is present in the file and none of them runs")
+    wired = {}
+    for event, entries in (doc.get("hooks") or {}).items():
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            for h in (e.get("hooks") or []):
+                if isinstance(h, dict) and h.get("command"):
+                    wired.setdefault(event, set()).add(h["command"])
+    # Under ITS OWN EVENT: a retrieval hook moved to Stop is not retrieval.
+    missing = [f"{event}: {cmd}"
+               for event, cmds in approved.get("entries", {}).items()
+               for cmd in cmds if cmd not in wired.get(event, ())]
     if missing:
         return ("hooks", "FAIL",
-                f"{len(missing)} approved hook entr(ies) are no longer in "
+                f"{len(missing)} approved hook entr(ies) are no longer wired in "
                 f"{settings}: {missing[0]}")
     return ("hooks", "OK", "every approved hook entry is still wired")
 
@@ -150,14 +179,32 @@ def check_peers(max_age):
     if not data:
         return ("peers", "SKIP", "single-host mesh (no peers configured)")
     now = time.time()
-    stale = []
-    for host, ts in data.items():
+    stale, unknown = [], []
+    for host, entry in data.items():
+        # Until 2026-09-19 fold.py wrote a bare git SHA here and this loop did
+        # `float(ts)`, which raises on every hex string -- and the `continue`
+        # then dropped the peer from consideration entirely, so the function
+        # went on to announce "N peer(s) seen recently" about peers whose age
+        # it had never established. A 24-hour-old file naming an offline peer
+        # returned OK (SEED-080 review, finding 6). File mtime is not usable
+        # as a substitute: git and Syncthing both reset it.
+        ts = entry.get("ts") if isinstance(entry, dict) else None
+        if ts is None:
+            unknown.append(host)
+            continue
         try:
             age = now - float(ts)
         except (TypeError, ValueError):
+            unknown.append(host)
             continue
         if age > max_age * 8:      # peers sync less often than the local fold
             stale.append(f"{host} ({int(age // 3600)}h)")
+    if unknown:
+        return ("peers", "UNKNOWN",
+                "peer liveness is UNKNOWN AGE for " + ", ".join(sorted(unknown))
+                + " — last-seen.json carries no timestamp for them (the "
+                  "pre-2026-09-19 bare-SHA format). The next fold rewrites it; "
+                  "until then this is not evidence the peer is alive.")
     if stale:
         return ("peers", "FAIL", "peers not seen recently: " + ", ".join(stale))
     return ("peers", "OK", f"{len(data)} peer(s) seen recently")

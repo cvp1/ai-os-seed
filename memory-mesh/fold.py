@@ -241,6 +241,16 @@ def fetch_peers():
     notes, alarms = [], []
     state_f = M.MESH_ROOT / "state" / "last-seen.json"
     state = json.loads(state_f.read_text()) if state_f.exists() else {}
+
+    def _last_sha(entry):
+        """last-seen entries were bare SHA strings until 2026-09-19; they are
+        now {"sha": ..., "ts": <epoch>}. Both are read, only the new form is
+        written -- a SHA carries no time, and fold_watch was parsing one as a
+        float and, on the ValueError, silently reporting the peer as seen
+        recently (SEED-080 review, finding 6)."""
+        if isinstance(entry, dict):
+            return entry.get("sha")
+        return entry
     remotes = [r for r in M.git("remote", check=False).split() if r]
     for host in remotes:
         # A sleeping peer ({{REDACTED}} naps) used to cost a 60 s TimeoutExpired
@@ -273,7 +283,7 @@ def fetch_peers():
         if not sha:
             alarms.append(f"{host}: no ref yet")
             continue
-        last = state.get(host)
+        last = _last_sha(state.get(host))
         if last:
             anc = subprocess.run(
                 ["git", "-C", str(M.MESH_ROOT), "merge-base",
@@ -290,7 +300,7 @@ def fetch_peers():
             alarms.append(f"MERGE CONFLICT with {host} — single-writer "
                           f"invariant broke: {merge.stderr.strip()[:120]}")
             continue
-        state[host] = sha
+        state[host] = {"sha": sha, "ts": int(time.time())}
         notes.append(f"{host}: ok @{sha[:8]}")
     state_f.parent.mkdir(parents=True, exist_ok=True)
     state_f.write_text(json.dumps(state, indent=1))
