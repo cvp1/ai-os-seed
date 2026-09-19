@@ -3842,6 +3842,83 @@ def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_s
     receipt["shipped"] = shipped
 
 
+def do_reseal(target: Path, assume_yes: bool) -> int:
+    """Re-record installed_sha as the operator-approved baseline.
+
+    The missing counterpart to "never re-baseline silently". installed_sha is
+    refreshed only by install and update, precisely so an --audit or --approve
+    run cannot launder a tampered tree. The cost, unnoticed until 2026-09-19:
+    an install that diverges for a GOOD reason — a component kept as a git
+    checkout, a file the operator patched for their platform, or a change in
+    what the hash counts — can never be clean again, and M0-package-integrity
+    stays red forever. A permanently red integrity check is not a safety
+    property; it is one the operator learns to ignore.
+
+    So the way back exists, but it is deliberately loud: it prints every
+    measured path that differs from the receipt's own shipped snapshot, says
+    plainly that it is accepting them, and needs a typed yes. It never
+    fetches, never writes shipped bytes, and changes exactly one field.
+    """
+    receipt = _load_receipt(target)
+    if receipt is None:
+        return die(f"{target} has no {CC_SEED_DIR}/{RECEIPT_NAME} — "
+                   f"--reseal re-approves an EXISTING baseline; an install that "
+                   f"predates receipts entirely wants --adopt-baseline.")
+    old = receipt["install"].get("installed_sha")
+    live = installed_sha(target, receipt["install"].get("components", []), ROOT_FILES)
+    if old == live:
+        print(f"{target}: already sealed — the tree matches its receipt "
+              f"({live[:16]}). Nothing to do.")
+        return 0
+    shipped = receipt.get("shipped") or {}
+    changed, gone = [], []
+    for rel, rec in sorted(shipped.items()):
+        want = (rec or {}).get("hash") or ""
+        # Only FILES carry a content hash. A dir or symlink entry has none,
+        # and calling those "MISSING" made the first draft of this list name
+        # every shipped skill directory — noise in exactly the list an
+        # operator is being asked to read before accepting.
+        if not want.startswith("sha256:"):
+            continue
+        p = target / rel
+        if not p.is_file():
+            gone.append(rel)
+            continue
+        if "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest() != want:
+            changed.append(rel)
+    print(f"reseal {target}")
+    print(f"  recorded baseline : {old or '(none)'}")
+    print(f"  live measurement  : {live}")
+    if changed or gone:
+        print(f"  shipped files that no longer match what this install wrote "
+              f"({len(changed) + len(gone)}):")
+        for rel in (changed + [g + "  (MISSING)" for g in gone])[:40]:
+            print(f"    - {rel}")
+        if len(changed) + len(gone) > 40:
+            print(f"    … and {len(changed) + len(gone) - 40} more")
+    else:
+        print("  no shipped file differs — the change is in what the hash "
+              "counts, or in files added beside the shipped set.")
+    print("  Resealing ACCEPTS these bytes as the reference point. Only do "
+          "this if you know why they differ.")
+    if not assume_yes:
+        try:
+            if input("  reseal? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("  not resealed.")
+                return 1
+        except EOFError:
+            return die("--reseal needs a typed yes (or --assume-yes for an "
+                       "automated caller that has already shown this list)")
+    receipt["install"]["installed_sha"] = live
+    reseals = receipt.setdefault("reseals", [])
+    reseals.append({"at": _now(), "from": old, "to": live,
+                    "shipped_changed": changed, "shipped_missing": gone,
+                    "assumed_yes": bool(assume_yes)})
+    _save_receipt(target, receipt)
+    print(f"  resealed: {live[:16]} is now the baseline; recorded in the receipt.")
+    return 0
+
+
 def do_adopt_baseline(target: Path) -> int:
     """SEED-076 follow-up, found live the first time --update ran against a
     REAL install: some installs predate the receipt system itself (pre-
@@ -4218,6 +4295,16 @@ def main():
     ap.add_argument("--allow-downgrade", action="store_true",
                     help="with --update: permit installing a version OLDER than what's "
                          "currently installed (refused by default)")
+    ap.add_argument("--reseal", action="store_true",
+                    help="re-approve the CURRENT bytes as this install's baseline "
+                         "after a divergence you meant (a component kept under "
+                         "version control, a file you patched). Prints every shipped "
+                         "file that differs and needs a typed yes; --assume-yes for "
+                         "an automated caller. Never fetches, never writes shipped "
+                         "bytes.")
+    ap.add_argument("--assume-yes", action="store_true",
+                    help="skip --reseal's typed confirmation (the caller has already "
+                         "shown the operator what it is accepting)")
     ap.add_argument("--adopt-baseline", action="store_true",
                     help="SEED-076: for an install that predates the receipt system "
                          "entirely (no .cc-seed/receipt.json at all) — records current "
@@ -4254,7 +4341,8 @@ def main():
                  args.list_packs, bool(args.remove_pack), bool(args.set_engagement),
                  bool(args.apply_proposal), bool(args.revert_proposal),
                  args.review_proposals, args.apply_proposals, args.update,
-                 args.adopt_baseline, bool(args.revoke), args.contract]
+                 args.adopt_baseline, args.reseal, bool(args.revoke),
+                 args.contract]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
                    "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
@@ -4297,6 +4385,8 @@ def main():
         return revoke(target, args.revoke)
     if args.update:
         return do_update(target, args.update_from, args.apply, args.allow_downgrade)
+    if args.reseal:
+        return do_reseal(target, args.assume_yes)
     if args.adopt_baseline:
         return do_adopt_baseline(target)
     if args.uninstall:
