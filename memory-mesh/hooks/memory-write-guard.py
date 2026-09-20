@@ -180,6 +180,8 @@ HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 # Shell metacharacters, so a command can be split into path-ish tokens.
 TOKEN_SPLIT = re.compile(r"[\s;|&<>()\[\]{}=,]+")
+# Just the shell redirect, for the sanctioned-segment check below.
+REDIRECT_SHAPE = re.compile(r">")
 
 
 def strip_commit_message(cmd):
@@ -338,13 +340,15 @@ def opaque_inline_write(scannable):
         segments = split_segments(strip_shell_comments(scannable))
     except ValueError:
         return None                  # the parse failure is handled elsewhere
-    bases = _resolution_bases(segments)
-    for seg in segments:
+    # Per-segment, command-order bases here too: the inline-code path had the
+    # same "any cd in the command sanctions this segment" hole.
+    bases_by_seg = _bases_per_segment(segments)
+    for seg, base in zip(segments, bases_by_seg):
         if not store_referenced(seg):
             continue
         try:
             flag = inline_code_flag(seg)
-            if flag and not segment_is_sanctioned(seg, bases):
+            if flag and not segment_is_sanctioned(seg, [base, WORKSPACE]):
                 return flag
         except ValueError:
             continue
@@ -508,7 +512,39 @@ def segment_program(seg):
     return prog
 
 
+def _bases_per_segment(segments):
+    """The base each segment's RELATIVE program token resolves against, in
+    COMMAND ORDER — one entry per segment.
+
+    `_resolution_bases` returned the set of EVERY cd target in the command, so
+    one legitimate `cd <mesh>` anywhere sanctioned an impostor reached by a
+    LATER cd: `cd <mesh> && cd <fake> && python3 memory_write.py > STORE/f.md`
+    was ALLOWED (gpt-6-astra, SEED-081 review, reproduced here 2026-09-19).
+    A shell has one current directory at a time and `cd` replaces it; the
+    guard now models that. WORKSPACE stays available only to tokens that
+    carry a directory component (`memory-mesh/memory_write.py`), never to a
+    bare name — a bare name is whatever the CURRENT directory holds.
+    """
+    here = os.getcwd()
+    out = []
+    for seg in segments:
+        out.append(here)
+        for tgt in _cd_targets([seg]):
+            here = tgt                    # last cd in this segment wins
+    return out
+
+
 def _resolution_bases(segments):
+    """DEPRECATED — kept only so an out-of-tree caller fails loudly.
+
+    Superseded by _bases_per_segment: returning every cd target in the command
+    as one set is what let a later impostor inherit an earlier legitimate cd.
+    """
+    raise RuntimeError("_resolution_bases is superseded by _bases_per_segment "
+                       "(command order matters; see SEED-081, 2026-09-19)")
+
+
+def _unused_resolution_bases_doc(segments):
     """Bases a RELATIVE program token may be resolved against.
 
     The process cwd is dropped the moment the command contains a `cd`: the
@@ -560,8 +596,16 @@ def resolves_to_door(prog, bases):
     if not prog:
         return False
     prog = os.path.expanduser(prog)
-    candidates = [prog] if os.path.isabs(prog) else [
-        os.path.join(b, prog) for b in bases]
+    if os.path.isabs(prog):
+        candidates = [prog]
+    else:
+        # A bare `memory_write.py` means "in the current directory" and
+        # nothing else. Joining WORKSPACE to it would re-open the impostor
+        # hole from the other side: `cd <fake> && python3 memory_write.py`
+        # would resolve against the workspace and find the real door.
+        bases = list(bases) if "/" in prog else [b for b in bases
+                                                 if b != WORKSPACE]
+        candidates = [os.path.join(b, prog) for b in bases]
     for cand in candidates:
         try:
             if os.path.realpath(cand) == DOOR:
@@ -587,22 +631,38 @@ def command_is_sanctioned(scannable):
         segments = split_segments(text)
     except ValueError as exc:
         return False, f"the guard could not parse this command ({exc})"
-    bases = _resolution_bases(segments)
+    bases_by_seg = _bases_per_segment(segments)
     writing = []
-    for seg in segments:
+    for seg, base in zip(segments, bases_by_seg):
         if WRITE_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
-            writing.append(seg)
+            writing.append((seg, [base, WORKSPACE]))
     if not writing:
         # The write shape is not in any executable segment (a comment, say).
         # Preserve the historical verdict rather than trust this parser to be
         # the only thing standing between a poisoned page and the store.
         return False, "no executable segment carries the write; denying anyway"
-    for seg in writing:
+    for seg, bases in writing:
         try:
             if not segment_is_sanctioned(seg, bases):
                 return False, (
                     "the command that writes is not this install's "
                     f"memory_write.py ({DOOR}): {seg.strip()[:120]!r}")
+            # Authorising the PROGRAM does not authorise its redirections.
+            # The shell opens `> STORE/f.md` itself, before the door runs and
+            # entirely outside its lineage gate, so `python3 <real door>
+            # --help > STORE/probe.md` wrote the store with no lineage and was
+            # ALLOWED (gpt-6-astra, SEED-081 review, reproduced 2026-09-19).
+            # The door is never invoked WITH a redirect in normal use — it
+            # writes the store itself — so a redirect in an otherwise
+            # sanctioned segment is refused rather than parsed for its target,
+            # which is the redirect-target analysis this module's docstring
+            # declines to attempt.
+            if REDIRECT_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
+                return False, (
+                    "this segment redirects with '>' while naming the store. "
+                    "memory_write.py writes the store itself; a shell redirect "
+                    "goes around its lineage gate even when the program IS "
+                    "this install's door. Run the door without a redirect.")
         except ValueError as exc:
             return False, f"the guard could not parse {seg.strip()[:80]!r} ({exc})"
     return True, ""

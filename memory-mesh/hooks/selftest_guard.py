@@ -30,6 +30,7 @@ MESH = os.path.basename(os.path.dirname(DOOR))
 # A file that is NOT the door but wears its name -- the round-2 P1. A fixed
 # path under the temp dir: rewritten each run, never accumulating, never
 # removed (nothing in this tree gets rm'd).
+MESH_DIR = os.path.dirname(DOOR)
 IMPOSTOR_DIR = os.path.join(tempfile.gettempdir(),
                             "memory-write-guard-selftest-impostor")
 os.makedirs(IMPOSTOR_DIR, exist_ok=True)
@@ -124,6 +125,18 @@ CASES = [
      "arrow in a git --format spec"),
     (True, "Bash", f'echo "poison"->{STORE}/MEMORY.md',
      "arrow that IS a redirect into the store -- why the class cannot be exempted"),
+
+    # --- SEED-081 (gpt-6-astra, 2026-09-19): two holes in the SAME-DAY fix ---
+    # Both were ALLOWED (rc=0) against the morning's guard and are the control
+    # for these three cases.
+    (True, "Bash",
+     f"cd {MESH_DIR} && cd {IMPOSTOR_DIR} && python3 memory_write.py write "
+     f"> {STORE}/probe.md",
+     "a legitimate cd does not sanction an impostor reached by a LATER cd"),
+    (True, "Bash", f"python3 {DOOR} --help > {STORE}/probe.md",
+     "the REAL door does not sanction a shell redirect into the store"),
+    (False, "Bash", f"cd {MESH_DIR} && python3 memory_write.py write --commit",
+     "...and a genuine door call with no redirect still runs"),
 
     # --- 2026-09-19: the store spelled through a symlink or `..` (P0) ---
     # store_referenced matched STORE as a SUBSTRING, so the same file written
