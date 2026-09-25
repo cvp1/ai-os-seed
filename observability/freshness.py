@@ -475,6 +475,27 @@ SOFT_MIN_RUNS = 4      # don't judge a job with less history than this
 SOFT_RATIO = 0.75      # this share of them writing stderr = persistent
 
 
+# The connector's per-call audit line (`_lib/connector/dispatch.py:_audit`) is
+# TELEMETRY on stderr by design — stdout is a data channel for its callers
+# (inbox_triage prints JSON there; moving the line to stdout broke it,
+# 2026-09-24 review). A run whose ENTIRE stderr is successful audit lines is
+# not noisy. "Entire" is load-bearing: only when the captured tail covers
+# every stderr byte, and every line is status=ok, does the run count clean —
+# a failed call (status=error / code=) or any other text still counts.
+_AUDIT_OK = re.compile(r"^connector: tool=\S+ caller=\S+ status=ok cred=\S+ ms=\d+$")
+
+
+def _noisy(row):
+    n = row["stderr_bytes"] or 0
+    if n <= 0:
+        return False
+    tail = row["error_tail"] or ""
+    lines = [l for l in tail.splitlines() if l.strip()]
+    if lines and len(tail.encode()) + 2 >= n and all(_AUDIT_OK.match(l.strip()) for l in lines):
+        return False
+    return True
+
+
 def soft_failure(conn, job):
     """Detail string if `job` is soft-failing RIGHT NOW, else None. Never raises.
 
@@ -507,9 +528,9 @@ def soft_failure(conn, job):
         return None
     if any(not r["ok"] for r in rows):
         return None        # a real failure in the window — FAILING already covers it
-    if (rows[0]["stderr_bytes"] or 0) <= 0:
+    if not _noisy(rows[0]):
         return None        # condition 1: latest run is clean -> not failing now
-    noisy = [r for r in rows if (r["stderr_bytes"] or 0) > 0]
+    noisy = [r for r in rows if _noisy(r)]
     if len(noisy) / len(rows) < SOFT_RATIO:
         return None
     tail = (rows[0]["error_tail"] or "").strip().splitlines()
@@ -700,6 +721,7 @@ def main():
     # Compose the findings BEFORE any early return, so --write-findings is
     # honoured on the clean path (where its job is to DELETE a stale file)
     # and under --json, not only on the text-with-problems path.
+    triage = ""  # "— N live, M parked" when acks were applied; "" otherwise
     if args.write_findings:
         findings = [f"[{r['status']}] {r['label']}: {r['detail']}" for r in
                     sorted(problems, key=lambda x: x["job"])]
@@ -714,6 +736,9 @@ def main():
         findings += [f"[SWITCH] {w}" for w in sw]
         live, acked = (findings, []) if fixture_only() else apply_acks(findings, now)
         write_findings(live, now, acked, [] if fixture_only() else switched_off_lines(now))
+        # The counts below include parked items; without this split an all-parked
+        # run (FINDINGS.md deleted, by design) reads in runs.db as live problems.
+        triage = f" — {len(live)} live, {len(acked)} parked"
 
     if args.json:
         print(json.dumps({"checked_at": now.isoformat(timespec="seconds"),
@@ -736,7 +761,7 @@ def main():
         print(f"FINDINGS: {len(problems)} job problem(s), "
               f"{len(drift)} shim drift, {len(repo)} repo hygiene, "
               f"{len(prices)} price drift, {len(models)} model drift, {len(keys)} key registry, "
-              f"{len(onto)} ontology, {len(sw)} switch store, {len(leaks)} leak")
+              f"{len(onto)} ontology, {len(sw)} switch store, {len(leaks)} leak{triage}")
     for r in sorted(shown, key=lambda x: (x["status"] == "OK", x["job"])):
         print(f"[{r['status']:7}] {r['label']}: {r['detail']}")
     for d in drift:
