@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _lib import event_bus, report, secrets  # noqa: E402,F401
+from _lib import claude_headless, event_bus, report, secrets  # noqa: E402,F401
 
 FAILS = []
 
@@ -43,9 +43,16 @@ finally:
 check("report: Report builder exists and is callable",
       callable(getattr(report, "Report", None)))
 
+# --- claude_headless --------------------------------------------------------
+cmd = claude_headless.build_cmd("hello")
+check("claude_headless: every call dials zero MCP servers",
+      "--strict-mcp-config" in cmd and '{"mcpServers":{}}' in cmd)
+check("claude_headless: every call denies the built-in tools",
+      "--disallowed-tools" in " ".join(cmd) or "--disallowedTools" in " ".join(cmd))
+
 # --- stdlib-only invariant --------------------------------------------------
 here = os.path.dirname(os.path.abspath(__file__))
-for mod in ["secrets", "event_bus", "report"]:
+for mod in ["secrets", "event_bus", "report", "claude_headless"]:
     r = subprocess.run(
         [sys.executable, "-I", "-S", "-c",
          f"import sys; sys.path.insert(0, {os.path.dirname(here)!r}); import _lib.{mod}"],

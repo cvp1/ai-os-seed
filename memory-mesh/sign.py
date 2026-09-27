@@ -243,13 +243,30 @@ def main():
         verbal = {"words": args.approved.strip(),
                   "ts": M.datetime.datetime.now(M.datetime.timezone.utc)
                         .strftime("%Y-%m-%dT%H:%M:%SZ")}
-    ev, _ = M.make_event("correct", subject, content, session=args.session,
-                         polarity=polarity, home=home, audience=args.audience,
-                         confidence="operator-stated",
-                         lineage="contains-untrusted" if verbal else "operator-direct",
-                         supersedes=supersedes or None,
-                         body_sha256=body_sha256,
-                         verbal_approval=verbal)
+    # The signed event CARRIES the bytes it binds (2026-09-27): a hash alone
+    # left every peer with nothing to project unless some older event happened
+    # to carry a matching body (docs/DESIGN-signed-bodies.md §2.2). The
+    # signature covers every non-underscore key, so body + metadata are signed
+    # together. A body over the event cap falls back to hash-only — the chain
+    # walk still finds a carrier — rather than refusing to sign.
+    def _mk(body):
+        return M.make_event("correct", subject, content, session=args.session,
+                            polarity=polarity, home=home, audience=args.audience,
+                            confidence="operator-stated",
+                            lineage="contains-untrusted" if verbal else "operator-direct",
+                            supersedes=supersedes or None,
+                            body_sha256=body_sha256, body=body,
+                            verbal_approval=verbal)
+    carry = shown_body if (shown_body and args.audience in M.BODY_AUDIENCES) else None
+    try:
+        ev, _ = _mk(carry)
+    except ValueError as e:
+        if carry is None or "exceeds" not in str(e):
+            raise
+        print(f"note: body too large to carry ({len(carry.encode())}B) — "
+              f"signing the hash only; peers recover the bytes by chain walk",
+              file=sys.stderr)
+        ev, _ = _mk(None)
     # WYSIWYS (signing-window-plain-summary-above-pin, Craig): the PIN/touch
     # (or, for a verbal approval, the typed --approved words) IS the
     # signature, so what it attests to must be ON SCREEN before it happens,

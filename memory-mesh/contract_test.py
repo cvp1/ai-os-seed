@@ -91,6 +91,26 @@ def scrubbed_environ():
             if not k.startswith(SCRUB_PREFIXES)}
 
 
+def _claude_oauth_env():
+    """{'CLAUDE_CODE_OAUTH_TOKEN': ...} read at point of use through the
+    workspace's own _lib.secrets, or {} — same rule as _lib/claude_headless
+    oauth_env(). A run started by ssh or a scheduler has no keychain on macOS,
+    so the CLI's interactive login is absent and the harness half failed "Not
+    logged in" ({{REDACTED}}, 2026-09-26). Only ADDS auth where there was none;
+    never touches os.environ; a locked vault means "no token", not a crash."""
+    if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
+        return {}
+    try:
+        sys.path.insert(0, str(WORKSPACE))
+        from _lib.secrets import load_secret  # noqa: PLC0415
+        tok = load_secret("CLAUDE_CODE_OAUTH_TOKEN", "~/.key/claude_code_oauth_token.key",
+                          what="the Claude Code OAuth token",
+                          required=False, exit_on_error=False)
+    except Exception:  # noqa: BLE001
+        return {}
+    return {"CLAUDE_CODE_OAUTH_TOKEN": tok} if tok else {}
+
+
 def run(cmd, env=None, cwd=None, timeout=TIMEOUT, stdin=None):
     e = scrubbed_environ()
     e.update(env or {})
@@ -244,6 +264,9 @@ RUNTIME_WRITABLE_PREFIXES = ("observability/data/", "session-brief/briefs/")
 
 INSTALLED_SHA_EXEMPT = {
     "scheduler/manifest.yml",
+    # the operator's own config (install.py OPERATOR_EDITABLE_CONFIG, 2026-09-26)
+    "observability/freshness.json",
+    "memory-mesh/mesh.toml",
 }
 
 
@@ -457,6 +480,8 @@ def m1_harness(sb, door, harness):
         "--no-push --commit")
     env = {"MEMORY_WRITE_STORE": str(sb.store), "MESH_ROOT": str(sb.mesh_root),
            "MESH_HOST": "contract", "MESH_SESSION_ID": f"contract-{harness}"}
+    if harness == "claude":
+        env.update(_claude_oauth_env())
     before = set(p.name for p in sb.store.glob("*.md"))
     try:
         r = run(spec["argv"](prompt), env=env, cwd=str(WORKSPACE),

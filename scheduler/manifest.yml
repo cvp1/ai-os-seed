@@ -43,4 +43,30 @@
 #       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job weekly_view --
 #       /usr/bin/python3 <SEED_ROOT>/views/weekly.py
 
+# Opt-in watchers that ship with the seed but are off until you add them
+# (fix SEED_ROOT, uncomment, add a freshness.json entry — or let
+# stage_drift propose one — then run sync.sh):
+#
+# jobs:
+#   - name: stage_drift        # scheduled job with no freshness entry -> staged proposal
+#     schedule: "5 7 * * 1"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job stage_drift --
+#       /usr/bin/python3 <SEED_ROOT>/scheduler/stage_drift.py
+#   - name: mcp_guard          # MCP launch-surface drift (run `guard.py snapshot` first)
+#     schedule: "30 6 * * 1"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job mcp_guard --
+#       /usr/bin/python3 <SEED_ROOT>/mcp-guard/guard.py check
+#   - name: friction_miner     # at most one automation idea a week
+#     schedule: "45 6 * * 1"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job friction_miner --
+#       /usr/bin/python3 <SEED_ROOT>/friction-miner/miner.py run
+#   - name: learn_sleep        # quarantined memory harvest; set LEARN_SOURCES first
+#     schedule: "40 6 * * *"
+#     command: >-
+#       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job learn_sleep --
+#       /usr/bin/python3 <SEED_ROOT>/memory-mesh/learn_harvest.py --nightly
+
 jobs: []

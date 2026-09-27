@@ -442,7 +442,8 @@ def main():
     # file is safe (nothing to lose); overwrite of a divergent one is not, and
     # both travel behind the same flag rather than splitting the risk into a
     # flag nobody remembers is half-on.
-    proj = M.project_store(fold, M.harness_store(), apply=args.project)
+    proj = M.project_store(fold, M.harness_store(), apply=args.project,
+                            events=events)
     if proj["created"] or proj["repaired"]:
         verb = "projected" if args.project else "WOULD project (run with --project)"
         print(f"projection: {verb} — {len(proj['created'])} created, "
@@ -474,6 +475,18 @@ def main():
     # Its write gate reports compaction, an unfittable index, or a write
     # failure; those join the edge-triggered alarm picture below rather than
     # being printed into the victim session's own context.
+    # Tier events are the mesh's record of which memories stay out of the
+    # always-on index; this host's `_index-exclude.txt` is their projection
+    # (2026-09-27). Any resulting always-on change still goes through the
+    # residency gate below — a replicated demotion is staged, never auto-live.
+    if store:
+        try:
+            added, removed = M.project_index_exclude(fold, store, apply=True)
+            if added or removed:
+                print(f"tiers: _index-exclude.txt +{len(added)} -{len(removed)} "
+                      f"from tier events")
+        except Exception as e:  # noqa: BLE001 — never break the live fold
+            alarms.append(f"tier projection failed: {e}")
     harness = M.write_harness_memory(
         fold, allow_residency_delta=args.promote_residency)
     alarms.extend(harness.get("alarms", []))

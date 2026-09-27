@@ -57,7 +57,8 @@ proof of the thing it isn't:
     python3 memory-mesh/effectiveness.py --dry-run
     python3 memory-mesh/effectiveness.py --selftest
 
-Stdlib + _lib (influx); targets /usr/bin/python3.
+Stdlib; _lib.influx optional (the seed does not ship it — the write is then
+skipped, loudly). Targets /usr/bin/python3.
 """
 import argparse
 import json
@@ -70,7 +71,6 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import mesh_lib as M          # noqa: E402
-from _lib import influx       # noqa: E402
 
 MEASUREMENT = "cc_memory_effectiveness"
 DEFAULT_WINDOW = 1000
@@ -274,6 +274,14 @@ def main():
     ts = int(time.time() * 1e9)
     fields = {k: v for k, v in snap.items()
               if isinstance(v, (int, float)) and v is not None}
+    try:
+        # lazy: the seed's _lib has no influx.py, and a top-level import killed
+        # every importer (test_core included) — bug bash 2026-09-27 #15
+        from _lib import influx
+    except ImportError as e:
+        print(f"effectiveness: influx write skipped — _lib.influx unavailable ({e})",
+              file=sys.stderr)
+        return 0
     try:
         influx.write_points([(MEASUREMENT, {"host": os.uname().nodename}, fields, ts)])
     except influx.InfluxError as e:

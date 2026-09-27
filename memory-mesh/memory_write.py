@@ -96,6 +96,24 @@ def _mesh_code_dir():
     return None
 
 
+def _emit_tier(slugs, tier):
+    """Replicate an index-tier change as `tier` events (2026-09-27), so every
+    host's fold agrees on what is on-demand. The local file change already
+    happened and stands on its own; a failure here is loud, never fatal."""
+    d = _mesh_code_dir()
+    tool = d / "tier.py" if d else None
+    if not (tool and tool.is_file() and slugs):
+        if slugs:
+            print("mesh: tier.py not found — this tier change stays LOCAL to this "
+                  "host until someone runs tier.py", file=sys.stderr)
+        return
+    r = subprocess.run([sys.executable, str(tool), f"--{tier}", *slugs, "--commit"],
+                       capture_output=True, text=True, timeout=120)
+    tail = (r.stdout or r.stderr).strip().splitlines()[-1:] or [""]
+    print(f"mesh: tier {tier}: {tail[0]}" if r.returncode == 0 else
+          f"mesh: TIER EMIT FAILED (local change stands): {proc_error(r)}")
+
+
 def _mesh_emit_path():
     """The emitter, or None — and None is said out loud by every caller."""
     d = _mesh_code_dir()
@@ -892,6 +910,24 @@ def cmd_write(args):
         fh.close()          # releases the flock
 
 
+def _write_store_file(path, text):
+    """Write a store file WITHOUT following a symlink (bug bash 2026-09-27 #4,
+    verify-A G4). Path.write_text follows one, so a link planted in the store
+    sent the door's bytes to whatever it pointed at. Refused loudly; the
+    O_NOFOLLOW open closes the check-then-write race as well."""
+    path = Path(path)
+    if path.is_symlink():
+        raise SystemExit(f"error: {path} is a symlink — refusing to write "
+                         "through it (a store file must be a regular file)")
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_NOFOLLOW", 0), 0o644)
+    except OSError as exc:
+        raise SystemExit(f"error: cannot write {path} ({exc}) — refusing")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
 def _cmd_write(args):
     if not SLUG_RE.match(args.slug):
         raise SystemExit(f"error: slug must be kebab-case (letters/digits/hyphens): {args.slug!r}")
@@ -1082,7 +1118,7 @@ def _cmd_write(args):
         print(f"\n(dry run — would write {target} and update {index_target.name}; pass --commit to apply)")
         return
 
-    target.write_text(rendered)
+    _write_store_file(target, rendered)
     print(f"wrote {target}")
 
     if index_is_generated():
@@ -1175,6 +1211,8 @@ def _cmd_write(args):
             emitted = re.search(r"emitted\s+([0-9a-f]{8,})", r.stdout or "")
             event_id = emitted.group(1) if emitted else None
             print(f"mesh: event emitted{f' ({event_id})' if event_id else ''}")
+            if args.slug in on_demand_slugs():
+                _emit_tier([args.slug], "ondemand")
             if args.lineage != "craig-direct" or args.provenance == \
                     "flagged-downgraded":
                 # Quarantined: not served by ANY tier until the operator's key
@@ -1195,7 +1233,10 @@ def _cmd_write(args):
                   f"{proc_error(r)}")
         # A supersede must also retire the OLD slug's lesson event, or the
         # generated index would keep serving the superseded rule forever.
-        if args.supersedes and index_is_generated():
+        # Never on its own slug: `--supersedes <same slug>` (an in-place
+        # rewrite) retracted the lesson this call had just written — 15 such
+        # retracts across 13 subjects, measured 2026-09-27.
+        if args.supersedes and args.supersedes != args.slug and index_is_generated():
             r2 = subprocess.run(
                 [sys.executable, str(mesh_emit), "--no-nudge",
                  "--kind", "retract", "--subject", f"lesson/{args.supersedes}",
@@ -1263,6 +1304,7 @@ def cmd_demote(args):
             return
         EXCLUDE.write_text("\n".join(keep).rstrip("\n") + "\n")
         print(f"updated {EXCLUDE}")
+        _emit_tier(dropped, "always")
         print("the next fold STAGES this as a residency delta — it is not live "
               "until Craig promotes it.")
         if not args.no_git:
@@ -1361,6 +1403,7 @@ def cmd_demote(args):
         print(f"updated {INDEX}")
     EXCLUDE.write_text(new_exclude)
     print(f"updated {EXCLUDE}")
+    _emit_tier(demoted, "ondemand")
 
     if not args.no_git:
         class _A:  # git_commit() reads .slug/.description/.no_push off args
@@ -1710,7 +1753,7 @@ def cmd_retag(args):
 
     paths = []
     for slug, p, after in changed:
-        p.write_text(after)
+        _write_store_file(p, after)
         paths.append(p)
     print(f"wrote {len(paths)} files")
 
@@ -1933,7 +1976,7 @@ def cmd_correct(args):
         if not args.commit:
             print("\n(dry run — pass --commit to apply)")
             return
-        p.write_text(after)
+        _write_store_file(p, after)
         print(f"wrote {p}  ({len(after)} B)")
         _reemit_corrected(args.slug)
         if not args.no_git:
@@ -1976,7 +2019,7 @@ def cmd_correct(args):
         print("\n(dry run — pass --commit to apply)")
         return
 
-    p.write_text(after)
+    _write_store_file(p, after)
     print(f"wrote {p}  ({len(after)} B)")
     _reemit_corrected(args.slug)
     if not args.no_git:
@@ -2469,6 +2512,26 @@ def selftest():
               "prior signed promotion on record is UNAFFECTED",
               "provenance: promotion-revoked" not in
               (shadow_store / "zzselftest-b2-clean.md").read_text())
+
+        # 8e. Bug bash 2026-09-27 #4 (verify-A G4): the slug file was written
+        #     with target.write_text(), which FOLLOWS a symlink -- a link
+        #     planted in the store (`ln -sfn`) sent the door's bytes to a file
+        #     OUTSIDE it. The door must refuse and leave the outside untouched.
+        outside = tmp / "outside-target.txt"
+        outside.write_text("ORIGINAL\n")
+        link = shadow_store / "zzselftest-g4-symlink.md"
+        os.symlink(outside, link)
+        refused = False
+        try:
+            _cmd_write(base_args(slug="zzselftest-g4-symlink",
+                                 session_id="sess-clean"))
+        except SystemExit:
+            refused = True
+        check("G4: write to a slug that is a SYMLINK is refused", refused)
+        check("G4: the symlink's outside target is UNCHANGED",
+              outside.read_text() == "ORIGINAL\n")
+        check("G4: the link is still a link (not silently replaced)",
+              link.is_symlink())
 
         # 9. correct: a live content claim (like write), so it gets the
         #    session-taint check, not the signed-mesh one — and since

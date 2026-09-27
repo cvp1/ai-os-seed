@@ -141,8 +141,13 @@ WORKSPACE = os.path.dirname(os.path.dirname(DOOR))
 # The store's two named surfaces. A bare mention of either is treated as the
 # store even without a path, because the shell's cwd is unknowable here.
 STORE_FILES = {"MEMORY.md", "QUARANTINE.md"}
+# 2026-09-27 (bug bash #4, verify-A A2/G1): scp, rsync, install and ln (incl.
+# `ln -sfn`, which plants a symlink the door would then write THROUGH) all put
+# a file in the store and were ALLOWED -- bash really created each one in a
+# temp substitute store. unlink/shred are rm's siblings. Widening only.
 WRITE_SHAPE = re.compile(
     r">|\btee\b|\bsed\s+-i\b|\bcp\b|\bmv\b|\brm\b|\btruncate\b|\bdd\b"
+    r"|\bscp\b|\brsync\b|\binstall\b|\bln\b|\bunlink\b|\bshred\b"
     r"|open\([^)]*['\"][wax]")
 # Redirections that cannot write a file, stripped before the write-shape scan.
 # Anchored so `>/dev/null/../MEMORY.md` is NOT stripped, and `>&` is dropped
@@ -176,7 +181,14 @@ GIT_COMMIT_MSG = re.compile(
         (?:"[^"]*"|'[^']*'|\S+)""", re.X)
 
 # The opening of a heredoc: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<< "EOF"`.
-HEREDOC_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# 2026-09-27: the delimiter must END there. `<<E"OF"` used to match as the
+# delimiter `E` (bash's is `EOF`), so the stripper hunted for a line reading
+# `E`, never found one, and dropped every line after it -- including a write
+# on a later line. A shape this regex does not read is simply not stripped.
+HEREDOC_OPEN = re.compile(
+    r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1(?![\w'\"\\])")
+# What an UNQUOTED heredoc body executes: command substitution.
+HEREDOC_SUBST = re.compile(r"\$\(|`")
 
 # Shell metacharacters, so a command can be split into path-ish tokens.
 TOKEN_SPLIT = re.compile(r"[\s;|&<>()\[\]{}=,]+")
@@ -201,6 +213,12 @@ def strip_heredocs(cmd):
 
     NOT stripped when the opening line contains a pipe: `cat <<EOF | bash`
     executes its body as shell, so there the body is code and must be scanned.
+
+    NOT stripped either when the delimiter is UNQUOTED and the body carries a
+    command substitution (2026-09-27, bug bash #4): bash runs `$(...)` and
+    backticks inside `<<EOF` while building the body, so `cat <<EOF` /
+    `$(printf x > STORE/f.md)` / `EOF` wrote the store and was ALLOWED. A
+    quoted delimiter (`<<'EOF'`) expands nothing, so its body stays prose.
     """
     lines = cmd.splitlines()
     out, i = [], 0
@@ -212,10 +230,15 @@ def strip_heredocs(cmd):
         if not m or "|" in line:
             continue
         delim = m.group(2)
+        body = []
         while i < len(lines) and lines[i].strip() != delim:
-            i += 1                      # drop the body
+            body.append(lines[i])
+            i += 1
+        if not m.group(1) and HEREDOC_SUBST.search("\n".join(body)):
+            out.extend(body)            # expanded by bash: code, keep it
+            continue                    # (the terminator line is kept too)
         if i < len(lines):
-            i += 1                      # and the terminator
+            i += 1                      # drop the body and the terminator
     return "\n".join(out)
 
 
@@ -384,9 +407,61 @@ def heredoc_into_runtime(cmd):
         k = 0
         while k < len(argv) and (ENV_ASSIGN.match(argv[k]) or argv[k] == "env"):
             k += 1
-        if k < len(argv) and _is_runtime(argv[k]) and \
-                store_referenced("\n".join(body)):
+        text = "\n".join(body)
+        if k < len(argv) and _is_runtime(argv[k]) and (
+                store_referenced(text)
+                or (names_store_parent(text) and has_inline_write(text))):
             return f"{os.path.basename(argv[k])} <<"
+    return None
+
+
+# --- the store spelled in pieces (2026-09-27, bug bash #4, verify-A G2) ------
+# store_referenced needs the path contiguous, so inline code that assembles it
+# -- `open('<parent>' + '/memory/x.md','w')`, `Path(parent, 'memory', 'x')` --
+# named nothing and was ALLOWED; bash then wrote the file. A runtime segment
+# that names the store's PARENT (the project dir, or its project key, or the
+# projects dir above it) AND carries a write-shaped call is denied too. This is
+# a speed bump, not a proof: an encoded path (base64, chr()) still gets past a
+# text scan -- the fold's manifest and alarm are the layer behind it.
+INLINE_WRITE = re.compile(
+    r"write|append|symlink|\blink|rename|replace|copy|move|unlink|remove"
+    r"|rmtree|truncate|touch|mkdir|os\.open|fdopen")
+
+
+def _store_parent_markers():
+    parent = os.path.dirname(STORE)
+    out = {parent, os.path.dirname(parent)}
+    key = os.path.basename(parent)
+    if len(key) >= 8:                   # the project key, e.g. -home-u-Github-CC
+        out.add(key)
+    return {m for m in out if m and m != os.sep}
+
+
+def names_store_parent(text):
+    return any(m in text for m in _store_parent_markers())
+
+
+def has_inline_write(text):
+    return bool(WRITE_SHAPE.search(NOT_A_WRITE.sub(" ", text))
+                or INLINE_WRITE.search(text))
+
+
+def split_path_inline_write(scannable):
+    """The inline-code flag of a runtime segment that names the store's parent
+    and carries a write shape, or None. Sanctioned (door) segments are exempt."""
+    try:
+        segments = split_segments(strip_shell_comments(scannable))
+    except ValueError:
+        return None
+    for seg, base in zip(segments, _bases_per_segment(segments)):
+        if not names_store_parent(seg) or not has_inline_write(seg):
+            continue
+        try:
+            flag = inline_code_flag(seg)
+            if flag and not segment_is_sanctioned(seg, [base, WORKSPACE]):
+                return flag
+        except ValueError:
+            continue
     return None
 
 
@@ -704,6 +779,8 @@ def main():
         opaque = None
         if mentions_store:
             opaque = opaque_inline_write(scannable)
+        if opaque is None:
+            opaque = split_path_inline_write(scannable)
         if opaque is None:
             opaque = heredoc_into_runtime(strip_commit_message(cmd))
         if opaque:

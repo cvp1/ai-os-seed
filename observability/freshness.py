@@ -64,6 +64,29 @@ _FINDINGS_MAX_BYTES = 16000
 _ACKS = _HERE / "control" / "findings_ack.json"
 _ACK_MAX_DAYS = 90
 
+# Fleet-only scanners and the instrument each one runs or reads. cc-seed writes
+# .cc-seed/receipt.json at the root of every install and ships none of these,
+# so on a seed install an absent instrument means "not installed here", not
+# "broken" — until 2026-09-26 {{REDACTED}}'s freshness reported all six as problems
+# every day. On a fleet tree (no receipt) absence stays a loud finding: that is
+# where a deleted instrument is the failure.
+_SEED_INSTALL = (_HERE.parent / ".cc-seed" / "receipt.json").exists()
+_FLEET_INSTRUMENTS = {
+    "prices": "observability/gen_prices.py",
+    "models": "_lib/model_catalog.py",
+    "keys": "keyvault/keys.py",
+    "leaks": "keyvault/leak_scan.py",
+    "inventory": "keyvault/inventory_check.py",
+    "ontology": "ontology/ontology.py",
+}
+
+
+def fleet_scanner_applies(name, root=None, seed=None):
+    """True when the named fleet-only scanner should run on this tree."""
+    root = Path(root) if root else _HERE.parent
+    seed = _SEED_INSTALL if seed is None else seed
+    return not seed or (root / _FLEET_INSTRUMENTS[name]).exists()
+
 
 def load_acks(now=None):
     """Return (active, expired) ack lists. Raises on a malformed ledger; the
@@ -433,6 +456,47 @@ def ontology_problems(state_path=None, now=None):
                 f"{type(e).__name__}: {e}"]
 
 
+def job_findings_problems(conn, now, cfg=None):
+    """One line per opted-in job whose LATEST run reported found work.
+
+    WHY (bug bash 2026-09-27 #3b): mcp_guard_check logged `FINDINGS: MCP
+    snapshot drift — 1 added, 4 removed` every Monday from at least 2026-08-03,
+    exit 0 and ok=1 by the Story 008 found-work convention — and evaluate()
+    branches on ok/exit_code only, so the supply-chain drift alarm reached no
+    reader for eight weeks (same last-hop gap as ontology_problems).
+
+    Opt-in per job (`"surface_findings": true` in freshness.json), not blanket:
+    ~15 jobs emit FINDINGS summaries, several every run as a report whose reader
+    is elsewhere (vivint_ha_watchdog, unifi_links, system_status…), and a daily
+    FINDINGS.md full of those is how the file gets skimmed past. State, not
+    history: the line follows the latest run and clears the run the finding
+    does; a failed latest run is FAILING's line, not this one. Never crashes."""
+    cfg = cfg if cfg is not None else json.loads(_CONFIG.read_text())
+    out = []
+    try:
+        for job, spec in cfg["jobs"].items():
+            if not spec.get("surface_findings"):
+                continue
+            rows = conn.execute(
+                "SELECT started_at, ok, summary FROM runs WHERE job=? "
+                "ORDER BY started_at DESC LIMIT 60", (job,)).fetchall()
+            if not rows or not rows[0]["ok"] \
+                    or not (rows[0]["summary"] or "").startswith("FINDINGS:"):
+                continue
+            streak = 0
+            for r in rows:
+                if not (r["ok"] and (r["summary"] or "").startswith("FINDINGS:")):
+                    break
+                streak += 1
+            since = _fmt_age(now - _parse_iso(rows[streak - 1]["started_at"]))
+            summ = rows[0]["summary"][len("FINDINGS:"):].strip()
+            out.append(f"{spec.get('label', job)}: {summ[:160]} "
+                       f"(every run for {since}, {streak}{'+' if streak == 60 else ''} run(s))")
+    except Exception as e:  # noqa: BLE001 -- never let the backstop crash the job
+        return [f"job findings check failed to run: {type(e).__name__}: {e}"]
+    return out
+
+
 def parse_age(s: str) -> timedelta:
     m = _DUR.match(s)
     if not m:
@@ -691,6 +755,7 @@ def main():
     now = datetime.now(timezone.utc)
     with db.connect() as conn:
         results = evaluate(conn, now)
+        found = job_findings_problems(conn, now)  # opted-in jobs' own FINDINGS: (#3b)
     if fixture_only():
         # Every scanner below reads the LIVE estate (git trees, ~/.key, the
         # switch file, the ack ledger), not the runs.db handed in. A test that
@@ -699,17 +764,23 @@ def main():
         # missed key_registry + switches + acks, so cc-unit-tests failed on
         # every day the real estate had any finding (42 runs since 08-26).
         # A NEW scanner added here must go inside this else-branch.
-        drift = repo = prices = models = keys = onto = sw = leaks = []
+        drift = repo = prices = models = keys = onto = sw = leaks = inv = []
+        skipped = []
     else:
+        # Fleet-only scanners run only where their instrument is installed
+        # (or always, on a fleet tree) — see fleet_scanner_applies.
+        skipped = [n for n in _FLEET_INSTRUMENTS if not fleet_scanner_applies(n)]
+        def fleet(name, scan):
+            return [] if name in skipped else scan()
         drift = shim_drift()  # Story 025: shim set/content drift is a paging problem too
         repo = repo_hygiene_problems()  # Story 008: dirty/unpushed/untracked-exec drift
-        prices = prices_projection_drift()  # prices.json must stay a projection of PRICING
-        models = model_drift_problems()  # frontier pins vs what the providers actually serve
-        keys = key_registry_problems()  # vault<->ROTATION.md coverage, sidecars, rotate_by
-        onto = ontology_problems()  # derived-ontology drift: the daily check's finding SET
+        prices = fleet("prices", prices_projection_drift)  # prices.json must stay a projection of PRICING
+        models = fleet("models", model_drift_problems)  # frontier pins vs what the providers actually serve
+        keys = fleet("keys", key_registry_problems)  # vault<->ROTATION.md coverage, sidecars, rotate_by
+        onto = fleet("ontology", ontology_problems)  # derived-ontology drift: the daily check's finding SET
         sw = switch_problems(now)  # the control file itself unreadable (loud, still watching)
-        leaks = key_leak_problems()  # a vault value found OUTSIDE the vault (PLAN-key-hygiene-2026-09-12)
-        inv = key_inventory_problems()  # fleet hosts holding vault keys their runbook row omits (PLAN §4.2)
+        leaks = fleet("leaks", key_leak_problems)  # a vault value found OUTSIDE the vault (PLAN-key-hygiene-2026-09-12)
+        inv = fleet("inventory", key_inventory_problems)  # fleet hosts holding vault keys their runbook row omits (PLAN §4.2)
 
     # STALE (went silent) and FAILING (crashed) are high-confidence — they page.
     # MISSING (never run) is weaker: usually a newly-instrumented job that hasn't
@@ -733,6 +804,7 @@ def main():
         findings += [f"[LEAK] secret outside the vault: {l}" for l in leaks]
         findings += [f"[INVENTORY] key on a fleet host: {i}" for i in inv]
         findings += [f"[ONTO] {o}" for o in onto]
+        findings += [f"[FOUND] {f}" for f in found]
         findings += [f"[SWITCH] {w}" for w in sw]
         live, acked = (findings, []) if fixture_only() else apply_acks(findings, now)
         write_findings(live, now, acked, [] if fixture_only() else switched_off_lines(now))
@@ -746,22 +818,24 @@ def main():
                           "shim_drift": drift, "repo_hygiene": repo,
                           "prices_drift": prices, "model_drift": models,
                           "key_registry": keys, "ontology": onto,
-                          "switches": sw, "leaks": leaks,
+                          "switches": sw, "leaks": leaks, "job_findings": found,
+                          "skipped_not_installed": skipped,
                           "switched_off": [] if fixture_only() else switched_off_lines(now)},
                          indent=2))
         return 0
 
     shown = results if args.all else problems
-    if not shown and not drift and not repo and not prices and not models and not keys and not onto and not sw and not leaks:
+    if not shown and not drift and not repo and not prices and not models and not keys and not onto and not sw and not leaks and not found:
         # Silent success: nothing printed, nothing found.
         return 0
-    if problems or drift or repo or prices or models or keys or onto or sw or leaks:
+    if problems or drift or repo or prices or models or keys or onto or sw or leaks or found:
         # Found work is success (Story 008): report with a FINDINGS: first line
         # (log_run stores it as the run's summary) and exit 0 below.
         print(f"FINDINGS: {len(problems)} job problem(s), "
               f"{len(drift)} shim drift, {len(repo)} repo hygiene, "
               f"{len(prices)} price drift, {len(models)} model drift, {len(keys)} key registry, "
-              f"{len(onto)} ontology, {len(sw)} switch store, {len(leaks)} leak{triage}")
+              f"{len(onto)} ontology, {len(sw)} switch store, {len(leaks)} leak, "
+              f"{len(found)} job finding{triage}")
     for r in sorted(shown, key=lambda x: (x["status"] == "OK", x["job"])):
         print(f"[{r['status']:7}] {r['label']}: {r['detail']}")
     for d in drift:
@@ -780,6 +854,11 @@ def main():
         print(f"[{'ONTO':7}] {o}")
     for w in sw:
         print(f"[{'SWITCH':7}] {w}")
+    for f in found:
+        print(f"[{'FOUND':7}] {f}")
+    if args.all and skipped:
+        print(f"[{'SKIP':7}] fleet-only scanners not installed on this seed install: "
+              f"{', '.join(skipped)}")
     return 0
 
 

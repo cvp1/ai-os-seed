@@ -47,7 +47,13 @@ def _host():
 HOST = _host()
 
 KINDS = {"assert", "correct", "lesson", "denial", "retract",
-         "propose-correct", "update-pointer", "pin"}
+         "propose-correct", "update-pointer", "pin", "tier"}
+# Index tier of a subject, replicated as an event (2026-09-27, Craig: "do the
+# recommended for 2"). Before this, `_index-exclude.txt` was a per-host file
+# and two hosts' always-on sets diverged by 38 rows with nothing to reconcile
+# them. A `tier` event is an OVERLAY like `pin`: it names a subject, never
+# renders, and a newer tier event supersedes the older one.
+TIERS = {"ondemand", "always"}
 POLARITIES = {"exists", "absent", "n/a"}
 LINEAGES = {"operator-direct", "contains-untrusted"}
 # The two promotion classes an untrusted-lineage fact can reach (Craig,
@@ -309,7 +315,7 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                confidence="inferred", supersedes=None, pin=False, ts=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
                carry_forward=False, body_sha256=None, verbal_approval=None,
-               pointer=False):
+               pointer=False, tier=None):
     # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
     # this is the one place a stump can be refused before it becomes doctrine —
     # backfill.py was gated first and the same week five more stumps arrived
@@ -350,6 +356,8 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
           "supersedes": supersedes, "sig": None}
     if pin:
         ev["pin"] = True
+    if tier is not None:
+        ev["tier"] = tier
     # SPEC v4 fields are OMITTED when unset rather than written as null: every
     # byte here is replicated forever, and an absent key reads the same as a
     # null to `.get()` while costing nothing. Grandfathered events simply lack
@@ -428,6 +436,16 @@ def validate_event(ev):
             if not va.get("ts"):
                 p.append("verbal_approval.ts missing — an approval with no "
                          "date cannot be placed in a session")
+    # A body and the hash that binds it must agree (2026-09-27, sign.py now
+    # carries both): a mismatch is a forged or corrupted carrier, never served.
+    if (ev.get("body") and ev.get("body_sha256")
+            and content_fingerprint(ev["body"]) != ev["body_sha256"]):
+        p.append("body does not match body_sha256")
+    if ev.get("kind") == "tier":
+        if ev.get("tier") not in TIERS:
+            p.append(f"tier event needs tier in {sorted(TIERS)}, got {ev.get('tier')!r}")
+        if ev.get("body"):
+            p.append("a tier event carries no body")
     if ev.get("residency") is not None and ev.get("residency") not in RESIDENCIES:
         p.append(f"bad residency {ev.get('residency')!r}")
     # A2 at the schema level: an event carrying a body for a non-fleet audience
@@ -516,7 +534,104 @@ def ghost_refusal_reason(kind, subject, body, store_root):
             f"    memory_write.py write --slug {slug} ... --commit")
 
 
-def project_store(fold, store, apply=False):
+CHAIN_WALK_MAX_HOPS = 64   # bound every loop (Principle 8); a cycle cannot hang the fold
+
+
+def _stamp(body, lineage, klass=None, words=None):
+    """Render the projection stamps from the governing verdict, exactly as
+    memory_write.set_lineage + set_promotion write them on the promoting host
+    (`lineage:`, then `promotion:` and, for a verbal promotion, `approved:`).
+    The body's own stamp lines are replaced, never trusted: they are what one
+    host wrote, not part of the fact."""
+    if not _FM_LINEAGE_STRIP.search(body):
+        return body
+    stamp = f"lineage: {lineage}\n"
+    if klass:
+        stamp += f"promotion: {klass}\n"
+        if words:
+            stamp += f"approved: {json.dumps(words, ensure_ascii=False)}\n"
+    body = re.sub(r"(?m)^(promotion|approved):[ \t]*.*$\n?", "", body)
+    return _FM_LINEAGE_STRIP.sub(stamp, body, count=1)
+
+
+def _chain(tip, by_id):
+    """The tip's supersede ancestry, nearest first (BFS, bounded, cycle-safe)."""
+    out, seen, frontier, hops = [], {tip["id"]}, [tip], 0
+    while frontier and hops < CHAIN_WALK_MAX_HOPS:
+        hops += 1
+        nxt = []
+        for e in frontier:
+            raw = e.get("supersedes")
+            for sid in ([raw] if isinstance(raw, str) else (raw or [])):
+                a = by_id.get(sid)
+                if a is not None and sid not in seen:
+                    seen.add(sid)
+                    out.append(a)
+                    nxt.append(a)
+        frontier = nxt
+    return out
+
+
+def chain_body(tip, events):
+    """The body a bodyless lesson tip stands for, or None (2026-09-27).
+
+    A `correct` that re-declares residency, or a signed promotion, supersedes
+    a lesson without re-carrying its body — sign.py bound the bytes by hash
+    and declare.py (69 events on {{REDACTED}}, 2026-09-17) carried only content. So
+    a peer projected nothing for 72 + 1 subjects whose bytes were in the log
+    all along, one step back. deee167 looked at a signed TIP only; this walks
+    the chain (docs/DESIGN-signed-bodies.md §2.1):
+
+      1. a VERIFIED signed event in the chain with `body_sha256` is the
+         authority; the bytes come from any event on the subject whose body
+         fingerprints to that hash — the carrier only supplies bytes, so an
+         unsigned carrier cannot change what gets written. No carrier: None
+         (never a stub for a signed subject).
+      2. no signed ancestor: the nearest ancestor carrying a body, stamped
+         with the LEAST trusted lineage of tip and carrier — a trusted tip
+         must not launder an untrusted body (§2.5).
+
+    Only operator/shared audiences may supply a body (A2). Returns the
+    stamped text, or None.
+    """
+    by_id = {e["id"]: e for e in (events or ())}
+    chain = [tip] + _chain(tip, by_id)
+    subject = tip["subject"]
+
+    def ok_carrier(e):
+        return (e.get("subject") == subject and event_carries_body(e)
+                and e.get("audience") in BODY_AUDIENCES)
+
+    # The nearest vouching event: a verified signature (key) or a verbal
+    # approval — the two promotion routes the fold serves (fold_events).
+    authority = next((e for e in chain if e.get("body_sha256")
+                      and (e.get("_signed") or e.get("verbal_approval"))), None)
+    if authority is not None:
+        want = authority["body_sha256"]
+        carrier = next((e for e in chain if ok_carrier(e)
+                        and content_fingerprint(e["body"]) == want), None)
+        if carrier is None:
+            carrier = next((e for e in (events or ()) if ok_carrier(e)
+                            and content_fingerprint(e["body"]) == want), None)
+        if carrier is None:
+            return None
+        if authority.get("_signed"):
+            return _stamp(carrier["body"], "craig-direct", PROMOTION_KEY)
+        return _stamp(carrier["body"], "craig-direct", PROMOTION_VERBAL,
+                      (authority.get("verbal_approval") or {}).get("words"))
+    carrier = next((e for e in chain[1:] if ok_carrier(e)), None)
+    if carrier is None:
+        return None
+    trusted = (tip.get("lineage") == "operator-direct"
+               and carrier.get("lineage") == "operator-direct")
+    return _stamp(carrier["body"], "craig-direct" if trusted else "contains-untrusted")
+
+
+# The tip-only predecessor (deee167); kept as a name for callers and tests.
+signed_promotion_body = chain_body
+
+
+def project_store(fold, store, apply=False, events=None):
     """Materialise/repair store files from the event log (SPEC v4 A1/A3).
 
     The tip of a subject's supersede lineage is the fact's one home; store files
@@ -548,7 +663,14 @@ def project_store(fold, store, apply=False):
     out = {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
     seen = set()
     for e in fold["live"]:
-        if e["kind"] != "lesson" or not e["subject"].startswith("lesson/"):
+        if not e["subject"].startswith("lesson/"):
+            continue
+        promoted = None
+        if e["kind"] == "correct" or (e["kind"] == "lesson" and not event_carries_body(e)):
+            promoted = chain_body(e, events)
+            if promoted is None and e["kind"] == "correct":
+                continue
+        elif e["kind"] != "lesson":
             continue
         # A body may only be projected for audiences allowed to carry one; a
         # family-audience event has no body by construction (A2), so this loop
@@ -563,7 +685,13 @@ def project_store(fold, store, apply=False):
             continue
         seen.add(slug)
         f = store / f"{slug}.md"
-        if event_carries_body(e):
+        if promoted is not None and f.exists():
+            # CREATE-ONLY for chain-walked bodies: the signing host stamps
+            # post-promotion frontmatter the carrier event never had, so a
+            # "repair" here would strip it (measured on {{REDACTED}},
+            # 2026-09-27). The missing file is the whole defect being fixed.
+            continue
+        if promoted is not None or event_carries_body(e):
             # A2 enforced AT THE PROJECTOR, not only at the producer. emit.py
             # refuses a family-audience body, but the projector consumes events
             # from peers, replay and anything with a shell — so a hand-crafted
@@ -576,7 +704,7 @@ def project_store(fold, store, apply=False):
                     f"{e.get('audience')!r}: {slug} (bodies are operator/shared "
                     f"only — this event should not exist)")
                 continue
-            want = e["body"]
+            want = promoted if promoted is not None else e["body"]
             if not f.exists():
                 if apply:
                     f.write_text(want, encoding="utf-8")
@@ -673,15 +801,22 @@ SIG_NAMESPACE = "memory-mesh"
 # throwaway keypair to exercise the verify path end-to-end.
 def _signers_file():
     """One signer registry for the fleet, but its checkout path differs by
-    host ({{REDACTED}}/{{REDACTED}}: ~/{{REDACTED}}/cc-handoff; {{REDACTED}}: ~/cc-handoff).
+    host ({{REDACTED}}/{{REDACTED}}: ~/{{REDACTED}}/cc-handoff; {{REDACTED}} since the
+    2026-09-26 anchor cutover: <install>/fleet/cc-handoff).
     A host that can't find it treats every signature as unverified — which
-    silently forked view.version fleet-wide (found 2026-07-28). Probe the
-    known homes; env override wins (drills)."""
+    silently forked view.version fleet-wide (found 2026-07-28), and again on
+    2026-09-27: {{REDACTED}}'s cutover moved cc-handoff under fleet/, 84 signed
+    events read as unsigned, and signed always-on rows fell out of residency.
+    Probe root-relative homes first (no host literal to scrub), then the
+    legacy ones; env override wins (drills)."""
     if os.environ.get("MESH_ALLOWED_SIGNERS"):
         return Path(os.environ["MESH_ALLOWED_SIGNERS"])
-    cands = [Path(os.path.expanduser(p)) for p in
-             ("~/{{REDACTED}}/cc-handoff/allowed_signers",
-              "~/cc-handoff/allowed_signers")]
+    root = Path(__file__).resolve().parent.parent
+    cands = [root / "cc-handoff" / "allowed_signers",
+             root / "fleet" / "cc-handoff" / "allowed_signers"] + [
+        Path(os.path.expanduser(p)) for p in
+        ("~/{{REDACTED}}/cc-handoff/allowed_signers",
+         "~/cc-handoff/allowed_signers")]
     for c in cands:
         if c.exists():
             return c
@@ -1202,6 +1337,21 @@ def fold_events(events, registry):
     # and the overlay is gone on the next fold.
     pins = [e for e in live if e["kind"] == "pin"]
     live = [e for e in live if e["kind"] != "pin"]
+    # Tier overlays (see TIERS). Two live tier events on one subject that
+    # disagree are a race between hosts: alarm and let neither win, so each
+    # host keeps what its file already says — never a silent demotion.
+    tier_evs = [e for e in live if e["kind"] == "tier"]
+    live = [e for e in live if e["kind"] != "tier"]
+    tiers, _tier_seen = {}, {}
+    for e in tier_evs:
+        _tier_seen.setdefault(e["subject"], set()).add(e.get("tier"))
+    for subj, ts_ in sorted(_tier_seen.items()):
+        if len(ts_) == 1:
+            tiers[subj] = next(iter(ts_))
+        else:
+            alarms.append(f"tier conflict on {subj}: live tier events say "
+                          f"{sorted(t or '?' for t in ts_)} — left to each host's "
+                          f"file; resolve with tier.py")
 
     unnormalized = [e for e in live if subject_problem(e["subject"], registry)]
     normalized = [e for e in live if not subject_problem(e["subject"], registry)]
@@ -1361,6 +1511,7 @@ def fold_events(events, registry):
             # the only record of WHY a memory is resident — and the only place
             # to find the id needed to retract it — is raw log spelunking.
             "pins": pins, "pins_active": sorted(pinned_subjects),
+            "tiers": tiers,
             "pins_refused": refused, "pinned_bytes": spent}
 
 
@@ -1603,9 +1754,13 @@ def harness_store():
     return store if (store / ".mesh-generated").exists() else None
 
 
-def ondemand_slugs(store):
-    """Slugs deliberately held OUT of the always-on index
-    (store/_index-exclude.txt — the store's standing two-tier decision)."""
+def _tier_key(subject):
+    """The key `_index-exclude.txt` uses: bare slug for lessons, else subject."""
+    return subject.split("/", 1)[1] if subject.startswith("lesson/") else subject
+
+
+def file_ondemand_slugs(store):
+    """The entries of store/_index-exclude.txt, as written on this host."""
     f = store / "_index-exclude.txt"
     if not f.exists():
         return set()
@@ -1615,6 +1770,46 @@ def ondemand_slugs(store):
         if s:
             out.add(s[:-3] if s.endswith(".md") else s)
     return out
+
+
+def ondemand_slugs(store, fold=None):
+    """Slugs deliberately held OUT of the always-on index.
+
+    The file is this host's record; `tier` events are the mesh's (2026-09-27).
+    With a fold, events win per subject: `ondemand` adds, `always` removes.
+    Without one (callers that have not folded) the file alone answers, which
+    is what the fold writes back anyway (project_index_exclude)."""
+    out = file_ondemand_slugs(store)
+    for subj, t in ((fold or {}).get("tiers") or {}).items():
+        k = _tier_key(subj)
+        if t == "ondemand":
+            out.add(k)
+        elif t == "always":
+            out.discard(k)
+            out.discard(subj)
+    return out
+
+
+EXCLUDE_HEADER = ("# On-demand tier — held out of the always-on MEMORY.md index.\n"
+                  "# PROJECTED by the fold from `tier` events + this host's own "
+                  "entries (2026-09-27);\n# change a tier with memory_write.py "
+                  "demote [--undo] or memory-mesh/tier.py, not by hand.\n")
+
+
+def project_index_exclude(fold, store, apply=False):
+    """Rewrite store/_index-exclude.txt as ondemand_slugs(store, fold).
+
+    Returns (added, removed). Creation-safe and loss-free: an entry with no
+    tier event stays; only an `always` event removes one."""
+    if store is None:
+        return [], []
+    before = file_ondemand_slugs(store)
+    after = ondemand_slugs(store, fold)
+    added, removed = sorted(after - before), sorted(before - after)
+    if apply and (added or removed):
+        (store / "_index-exclude.txt").write_text(
+            EXCLUDE_HEADER + "".join(f"{s}\n" for s in sorted(after)), encoding="utf-8")
+    return added, removed
 
 
 ONDEMAND_HEADING = "## On-demand memories — not always-loaded; /recall reaches them"
@@ -1777,7 +1972,7 @@ def residency_partition(fold, store):
         return (e["subject"].split("/", 1)[1]
                 if e["subject"].startswith("lesson/") else None)
 
-    exclude = ondemand_slugs(store) if store else set()
+    exclude = ondemand_slugs(store, fold) if store else set()
     today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     always, demand, undeclared, expired = [], [], [], []
     for e in ranked_index(fold, "operator"):
@@ -1836,7 +2031,7 @@ def render_harness_memory(fold, store):
     """The harness-loaded MEMORY.md: the operator INDEX minus on-demand slugs,
     plus an appendix naming what /recall can reach — sized so the WHOLE file
     clears the loader's ceilings. Returns (text, report)."""
-    exclude = ondemand_slugs(store)
+    exclude = ondemand_slugs(store, fold)
     ranked = [e for e in ranked_index(fold, "operator")
               if not index_excluded(e, exclude)]
     # The on-demand appendix advertises slugs as reachable by /recall. A

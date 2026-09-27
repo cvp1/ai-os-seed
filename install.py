@@ -61,7 +61,7 @@ HERE = Path(__file__).resolve().parent
 
 # What an install consists of — directories and files copied verbatim.
 COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "memory-mesh", "views",
-              "session-brief"]
+              "session-brief", "friction-miner", "mcp-guard"]
 # Opt-in only (SEED-065): governance/ never ships via the default COMPONENTS
 # copy — a default `install.py --target <ROOT>` is byte-for-byte unchanged
 # by this wave. --enable-governance is the explicit "governance: none is
@@ -524,7 +524,10 @@ def _package_sha(package: Path) -> str:
     h = hashlib.sha256()
     try:
         for p in sorted(Path(package).rglob("*")):
-            if not p.is_file() or "__pycache__" in p.parts:
+            # .git too: a package delivered as a checkout (the beta drop) must
+            # hash like dist/ itself, or the receipt can never name the dist
+            # it came from (2026-09-26, first beta update on {{REDACTED}}).
+            if not p.is_file() or "__pycache__" in p.parts or ".git" in p.relative_to(package).parts:
                 continue
             h.update(p.relative_to(package).as_posix().encode())
             h.update(hashlib.sha256(p.read_bytes()).digest())
@@ -559,8 +562,50 @@ def _package_sha(package: Path) -> str:
 # this install wrote"). check 1 already skipped exactly these; the hash had
 # never been told.
 RUNTIME_WRITABLE_PREFIXES = ("observability/data/", "session-brief/briefs/")
+# Roots the OPERATOR owns outright: private add-ons this package never ships,
+# never updates and never rolls back (a fleet member's own code checkouts,
+# governed by their own tooling). --audit skips them rather than calling every
+# file there UNEXPECTED — which would flag every audit and fail a beta soak
+# for content that was never the package's to vouch for. --update and
+# --rollback already only touch shipped/planned paths, so they leave it alone.
+OPERATOR_OWNED_PREFIXES = ("fleet/",)
+# Shipped files the operator is TOLD to edit — their own job list and mesh
+# membership. Like scheduler/manifest.yml: not byte-compared against the
+# package by --audit, not in installed_sha, never auto-written by --update.
+# Flagging them made every real install's audit permanently FLAGGED.
+OPERATOR_EDITABLE_CONFIG = ("observability/freshness.json", "memory-mesh/mesh.toml")
+# The operator's own declaration of what else in the install is theirs — one
+# path per line (a trailing / = a directory prefix). An entry that covers a
+# path the package ships is REFUSED and reported: a declaration can widen
+# what the audit leaves alone, never hide a change to shipped code. Every
+# honored entry is listed in the audit result, so it stays visible.
+OPERATOR_OWNED_FILE = "operator-owned"
+
+
+def _operator_declared(target: Path, package_paths):
+    """(honored_entries, problems) from <target>/.cc-seed/operator-owned."""
+    f = target / CC_SEED_DIR / OPERATOR_OWNED_FILE
+    if not f.is_file():
+        return [], []
+    honored, problems = [], []
+    for raw in f.read_text(encoding="utf-8", errors="replace").splitlines():
+        e = raw.strip()
+        if not e or e.startswith("#"):
+            continue
+        if e.startswith("/") or ".." in e.split("/"):
+            problems.append(f"operator-owned: {_escape_path(e)!s} refused — must be a relative path inside the install")
+            continue
+        covers = [p for p in package_paths
+                  if p == e.rstrip("/") or (e.endswith("/") and p.startswith(e))]
+        if covers:
+            problems.append(f"operator-owned: {_escape_path(e)} refused — it covers a path "
+                            f"the package ships ({_escape_path(covers[0])})")
+            continue
+        honored.append(e)
+    return honored, problems
 
 INSTALLED_SHA_EXEMPT = {
+    *OPERATOR_EDITABLE_CONFIG,
     # --enable-demo legitimately rewrites this file in place, which is why
     # check 1 skips it too. Hashing it would make every post-demo install
     # permanently "drifted".
@@ -2974,6 +3019,12 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         for pkg_p in [pkg_base] + sorted(pkg_base.rglob("*")):
             rel = pkg_p.relative_to(package).as_posix()
             checked_rel.add(rel)
+            if rel in OPERATOR_EDITABLE_CONFIG:
+                continue  # the operator's own config — see OPERATOR_EDITABLE_CONFIG
+            if rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS:
+                continue  # memory/ is the operator's once it has content (install()
+                          # and --update already treat it so); an operator who
+                          # retired it was reported as "missing" files forever
             if rel == "scheduler/manifest.yml":
                 continue  # owned by check 2 — --enable-demo is a legitimate,
                           # in-place rewrite of this file (see enable_demo()),
@@ -3025,12 +3076,22 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
     # (SEED-079) the brief store /freeze and /capture fill. Content there is
     # the user's, produced by using the system — never "unexpected".
     runtime_writable_prefixes = RUNTIME_WRITABLE_PREFIXES
+    pkg_paths = ({p.relative_to(package).as_posix() for c in written
+                  for p in (package / c).rglob("*")} | set(ROOT_FILES)) if package else set()
+    declared, decl_problems = _operator_declared(target, pkg_paths)
+    problems.extend(decl_problems)
     for live_p in sorted(target.rglob("*")):
         rel = live_p.relative_to(target).as_posix()
         if rel in checked_rel:
             continue
         if rel == CC_SEED_DIR or rel.startswith(CC_SEED_DIR + "/"):
             continue  # install.py's own receipt/staged scaffold
+        if rel == "install.py" and package and (package / "install.py").is_file():
+            # The installer's own copy (older installs placed one; --update
+            # keeps it current via _refresh_installer). Compared, not skipped.
+            if live_p.read_bytes() != (package / "install.py").read_bytes():
+                problems.append("install.py: the install's own installer differs from the package's")
+            continue
         if rel == "CLAUDE.md":
             continue  # owned by check 3
         hook_record = (receipt.get("gated_writes") or {}).get("memory-hooks")
@@ -3050,9 +3111,17 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             # A REVOKED record grants nothing. The file is then just a file
             # this package does not own; it falls through to the baseline
             # comparison or to UNEXPECTED, as any other unmanaged path would.
+        if rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS:
+            continue  # the operator's component (see the package loop above)
+        if rel.rsplit("/", 1)[-1] == ".DS_Store":
+            continue  # macOS Finder metadata — appears in any folder a Mac user opens
         if "__pycache__" in rel.split("/") or rel.endswith((".pyc", ".pyo")):
             continue  # bytecode cache — a harmless side effect of running any shipped .py tool
         if any(rel == p.rstrip("/") or rel.startswith(p) for p in runtime_writable_prefixes):
+            continue
+        if any(rel == p.rstrip("/") or rel.startswith(p) for p in OPERATOR_OWNED_PREFIXES):
+            continue
+        if any(rel == e.rstrip("/") or (e.endswith("/") and rel.startswith(e)) for e in declared):
             continue
         if rel in baseline:
             reason = _compare_baseline_entry(live_p, baseline[rel])
@@ -3073,7 +3142,11 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
                             f"the baseline is GONE — it was removed after the "
                             f"install without a gated-write record")
 
-    return _flagged("1", "package trace", problems) if problems else _pass("1", "package trace")
+    note = (f"{len(declared)} operator-declared path(s) left to the operator "
+            f"(.cc-seed/{OPERATOR_OWNED_FILE}): " + ", ".join(declared[:40])) if declared else None
+    if problems:
+        return _flagged("1", "package trace", problems + ([note] if note else []))
+    return _pass("1", "package trace", note)
 
 
 def _check_2(target: Path, package: Path) -> dict:
@@ -3576,7 +3649,7 @@ SHIPPED_PATHS = COMPONENTS + ROOT_FILES  # the exact surface install() itself wr
 # `jobs: []` the seed ships, which would have silently de-scheduled every
 # real job on the next update. --update reports these but NEVER auto-writes
 # them — reconciling scheduler entries stays a manual, by-hand act.
-UPDATE_MANUAL_ONLY_PATHS = {"scheduler/manifest.yml"}
+UPDATE_MANUAL_ONLY_PATHS = {"scheduler/manifest.yml", *OPERATOR_EDITABLE_CONFIG}
 # Whole COMPONENTS this file already treats as user-owned the moment real
 # content exists — install() itself never overwrites memory/ once it's
 # there (SATISFIED_BY_EXISTING, _memory_is_pristine): it ships an EMPTY
@@ -3837,9 +3910,158 @@ def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_s
                 dst.unlink()
             shutil.copy2(src, dst)
     shipped = dict(receipt.get("shipped") or {})
-    for rel in plan["create"] + plan["update"]:
+    # "unchanged" means the live bytes ALREADY equal the new package's, so the
+    # new entry is what is shipped there now. Keeping the old version's record
+    # made such a path look locally modified on every later --update (found
+    # repairing {{REDACTED}}, 2026-09-26).
+    for rel in plan["create"] + plan["update"] + plan["unchanged"]:
         shipped[rel] = new_snap[rel]
     receipt["shipped"] = shipped
+
+
+# --- --rollback: undo the most recent --update --apply, byte for byte ---
+#
+# {{REDACTED}} became the beta channel (2026-09-26): betas land there first via
+# --update --from <dist>, soak, and only then publish. A beta that breaks the
+# operator's daily driver needs a one-command way back, and --update cannot
+# be it: it refuses downgrades, needs the OLD dist on hand, and never deletes
+# a path the new version created. So every --update --apply now saves exactly
+# what it is about to replace, and --rollback puts it back.
+ROLLBACK_DIR = "rollback"
+ROLLBACK_KEEP = 3  # bounded (Principle 8): only the last few updates are undoable
+
+
+def _rollback_root(target: Path) -> Path:
+    return target / CC_SEED_DIR / ROLLBACK_DIR
+
+
+def _rollback_points(target: Path, include_used: bool = False) -> list:
+    """Saved points, oldest first. A used point is renamed *.rolled-back and
+    is never offered again — undoing the same update twice would restore
+    stale bytes over whatever came after."""
+    root = _rollback_root(target)
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir()
+                  if p.is_dir() and (p / "rollback.json").is_file()
+                  and (include_used or not p.name.endswith(".rolled-back")))
+
+
+def _snapshot_for_rollback(target: Path, plan: dict, new_snap: dict,
+                           from_version, to_version) -> Path:
+    """Save what the coming _apply_update will overwrite, BEFORE it runs.
+    Updated paths keep their prior bytes; created paths are recorded with the
+    hash the update will give them, so rollback can tell "still as the update
+    left it" (safe to remove) from "edited since" (left alone, reported)."""
+    snap = _rollback_root(target) / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    files = snap / "files"
+    files.mkdir(parents=True)
+    updated = []
+    for rel in plan["update"]:
+        live = target / rel
+        entry = {"rel": rel, "type": _lstat_type(live.lstat()),
+                 "new": new_snap.get(rel, {})}
+        if entry["type"] == "symlink":
+            entry["symlink_target"] = os.readlink(live)
+        elif entry["type"] == "file":
+            (files / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(live, files / rel)
+        updated.append(entry)
+    created = [{"rel": rel, "new": new_snap.get(rel, {})} for rel in plan["create"]]
+    receipt_p = target / CC_SEED_DIR / RECEIPT_NAME
+    if receipt_p.is_file():
+        shutil.copy2(receipt_p, snap / RECEIPT_NAME)
+    if (target / "install.py").is_file():
+        shutil.copy2(target / "install.py", snap / "install.py")
+    (snap / "rollback.json").write_text(json.dumps({
+        "at": _now(), "from_version": from_version, "to_version": to_version,
+        "updated": updated, "created": created}, indent=1))
+    older = _rollback_points(target, include_used=True)
+    for old in older[:-ROLLBACK_KEEP]:
+        shutil.rmtree(old)
+    return snap
+
+
+def _still_as_updated(live: Path, new_entry: dict) -> bool:
+    if not live.exists() and not live.is_symlink():
+        return False
+    t = _lstat_type(live.lstat())
+    if t != new_entry.get("type"):
+        return False
+    if t == "file":
+        return _sha256_file(live) == new_entry.get("hash")
+    if t == "symlink":
+        return os.readlink(live) == new_entry.get("symlink_target")
+    return True
+
+
+def do_rollback(target: Path, assume_yes: bool) -> int:
+    """Undo the most recent --update --apply. Shows every path it will
+    restore or remove and needs a typed yes (Principle 17). A path edited
+    since the update is never touched — rollback restores the update's own
+    footprint, not the operator's later work."""
+    snaps = _rollback_points(target)
+    if not snaps:
+        return die(f"{target}: no rollback point — only an --update --apply made by an "
+                   f"installer with --rollback support leaves one")
+    snap = snaps[-1]
+    meta = json.loads((snap / "rollback.json").read_text())
+    restore, remove, keep = [], [], []
+    for e in meta["updated"]:
+        (restore if _still_as_updated(target / e["rel"], e["new"]) else keep).append(e)
+    for e in meta["created"]:
+        (remove if _still_as_updated(target / e["rel"], e["new"]) else keep).append(e)
+    print(f"rollback {target}: undo update {meta['from_version']} -> "
+          f"{meta['to_version']} ({meta['at']})")
+    for e in restore:
+        print(f"  RESTORE {e['rel']}")
+    for e in remove:
+        print(f"  REMOVE  {e['rel']}  (created by that update)")
+    for e in keep:
+        print(f"  KEEP    {e['rel']}  (changed since the update — left as is)")
+    print("  plus: the receipt and install.py return to their pre-update bytes.")
+    if not assume_yes:
+        try:
+            if input("  roll back? [y/N] ").strip().lower() not in ("y", "yes"):
+                print("  not rolled back.")
+                return 1
+        except EOFError:
+            return die("--rollback needs a typed yes (or --assume-yes for an automated "
+                       "caller that has already shown this list)")
+    with _update_lock(target):
+        for e in restore:
+            live = target / e["rel"]
+            live.unlink()
+            if e["type"] == "symlink":
+                os.symlink(e["symlink_target"], live)
+            elif e["type"] == "file":
+                shutil.copy2(snap / "files" / e["rel"], live)
+        # Deepest first, so a created dir is emptied before it is considered.
+        for e in sorted(remove, key=lambda e: e["rel"].count("/"), reverse=True):
+            live = target / e["rel"]
+            if not live.exists() and not live.is_symlink():
+                continue  # already pruned as the empty parent of a removed path
+            if live.is_dir() and not live.is_symlink():
+                try:
+                    live.rmdir()          # only if empty: never remove operator files
+                except OSError:
+                    print(f"  KEEP    {e['rel']}/  (not empty)")
+            else:
+                live.unlink()
+            # A created component leaves its now-empty parents behind; prune
+            # upward, never past the target, never a non-empty dir.
+            parent = live.parent
+            while parent != target and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+                parent = parent.parent
+        if (snap / RECEIPT_NAME).is_file():
+            shutil.copy2(snap / RECEIPT_NAME, target / CC_SEED_DIR / RECEIPT_NAME)
+        if (snap / "install.py").is_file() and (target / "install.py").is_file():
+            shutil.copy2(snap / "install.py", target / "install.py")
+        snap.rename(snap.with_name(snap.name + ".rolled-back"))
+    print(f"  rolled back to {meta['from_version']}. Registered skill links outside "
+          f"the install (if the update added any) are not touched.")
+    return 0
 
 
 def do_reseal(target: Path, assume_yes: bool) -> int:
@@ -4037,7 +4259,14 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 return die(f"update: fetched version {new_version!r} is OLDER than the "
                           f"installed {current_version!r} — refusing (pass --allow-downgrade "
                           f"if this is deliberate, e.g. --from a specific local clone)")
-            if new_version != "unknown" and new_version == current_version:
+            # A version string is not an identity for a BETA: every build
+            # between version bumps says the same thing, so "already current"
+            # silently refused to install any of them (the beta channel,
+            # 2026-09-26). Same version is "current" only when the package
+            # bytes are the ones this install came from, too.
+            same_bytes = (receipt["install"].get("package_sha")
+                          == _package_sha(new_tree))
+            if new_version != "unknown" and new_version == current_version and same_bytes:
                 print(f"update: already current (version {current_version}).")
                 if apply:
                     _redecide_skill_origins(target, receipt)
@@ -4138,6 +4367,9 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                     _save_receipt(target, receipt)
                 return 0
 
+            snap = _snapshot_for_rollback(target, plan, new_snap, current_version, new_version)
+            print(f"rollback point saved: {snap.relative_to(target)} "
+                  f"(undo with: install.py --target {target} --rollback)")
             _apply_update(target, receipt, new_tree, plan, new_snap)
             newly_registered, newly_deferred, newly_refused, seen_names = \
                 _register_new_skills(target)
@@ -4151,7 +4383,11 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             # (worse) reported as an unexpected path by the sweep at the end.
             # Silent, and it got quieter the more the seed grew.
             comps = receipt["install"].setdefault("components", [])
-            for rel in sorted(set(plan["create"]) | set(plan["update"])):
+            # "unchanged" counts too: a component that reached the tree some
+            # other way (an older installer, a hand repair) but whose bytes
+            # ARE the package's is shipped here — leaving it out of
+            # components kept session-brief/ reported as UNEXPECTED forever.
+            for rel in sorted(set(plan["create"]) | set(plan["update"]) | set(plan["unchanged"])):
                 top = rel.split("/", 1)[0]
                 if top in COMPONENTS and top not in comps:
                     comps.append(top)
@@ -4167,6 +4403,11 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             })
             receipt["updates"] = updates
             receipt["install"]["installer_version"] = new_version
+            # The receipt must name the dist this tree now came FROM, or a beta
+            # soak (tools/soak_evidence.py) could never bind to what was tested:
+            # package_sha used to stay the ORIGINAL install's forever.
+            receipt["install"]["package_sha"] = _package_sha(new_tree)
+            updates[-1]["package_sha"] = receipt["install"]["package_sha"]
             # R2: an update legitimately rewrites shipped bytes, so the
             # measurement is retaken here. Only install and update refresh it —
             # an --audit or --approve run must never re-baseline a tampered
@@ -4295,6 +4536,12 @@ def main():
     ap.add_argument("--allow-downgrade", action="store_true",
                     help="with --update: permit installing a version OLDER than what's "
                          "currently installed (refused by default)")
+    ap.add_argument("--rollback", action="store_true",
+                    help="undo the most recent --update --apply: restore the bytes it "
+                         "replaced, remove paths it created, and return the receipt and "
+                         "installer to their pre-update state. Paths edited since the "
+                         "update are left alone. Needs a typed yes (--assume-yes for an "
+                         "automated caller).")
     ap.add_argument("--reseal", action="store_true",
                     help="re-approve the CURRENT bytes as this install's baseline "
                          "after a divergence you meant (a component kept under "
@@ -4342,12 +4589,12 @@ def main():
                  bool(args.apply_proposal), bool(args.revert_proposal),
                  args.review_proposals, args.apply_proposals, args.update,
                  args.adopt_baseline, args.reseal, bool(args.revoke),
-                 args.contract]
+                 args.contract, args.rollback]
     if sum(bool(x) for x in exclusive) > 1:
         return die("--enable-demo, --enable-governance, --uninstall, --approve, --audit, "
                    "--list-packs, --remove-pack, --set-engagement, --apply-proposal, "
                    "--revert-proposal, --review-proposals, --apply-proposals, --update, "
-                   "--adopt-baseline, --revoke and --contract are mutually exclusive")
+                   "--adopt-baseline, --revoke, --contract and --rollback are mutually exclusive")
     if args.into and any(exclusive):
         return die("--into only applies to the initial install")
     if args.confirm and not args.apply_proposal:
@@ -4387,6 +4634,8 @@ def main():
         return do_update(target, args.update_from, args.apply, args.allow_downgrade)
     if args.reseal:
         return do_reseal(target, args.assume_yes)
+    if args.rollback:
+        return do_rollback(target, args.assume_yes)
     if args.adopt_baseline:
         return do_adopt_baseline(target)
     if args.uninstall:

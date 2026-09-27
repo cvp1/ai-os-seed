@@ -173,3 +173,235 @@ class MeshCoreTests(unittest.TestCase):
                                             store), [])
 
 if __name__ == "__main__": unittest.main()
+
+
+class SignedPromotionProjectionTests(unittest.TestCase):
+    """2026-09-27: a signed promotion tip (kind `correct`, body_sha256, no body)
+    must project the hash-matching earlier body on a peer — and nothing else."""
+
+    BODY = ("---\nname: x-fact\ndescription: d\nlineage: contains-untrusted\n"
+            "metadata:\n  node_type: memory\n---\n\nthe real body\n")
+
+    def _run(self, tip_overrides, body=None):
+        lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
+                  "audience": "operator", "body": body or self.BODY,
+                  "lineage": "contains-untrusted"}
+        tip = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+               "audience": "operator", "lineage": "operator-direct",
+               "supersedes": "a1", "_signed": True,
+               "body_sha256": mesh_lib.content_fingerprint(self.BODY)}
+        tip.update(tip_overrides)
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            out = mesh_lib.project_store({"live": [tip]}, store, apply=True,
+                                         events=[lesson, tip])
+            f = store / "x-fact.md"
+            return out, (f.read_text() if f.exists() else None)
+
+    def test_signed_tip_projects_matching_body_with_tip_lineage(self):
+        out, text = self._run({})
+        self.assertEqual(out["created"], ["x-fact"])
+        self.assertIn("the real body", text)
+        self.assertIn("lineage: craig-direct\npromotion: key-signed\n", text)
+
+    def test_existing_file_is_never_rewritten_by_a_promotion(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            (store / "x-fact.md").write_text("hand-kept\n")
+            lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
+                      "audience": "operator", "body": self.BODY}
+            tip = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+                   "audience": "operator", "lineage": "operator-direct",
+                   "_signed": True, "body_sha256": mesh_lib.content_fingerprint(self.BODY)}
+            out = mesh_lib.project_store({"live": [tip]}, store, apply=True,
+                                         events=[lesson, tip])
+            self.assertEqual((out["created"], out["repaired"]), ([], []))
+            self.assertEqual((store / "x-fact.md").read_text(), "hand-kept\n")
+
+    def test_unsigned_tip_never_launders_an_untrusted_body(self):
+        # Before the chain walk this projected nothing; now the body is
+        # recovered, but an unsigned operator-direct tip cannot vouch for an
+        # untrusted carrier — the file lands contains-untrusted (quarantined).
+        out, text = self._run({"_signed": False})
+        self.assertEqual(out["created"], ["x-fact"])
+        self.assertIn("lineage: contains-untrusted\n", text)
+        self.assertNotIn("promotion:", text)
+
+    def _chain_run(self, events, live_tip):
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            out = mesh_lib.project_store({"live": [live_tip]}, store, apply=True,
+                                         events=events)
+            f = store / "x-fact.md"
+            return out, (f.read_text() if f.exists() else None)
+
+    def test_bodyless_declaration_over_a_signed_promotion_projects_signed_bytes(self):
+        # The dominant real case (69 subjects): lesson -> signed promote ->
+        # unsigned residency `correct` with no body. The signature two hops
+        # back is still the authority.
+        lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
+                  "audience": "operator", "body": self.BODY,
+                  "lineage": "contains-untrusted"}
+        signed = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+                  "audience": "operator", "lineage": "operator-direct",
+                  "supersedes": "a1", "_signed": True,
+                  "body_sha256": mesh_lib.content_fingerprint(self.BODY)}
+        declare = {"id": "c3", "kind": "correct", "subject": "lesson/x-fact",
+                   "audience": "shared", "lineage": "operator-direct",
+                   "supersedes": ["b2"], "residency": "doctrine"}
+        out, text = self._chain_run([lesson, signed, declare], declare)
+        self.assertEqual(out["created"], ["x-fact"])
+        self.assertIn("lineage: craig-direct\npromotion: key-signed\n", text)
+
+    def test_verbal_authority_stamps_verbally_signed_with_the_words(self):
+        lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
+                  "audience": "operator", "body": self.BODY,
+                  "lineage": "contains-untrusted"}
+        verbal = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+                  "audience": "operator", "lineage": "contains-untrusted",
+                  "supersedes": "a1", "verbal_approval": {"words": "go, ship it", "ts": "t"},
+                  "body_sha256": mesh_lib.content_fingerprint(self.BODY)}
+        out, text = self._chain_run([lesson, verbal], verbal)
+        self.assertIn('promotion: verbally-signed\napproved: "go, ship it"\n', text)
+
+    def test_trusted_chain_without_signature_projects_craig_direct(self):
+        body = self.BODY.replace("contains-untrusted", "craig-direct")
+        lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
+                  "audience": "operator", "body": body, "lineage": "operator-direct"}
+        declare = {"id": "c3", "kind": "correct", "subject": "lesson/x-fact",
+                   "audience": "shared", "lineage": "operator-direct", "supersedes": ["a1"]}
+        out, text = self._chain_run([lesson, declare], declare)
+        self.assertIn("lineage: craig-direct\n", text)
+        self.assertNotIn("promotion:", text)
+
+    def test_supersede_cycle_terminates(self):
+        a = {"id": "a1", "kind": "correct", "subject": "lesson/x-fact",
+             "audience": "operator", "lineage": "operator-direct", "supersedes": "b2"}
+        b = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+             "audience": "operator", "lineage": "operator-direct", "supersedes": "a1"}
+        out, text = self._chain_run([a, b], a)
+        self.assertEqual(out["created"], [])
+        self.assertIsNone(text)
+
+    def test_hash_mismatch_projects_nothing(self):
+        out, text = self._run({}, body=self.BODY.replace("real", "forged"))
+        self.assertEqual(out["created"], [])
+        self.assertIsNone(text)
+
+    def test_no_events_passed_keeps_old_behaviour(self):
+        tip = {"id": "b2", "kind": "correct", "subject": "lesson/x-fact",
+               "audience": "operator", "_signed": True, "body_sha256": "0" * 64}
+        with tempfile.TemporaryDirectory() as d:
+            out = mesh_lib.project_store({"live": [tip]}, Path(d), apply=True)
+        self.assertEqual(out["created"], [])
+
+
+class BodyHashAgreementTests(unittest.TestCase):
+    """2026-09-27: sign.py carries the body it binds; the two must agree."""
+
+    def _ev(self, body, sha):
+        return {"id": "x", "ts": "t", "host": "h", "session": "s", "kind": "correct",
+                "subject": "lesson/x", "content": "c", "lineage": "operator-direct",
+                "audience": "operator", "confidence": "operator-stated",
+                "body": body, "body_sha256": sha}
+
+    def test_matching_body_and_hash_validate(self):
+        b = "---\nname: x\nlineage: craig-direct\n---\nreal\n"
+        self.assertEqual(mesh_lib.validate_event(self._ev(b, mesh_lib.content_fingerprint(b))), [])
+
+    def test_mismatched_body_is_invalid(self):
+        b = "---\nname: x\n---\nreal\n"
+        probs = mesh_lib.validate_event(self._ev(b.replace("real", "forged"),
+                                                 mesh_lib.content_fingerprint(b)))
+        self.assertIn("body does not match body_sha256", probs)
+
+
+class TierOverlayTests(unittest.TestCase):
+    """2026-09-27: the on-demand tier replicates as `tier` events."""
+
+    def _ev(self, i, subj, tier, sup=None, kind="tier"):
+        return {"id": i, "ts": "2026-09-27T00:00:0%sZ" % i[-1], "host": "h",
+                "session": "s", "kind": kind, "subject": subj, "content": "c",
+                "lineage": "operator-direct", "audience": "operator",
+                "confidence": "operator-stated", "polarity": "n/a",
+                "supersedes": sup, "tier": tier}
+
+    def _fold(self, evs):
+        return mesh_lib.fold_events(evs, mesh_lib.load_registry())
+
+    def test_newest_tier_wins_by_supersede(self):
+        f = self._fold([self._ev("t1", "lesson/a", "ondemand"),
+                        self._ev("t2", "lesson/a", "always", sup=["t1"])])
+        self.assertEqual(f["tiers"], {"lesson/a": "always"})
+
+    def test_conflicting_live_tiers_alarm_and_neither_wins(self):
+        f = self._fold([self._ev("t1", "lesson/a", "ondemand"),
+                        self._ev("t2", "lesson/a", "always")])
+        self.assertNotIn("lesson/a", f["tiers"])
+        self.assertTrue(any("tier conflict on lesson/a" in a for a in f["alarms"]))
+
+    def test_tier_events_never_render(self):
+        f = self._fold([self._ev("t1", "lesson/a", "ondemand")])
+        self.assertFalse(any(e["kind"] == "tier" for e in f["live"]))
+
+    def test_ondemand_slugs_merges_file_and_events(self):
+        with tempfile.TemporaryDirectory() as d:
+            store = Path(d)
+            (store / "_index-exclude.txt").write_text("keep-me\nun-demote\n")
+            fold = {"tiers": {"lesson/new-od": "ondemand", "lesson/un-demote": "always",
+                              "home/x": "ondemand"}}
+            self.assertEqual(mesh_lib.ondemand_slugs(store, fold),
+                             {"keep-me", "new-od", "home/x"})
+            added, removed = mesh_lib.project_index_exclude(fold, store, apply=True)
+            self.assertEqual((added, removed), (["home/x", "new-od"], ["un-demote"]))
+            self.assertEqual(mesh_lib.file_ondemand_slugs(store), {"keep-me", "new-od", "home/x"})
+            # a second projection is a no-op (edge-triggered)
+            self.assertEqual(mesh_lib.project_index_exclude(fold, store, apply=True), ([], []))
+
+    def test_tier_event_schema(self):
+        bad = self._ev("t1", "lesson/a", "sometimes")
+        self.assertTrue(any("tier event needs tier" in p for p in mesh_lib.validate_event(bad)))
+        self.assertEqual(mesh_lib.validate_event(self._ev("t1", "lesson/a", "ondemand")), [])
+
+
+class SeedWithoutInfluxTests(unittest.TestCase):
+    """Bug bash 2026-09-27 #15: effectiveness.py and index_growth.py imported
+    `_lib.influx` at module top, and the seed's `_lib/` does not ship it — so
+    `import effectiveness` (line 9 here) killed the whole shipped core suite
+    with an ImportError. Build that tree for real (this package + a `_lib`
+    with no influx.py) and prove both modules import and that their write
+    path says, on stderr, that it skipped — not crash, not silently pass."""
+
+    DRIVER = r'''
+import sys
+from unittest import mock
+import effectiveness, index_growth
+with mock.patch.object(effectiveness, "snapshot", return_value={"window": 1, "fire_rate": 0.5}), \
+     mock.patch.object(effectiveness, "render", return_value="r"), \
+     mock.patch.object(sys, "argv", ["effectiveness.py"]):
+    assert effectiveness.main() == 0
+with mock.patch.object(index_growth, "snapshot", return_value={
+        "bytes": 1, "ceiling_bytes": 2, "pct_full": 50, "rows": 1, "lines": 1,
+        "ceiling_lines": 2, "slack_bytes": 1, "slack_rows": 0,
+        "ondemand_named": 0, "ondemand_total": 0}), \
+     mock.patch.object(sys, "argv", ["index_growth.py"]):
+    assert index_growth.main() == 0
+'''
+
+    def test_modules_load_and_skip_loudly_without_lib_influx(self):
+        import shutil
+        import subprocess
+        import sys
+        here = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "_lib").mkdir()
+            (Path(td) / "_lib" / "__init__.py").write_text("")
+            pkg = Path(td) / "memory-mesh"
+            shutil.copytree(here, pkg, ignore=shutil.ignore_patterns(
+                "__pycache__", ".git", "audits", "reviews", "proposals", "docs"))
+            r = subprocess.run([sys.executable, "-c", self.DRIVER], cwd=pkg,
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("effectiveness: influx write skipped", r.stderr)
+        self.assertIn("index_growth: skipped", r.stderr)
+        self.assertIn("_lib.influx", r.stderr)

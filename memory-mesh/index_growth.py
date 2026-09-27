@@ -19,7 +19,8 @@ unfalsifiable. One point a day makes it answerable.
 
     python3 memory-mesh/index_growth.py --dry-run
 
-Stdlib + _lib (influx); targets /usr/bin/python3.
+Stdlib; _lib.influx optional (the seed does not ship it — the write is then
+skipped, loudly). Targets /usr/bin/python3.
 """
 import argparse
 import os
@@ -30,7 +31,6 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
-from _lib import influx  # noqa: E402
 import mesh_lib as M     # noqa: E402
 
 MEASUREMENT = "cc_doctrine_index"
@@ -115,6 +115,11 @@ def main():
         return 0
 
     ts = int(datetime.now(timezone.utc).timestamp() * 1e9)
+    try:
+        from _lib import influx  # lazy: the seed ships no influx.py (bug bash 2026-09-27 #15)
+    except ImportError as e:
+        print(f"index_growth: skipped — _lib.influx unavailable ({e})", file=sys.stderr)
+        return 0
     try:
         influx.write_points([(MEASUREMENT, {"host": os.uname().nodename}, snap, ts)])
     except influx.InfluxError as e:

@@ -31,7 +31,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-import yaml
+# PyYAML is not in a stdlib-only runtime (macOS /usr/bin/python3 has none):
+# fall back to a deliberately narrow parser of the manifest's documented
+# subset. Found and fixed on a real install ({{REDACTED}}), upstreamed 2026-09-26.
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "manifest.yml"
@@ -56,6 +62,52 @@ WEEKLY_FIELD_RE = re.compile(r"^(\d{1,2}) (\d{1,2}) \* \* (\d)$")
 class ScheduleError(Exception):
     """A job's cron expression doesn't translate to this platform's
     scheduler — refused rather than silently mis-scheduled."""
+
+
+def _parse_manifest_fallback(text):
+    """Parse the small, documented manifest subset when PyYAML is absent.
+
+    The scheduler manifest intentionally uses only a top-level ``jobs`` list,
+    scalar values, and folded commands.  Keeping this parser deliberately
+    narrow makes the shipped scheduler usable with the stdlib-only runtime
+    while rejecting a format it cannot faithfully interpret.
+    """
+    jobs = []
+    current = None
+    folded_key = None
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip())
+        line = raw_line.strip()
+        if line == "jobs:":
+            continue
+        if line in ("jobs: []", "jobs: [ ]"):   # the shipped, empty manifest
+            continue
+        if indent == 2 and line.startswith("- "):
+            current = {}
+            jobs.append(current)
+            folded_key = None
+            line = line[2:]
+        if current is None:
+            raise ValueError("manifest must contain a top-level jobs list")
+        if indent == 4 or (indent == 2 and ":" in line):
+            if ":" not in line:
+                raise ValueError(f"unsupported manifest entry: {line!r}")
+            key, value = line.split(":", 1)
+            value = value.strip()
+            if value in {">-", ">"}:
+                current[key] = ""
+                folded_key = key
+            else:
+                current[key] = value.strip('"\'')
+                folded_key = None
+            continue
+        if indent >= 6 and folded_key:
+            current[folded_key] = (current[folded_key] + " " + line).strip()
+            continue
+        raise ValueError(f"unsupported manifest syntax: {raw_line!r}")
+    return {"jobs": jobs}
 
 
 # --- supervision checks (SEED-075) ------------------------------------------
@@ -94,6 +146,12 @@ EPHEMERAL_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/",
 # does-it-exist check, which still catches a typo'd interpreter.
 SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
                    "/opt/", "/etc/")
+# User-level interpreter homes: the seed's own docs put its tools under a
+# venv (~/.venvs/aios-seed — freshness/repo_hygiene need Python 3.10+, which
+# macOS /usr/bin/python3 is not). Warning on the interpreter the seed told the
+# operator to use made every macOS install's --check fail. Same exemption as
+# SYSTEM_PREFIXES: outside the root by design, still existence-checked.
+USER_INTERPRETER_PREFIXES = tuple(str(Path.home() / d) + "/" for d in (".venvs", ".local/bin"))
 
 
 def _command_paths(command):
@@ -127,6 +185,7 @@ def command_problems(job, root=None):
     """Supervision findings for one manifest entry, as (severity, message)."""
     root = Path(root or SEED_ROOT)
     name = job.get("name", "<unnamed>")
+    acked = str(job.get("outside_root_ok") or "").strip()
     command = (job.get("command") or "").strip()
     out = []
 
@@ -161,9 +220,13 @@ def command_problems(job, root=None):
         if not Path(p).exists():
             out.append((BLOCK, f"{name}: command targets {p}, which does not "
                                f"exist on disk"))
-        if not p.startswith(SYSTEM_PREFIXES) and not _inside(p, root):
-            out.append((WARN, f"{name}: command targets {p}, outside the "
-                              f"installed target root {root}"))
+        if p.startswith(SYSTEM_PREFIXES + USER_INTERPRETER_PREFIXES) or _inside(p, root):
+            continue
+        if acked:
+            continue  # the job carries outside_root_ok: <reason> — the operator's call, on the record
+        out.append((WARN, f"{name}: command targets {p}, outside the "
+                          f"installed target root {root} (if deliberate, add "
+                          f"outside_root_ok: <why> to the job)"))
     return out
 
 
@@ -177,8 +240,8 @@ def manifest_problems(jobs, root=None):
 def load_jobs():
     if not MANIFEST.exists():
         sys.exit(f"scheduler/sync.py: manifest not found: {MANIFEST}")
-    with open(MANIFEST) as f:
-        data = yaml.safe_load(f) or {}
+    text = MANIFEST.read_text()
+    data = (yaml.safe_load(text) if yaml is not None else _parse_manifest_fallback(text)) or {}
     jobs = data.get("jobs") or []
     names = [j["name"] for j in jobs]
     dupes = {n for n in names if names.count(n) > 1}

@@ -50,6 +50,8 @@ def main():
     ap.add_argument("--expires", metavar="YYYY-MM-DD",
                     help="state rows only: render-hide after this date")
     ap.add_argument("--pin", action="store_true")
+    ap.add_argument("--tier", choices=sorted(M.TIERS),
+                    help="with --kind tier: the index tier this subject holds")
     ap.add_argument("--sync", action="store_true",
                     help="block until one peer confirms replication (bounded)")
     ap.add_argument("--no-nudge", action="store_true")
@@ -154,7 +156,7 @@ def main():
         args.kind, args.subject, args.content, session=args.session,
         polarity=args.polarity, home=args.home, lineage=args.lineage,
         audience=args.audience, confidence=args.confidence,
-        supersedes=supersedes, pin=args.pin, residency=args.residency,
+        supersedes=supersedes, pin=args.pin, tier=args.tier, residency=args.residency,
         hook=hook, body=body, expires=args.expires,
         carry_forward=args.carry_forward, pointer=args.pointer)
 

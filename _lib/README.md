@@ -10,6 +10,7 @@ grow it as your system grows, and keep the stdlib-only invariant
 | `secrets.py` | env-var → file → strip credential loader; fails closed with a clear message when the key vault is locked |
 | `event_bus.py` | append-only SQLite event/telemetry bus (local state, no network) |
 | `report.py` | terminal-output-to-HTML archiver for jobs that produce reports |
+| `claude_headless.py` | the one headless `claude -p` runner: every call dials zero MCP servers and denies every built-in tool unless the caller names the tools it needs |
 | `selftest.py` | imports every module under `python3 -I -S` to enforce stdlib-only |
 
 The seed ships only the universal spine. As you add domain modules (your

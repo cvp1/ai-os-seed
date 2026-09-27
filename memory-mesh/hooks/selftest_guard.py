@@ -231,6 +231,56 @@ CASES = [
      "inline code that never names the store"),
     (False, "Bash", "node -e \"console.log('hi')\"",
      "node -e that never names the store"),
+
+    # --- bug bash 2026-09-27 #4 (verify-A A2/G1/G2): each was ALLOWED (rc=0)
+    # and bash then really created the file in a temp substitute store. ---
+    # An UNQUOTED heredoc expands $(...) and backticks in its body, so that
+    # body is code, not prose -- stripping it hid the write.
+    (True, "Bash", f"cat <<EOF\n$(printf poison > {STORE}/heredoc.md)\nEOF",
+     "unquoted heredoc body with $(...) writing the store"),
+    (True, "Bash", f"cat <<EOF\n`printf poison > {STORE}/heredoc.md`\nEOF",
+     "unquoted heredoc body with backticks writing the store"),
+    # Copy/link tools the write-shape list did not know.
+    (True, "Bash", f"scp /tmp/evil {STORE}/scp.md", "scp into store"),
+    (True, "Bash", f"rsync /tmp/evil {STORE}/rsync.md", "rsync into store"),
+    (True, "Bash", f"install -m644 /tmp/evil {STORE}/install.md",
+     "install into store"),
+    (True, "Bash", f"ln -sfn /tmp/outside.txt {STORE}/link.md",
+     "ln -sfn into store"),
+    (True, "Bash", f"ln /tmp/outside.txt {STORE}/hard.md", "hard ln into store"),
+    (True, "Bash", f"/bin/cp -t {STORE} /tmp/evil", "cp -t by absolute path"),
+    # A partly-quoted delimiter (`<<E"OF"`, bash reads EOF) was matched as `E`,
+    # so the stripper dropped every later line -- including a real write.
+    (True, "Bash", f"cat <<E\"OF\"\nhi\nEOF\nprintf poison > {STORE}/late.md",
+     "partly-quoted heredoc delimiter must not swallow a later write"),
+    # The store path split across string concatenation in inline code.
+    (True, "Bash",
+     f"python3 -c \"open('{os.path.dirname(STORE)}' + '/{os.path.basename(STORE)}"
+     f"/concat.md','w').write('poison')\"",
+     "python3 -c with the store path split by concatenation"),
+    (True, "Bash",
+     f"python3 -c \"import pathlib; pathlib.Path('{os.path.dirname(STORE)}', "
+     f"'{os.path.basename(STORE)}', 'x.md').write_text('poison')\"",
+     "python3 -c pathlib join of the store's parent + basename"),
+    (True, "Bash",
+     f"node -e \"require('fs').writeFileSync('{os.path.dirname(STORE)}'+"
+     f"'/{os.path.basename(STORE)}/x.md','p')\"",
+     "node -e split path writeFileSync"),
+    (True, "Bash",
+     f"python3 <<'EOF'\nimport pathlib\n"
+     f"pathlib.Path('{os.path.dirname(STORE)}' + '/{os.path.basename(STORE)}/x.md')"
+     f".write_text('poison')\nEOF",
+     "heredoc program with the store path split by concatenation"),
+    # ...a quoted heredoc is still prose, and a read of the store's parent is
+    # still a read; the plain read/copy-out shapes stay allowed.
+    (False, "Bash",
+     f"cat > {WORKSPACE}/evals/reviews/note.md <<'EOF'\n"
+     f"$(printf x > {STORE}/x.md) is how an attack would look\nEOF",
+     "QUOTED heredoc body with $(...) is inert prose"),
+    (False, "Bash",
+     f"python3 -c \"import os; print(os.listdir('{os.path.dirname(STORE)}'))\"",
+     "inline READ of the store's parent with no write shape"),
+    (False, "Bash", "rsync -a /tmp/a/ /tmp/b/", "rsync that never names the store"),
 ]
 
 # The deny message must NAME the token that matched, so the operator can see

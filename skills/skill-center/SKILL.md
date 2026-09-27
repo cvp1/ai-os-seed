@@ -71,7 +71,7 @@ static SKILL.md review can't see what a referenced script does at runtime.
 The cheapest point to land this control is before the first third-party
 skill arrives, not after. After the vendor step:
 1. `audit.py --vendor <name>` — stamps `provenance: third-party` +
-   `observed: false` in the skill's frontmatter. `audit.py`'s lint now flags
+   `observed: false` in the skill's frontmatter. `audit.py`'s lint flags
    it FIX until observed.
 2. Run it once, supervised, on non-sensitive input, and check it for
    dynamic-context `!` lines, `eval`/`exec`/`os.system`, `curl|sh`,

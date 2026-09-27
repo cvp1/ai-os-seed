@@ -48,6 +48,8 @@ def main():
         return ap.error("no subjects given")
 
     events, _ = M.read_all_events()
+    # Sets each event's `_signed`, which chain_body needs to find the authority.
+    M.fold_events(events, M.load_registry())
     live = {e["id"]: e for e in events}
     store = M.harness_store()
     done, skipped = [], []
@@ -81,6 +83,14 @@ def main():
                 # skipped `local-llm-harness-over-model` (store file > 8 KB).
                 if len(body.encode("utf-8")) + 1500 > M.MAX_EVENT_BYTES:
                     body = None
+        if body is None and subj.startswith("lesson/"):
+            # No local file (a peer — the 69 declarations on {{REDACTED}} on
+            # 2026-09-17 went out bodyless this way and stranded their bytes
+            # one hop back). Re-carry the chain's body so this tip is not the
+            # event that hides it (docs/DESIGN-signed-bodies.md §2.2).
+            chained = M.chain_body(tip, events)
+            if chained and len(chained.encode("utf-8")) + 1500 <= M.MAX_EVENT_BYTES:
+                body = chained
         if not args.commit:
             print(f"would declare {args.residency:8s} {subj} "
                   f"(supersedes {len(ids)}, body={'yes' if body else 'no'})")

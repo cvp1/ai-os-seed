@@ -1,6 +1,6 @@
 ---
 name: capture
-description: Close the write-back loop at the end of a substantive session — distill what was decided and *why* and file it into the right destination (auto-memory for agent-facing rules, the vault for durable decisions/knowledge, a session brief for work left unfinished). Use when Craig says "/capture", "capture this session", "write that back", "log this decision", "freeze this", "hand this off", or at the end of a session where real thinking happened — or real work was left open — that would otherwise evaporate. The sibling of /improve (which is auto-memory-only) — /capture routes to all three.
+description: Close the write-back loop at the end of a substantive session — distill what was decided and *why* and file it into the right destination (auto-memory for agent-facing rules, the vault for durable decisions/knowledge, a session brief for work left unfinished). Use when Craig says "/capture", "capture this session", "write that back", "log this decision", or at the end of a session where real thinking happened — or real work was left open — that would otherwise evaporate. The sibling of /improve (which is auto-memory-only) — /capture routes to all three.
 ---
 
 # /capture — write the session's thinking back into the right brain
@@ -213,9 +213,7 @@ post it as a signed `resume` task (see `session-brief/README.md`).
   frontmatter `tags: [decision]` + a `Decision / Why / What changed / Links`
   body. The dated log is thin; it **links out** to the canonical PARA note
   (don't duplicate that note's content).
-- **Minimal metadata contract, new/active notes only** (second-brain eval,
-  2026-08-06 — no mass backfill, this is the write path that keeps new notes
-  from joining the ~87% with no frontmatter): every note this skill writes or
+- **Minimal metadata contract, new/active notes only (no backfill):** every note this skill writes or
   meaningfully edits carries `created` (date, set once), `last_verified`
   (date, bump on any substantive edit — not on a passing link fix), and
   `lifecycle` (`live` | `stale` | `archived` — three explicit states, not an
@@ -242,9 +240,8 @@ post it as a signed `resume` task (see `session-brief/README.md`).
   *decision, domain insight, or unfinished work* is in play, use `/capture`.
 - **`session-brief`** is the fifth transferable asset in the modular-harness
   goal — tools, memory, connectors and doctrine already move between providers;
-  work-in-progress did not until it became a file. Validated 2026-07-28 against
-  opencode/grok-4.5 and a local gemma4-e4b, both resuming cold from a brief
-  alone. `cc-handoff`'s signed `resume` verb moves one between hosts.
+  work-in-progress did not until it became a file; it moves as a brief file any
+  harness can resume cold. `cc-handoff`'s signed `resume` verb moves one between hosts.
 - **`/ingest`** writes the vault from `_inbox` raw sources; `/capture` writes it
   from *session reasoning*. Different inputs, complementary.
 - **Phase 2 (LIVE since 2026-06-30):** a gated Stop hook
