@@ -2155,7 +2155,7 @@ def selftest():
         #     carve-out reaches make_event, so the event lands in the mesh.
         #     The half-state this closes is "file written, event refused".
         a = base_args(slug="zzselftest-b2-factcopy", type="project",
-                      rule="the Envoy is at {{HOST_IP}}, verified",
+                      rule="the Envoy is at 192.0.2.158, verified",
                       session_id=None)
         try:
             _cmd_write(a)
@@ -2166,7 +2166,7 @@ def selftest():
         check("…and no file landed for it",
               not (shadow_store / f"{a.slug}.md").exists())
         a = base_args(slug="zzselftest-b2-factref", type="reference",
-                      rule="the Envoy is at {{HOST_IP}} — see FLEET.md",
+                      rule="the Envoy is at 192.0.2.158 — see FLEET.md",
                       session_id=None)
         _cmd_write(a)
         check("reference memory with a fact is admitted at the door",
@@ -2175,7 +2175,7 @@ def selftest():
                          for p in (shadow_mesh / "events").glob("*.ndjson"))
         check("…and its event REACHED the mesh (--pointer carried the carve-out "
               "through make_event's body gate — no file-without-event half-state)",
-              f"lesson/{a.slug}" in logged and "{{HOST_IP}}" in logged)
+              f"lesson/{a.slug}" in logged and "192.0.2.158" in logged)
 
         # 2. SessionStart witnessed, no untrusted touch -> clean.
         SP.record("SessionStart", {"session_id": "sess-clean"})

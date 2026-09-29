@@ -734,7 +734,7 @@ def selftest():
               classify_tool(nav, {"url": "https://vendor.example/docs"})[0])
         check("browser navigate to a LAN dashboard is NOT untrusted "
               "(2026-07-27 carve-out)",
-              not classify_tool(nav, {"url": "https://{{HOST_IP}}:8123/"})[0])
+              not classify_tool(nav, {"url": "https://192.0.2.75:8123/"})[0])
         check("browser navigate with no url flags (safe default)",
               classify_tool(nav, {})[0])
         check("browser detail names the HOST only, never the path",
@@ -776,7 +776,7 @@ def selftest():
         check("invoking it by path IS untrusted to next",
               nxt("/home/{{REDACTED}}/{{REDACTED}}/cc-skills/proton-mail/read_proton.py"))
         check("LAN curl by IP is NOT untrusted (Craig 2026-07-27)",
-              not nxt("curl -sk --max-time 5 https://{{HOST_IP}}:8123/api/"))
+              not nxt("curl -sk --max-time 5 https://192.0.2.75:8123/api/"))
         check("loopback curl is NOT untrusted",
               not nxt("curl -s http://127.0.0.1:8099/api/panes"))
         check("bare LAN hostname is NOT untrusted",

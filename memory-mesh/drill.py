@@ -1026,15 +1026,15 @@ def drill_14(m):
           _mk("clean content", home="corral/browser_ui.py",
               body="exits 146.70.174.187 then 146.70.174.180") == "refused")
     check("14.24 a home pointer does NOT exempt content — pointing is not pasting",
-          _mk("Envoy is at {{HOST_IP}}", home="FLEET.md") == "refused")
+          _mk("Envoy is at 192.0.2.158", home="FLEET.md") == "refused")
     check("14.25 pointer=True admits a fact in a REFERENCE memory (memory_write --type reference)",
-          _mk("clean", body="Envoy is at {{HOST_IP}} — see FLEET.md", pointer=True) == "made")
+          _mk("clean", body="Envoy is at 192.0.2.158 — see FLEET.md", pointer=True) == "made")
     check("14.26 carry_forward bypasses the fact gate too (retag never mints)",
-          _mk("clean", body="legacy {{HOST_IP}}", carry_forward=True) == "made")
+          _mk("clean", body="legacy 198.51.100.1", carry_forward=True) == "made")
     check("14.27 0.0.0.0 is the all-sources idiom, not a host (false positive 2026-09-16)",
           _mk("clean", body="never widen to 0.0.0.0/0") == "made")
     check("14.28 fact_refusal REPORTS what the funnel raises (backfill/repair pre-screen)",
-          "fact-shaped" in (M.fact_refusal("at {{HOST_IP}}") or "")
+          "fact-shaped" in (M.fact_refusal("at 192.0.2.158") or "")
           and M.fact_refusal("clean") is None)
 
     # --- projection drift: all three classes, and the clean case

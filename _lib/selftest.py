@@ -14,7 +14,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from _lib import claude_headless, event_bus, report, secrets  # noqa: E402,F401
+from _lib import claude_headless, event_bus, frontmatter, report, secrets  # noqa: E402,F401
 
 FAILS = []
 
@@ -43,6 +43,13 @@ finally:
 check("report: Report builder exists and is callable",
       callable(getattr(report, "Report", None)))
 
+# --- frontmatter -----------------------------------------------------------
+fm_meta, fm_body = frontmatter.parse('---\nname: foo\ntype: feedback\n---\n\nbody text\n')
+check("frontmatter.parse: splits meta and body",
+      fm_meta == {"name": "foo", "type": "feedback"} and fm_body == "body text")
+check("frontmatter.parse: no leading '---' falls back to ({}, text)",
+      frontmatter.parse("just text") == ({}, "just text"))
+
 # --- claude_headless --------------------------------------------------------
 cmd = claude_headless.build_cmd("hello")
 check("claude_headless: every call dials zero MCP servers",
@@ -52,7 +59,7 @@ check("claude_headless: every call denies the built-in tools",
 
 # --- stdlib-only invariant --------------------------------------------------
 here = os.path.dirname(os.path.abspath(__file__))
-for mod in ["secrets", "event_bus", "report", "claude_headless"]:
+for mod in ["secrets", "event_bus", "frontmatter", "report", "claude_headless"]:
     r = subprocess.run(
         [sys.executable, "-I", "-S", "-c",
          f"import sys; sys.path.insert(0, {os.path.dirname(here)!r}); import _lib.{mod}"],

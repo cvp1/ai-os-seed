@@ -120,30 +120,30 @@ class MeshCoreTests(unittest.TestCase):
         self.assertIn("146.70.174.187", str(cm.exception))
         # a home does not exempt content or hook either — pointing is not pasting
         with self.assertRaises(ValueError):
-            mk(content="Envoy is at {{HOST_IP}}", home="FLEET.md")
+            mk(content="Envoy is at 192.0.2.158", home="FLEET.md")
         with self.assertRaises(ValueError):
             mk(hook="listens on localhost:8942", home="money/README.md")
         with self.assertRaises(ValueError):
             mk(body="no ssh key to .21, permission denied (publickey)")
         # the two carve-outs, both per-call arguments
-        mk(body="Envoy is at {{HOST_IP}} — see FLEET.md", pointer=True)
-        mk(body="legacy text with {{HOST_IP}} inside", carry_forward=True)
+        mk(body="Envoy is at 192.0.2.158 — see FLEET.md", pointer=True)
+        mk(body="legacy text with 198.51.100.1 inside", carry_forward=True)
         # the all-sources CIDR idiom is not a host (observed false positive 2026-09-16)
         mk(body="never widen the source gate to 0.0.0.0/0")
         # non-lesson kinds flow free, as before
-        mesh_lib.make_event("assert", "endpoint/envoy", "{{HOST_IP}}",
+        mesh_lib.make_event("assert", "endpoint/envoy", "192.0.2.158",
                             session="s", home="FLEET.md")
         # the discriminator itself, callable by the other door
-        self.assertEqual(mesh_lib.fact_shape("x", "at {{HOST_IP}} now")[1], "an IPv4 address")
+        self.assertEqual(mesh_lib.fact_shape("x", "at 203.0.113.3 now")[1], "an IPv4 address")
         self.assertIsNone(mesh_lib.fact_shape("plain prose", None, ""))
         # the report-shaped form the batch producers pre-screen with — the same
         # words the funnel raises, so a refusal reads identically from either door
-        why = mesh_lib.fact_refusal("Envoy is at {{HOST_IP}}")
+        why = mesh_lib.fact_refusal("Envoy is at 192.0.2.158")
         self.assertIn("fact-shaped content", why)
-        self.assertIn("{{HOST_IP}}", why)
+        self.assertIn("192.0.2.158", why)
         self.assertIsNone(mesh_lib.fact_refusal("a behavioural rule", None, None))
         with self.assertRaises(ValueError) as cm:
-            mk(content="Envoy is at {{HOST_IP}}")
+            mk(content="Envoy is at 192.0.2.158")
         self.assertIn(why, str(cm.exception))
 
     def test_residency_promote_flags_rows_with_no_body(self):

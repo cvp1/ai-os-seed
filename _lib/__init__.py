@@ -14,7 +14,7 @@ Everything here is **stdlib-only** so scripts keep running under bare
 package as your system grows; keep the invariant.
 """
 from . import (  # noqa: F401
-    claude_headless, event_bus, report, secrets,
+    claude_headless, event_bus, frontmatter, report, secrets,
 )
 
-__all__ = ["claude_headless", "event_bus", "report", "secrets"]
+__all__ = ["claude_headless", "event_bus", "frontmatter", "report", "secrets"]

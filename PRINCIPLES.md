@@ -73,9 +73,10 @@ covered by a specific convention, reason from here.
    two that reason from dates hardest
    (`decisions/reviews/2026-09-16-principles-tighten-SYNTHESIS.md`).
 23. **Accretion needs a removal path.** (Numbered 23, append-only — paired here
-    with 9 as its sibling: 9 owns persist-and-derive, 23 owns removal.) What accretes needs a removal path
-    audited as carefully as the addition path, or the store just gets less true
-    over time while looking the same size. Two mechanisms already do this without
+    with 9 as its sibling: 9 owns persist-and-derive, 23 owns removal.) What accretes — stored facts, and
+    equally the checks, gates and rules the fleet adds to itself — needs a removal path
+    audited as carefully as the addition path, or the system just gets less true
+    (or slower) over time while looking the same size. Two mechanisms already do this without
     ever being named as one rule: memory-mesh's own budget-driven demotion prunes
     the always-on index under byte pressure (`_index-exclude.txt`, ranking), and
     `memory-prune`'s human-reviewed pass catches facts in the vault that went
@@ -90,6 +91,16 @@ covered by a specific convention, reason from here.
     Retitled 2026-09-16 from "Eviction is accretion's other half": a metaphor an
     agent could satisfy while building no removal path
     (`decisions/reviews/2026-09-16-principles-tighten-SYNTHESIS.md`).
+    Extended 2026-09-28 to rules (Craig; `decisions/principle-23-covers-rules-2026-09-28.md`):
+    a check is accretion too. The bureaucracy pathology is a mistake that earns a
+    check, a skipped check that earns a check-that-the-check-ran, checks that earn
+    evidence, evidence that earns a review — each step locally defensible, the sum
+    making the process the work. So a new check, gate, guard or doctrine line names
+    what would retire it (a review date, or the condition that makes it moot); a
+    check whose only job is to prove another check ran is a smell to fix at the
+    first check, not a fix; and when the ceremony share of the work rises (goal
+    `ceremony-share`, `observability/ceremony.py`), the answer is to cut or merge
+    checks, never to add one that watches the others.
 10. **Right-size to the turn.** Run the cheapest tier that passes a zero-LLM
     structural gate; escalate up the ladder only on failure; reserve the frontier
     model for hard or tool-using turns. Let data, not code, hold the assignment — and
