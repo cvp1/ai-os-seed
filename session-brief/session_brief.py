@@ -1,30 +1,9 @@
 #!/usr/bin/env python3
 """session_brief — freeze work-in-progress so it can continue in another session.
 
-WHY THIS EXISTS
-    Four things already move between sessions, harnesses and providers in
-    this system: tools (repo CLIs), memory (memory/ + memory-mesh), connectors
-    (MCP servers + CLIs) and doctrine (PRINCIPLES.md, CLAUDE.md). A fifth does
-    not: a live session's goal, the decisions taken and WHY, what was ruled
-    out, and what to do next live only in a transcript owned by one harness.
-    Close the window and the expensive part is gone; open another harness and
-    you re-explain from scratch.
-
-    A brief is that missing asset as a file. Plain markdown + YAML frontmatter,
-    stdlib-only, no harness API anywhere in it. Any agent that can read a file
-    can resume from one.
-
-THE TEST IT HAS TO PASS
-    Freeze a thread in one harness; hand `resume` output to a different one —
-    or to a small local model — and continue without re-explaining. If that
-    fails, portability is a claim rather than a property.
-
-WHAT IT DELIBERATELY IS NOT
-    Not a transcript. Not a summary of what was said. A brief holds decisions
-    and their reasons, not narration — the things that are expensive to
-    rediscover and cheap to state. Bounded on purpose (see CAPS): an artifact
-    that grows without limit stops being loadable by the small local models
-    this exists to hand work to.
+A brief is plain markdown + YAML frontmatter holding a session's goal,
+decisions and reasons, failed paths, state and next action, so any harness or
+model can resume it. Size is capped (see CAPS); truncation is reported.
 
 VERBS
     write    read a JSON payload on stdin, write briefs/<id>.md
@@ -37,9 +16,7 @@ VERBS
     ./session_brief.py resume --id latest      # paste into any chat, or pipe at a CLI
 
 STORE
-    briefs/ next to this file; CC_BRIEFS_DIR overrides it. The installer's
-    --audit treats session-brief/briefs/ as a declared runtime path, so your
-    briefs are never flagged as unexpected content.
+    briefs/ next to this file; CC_BRIEFS_DIR overrides it.
 """
 import argparse
 import json
@@ -51,8 +28,7 @@ from datetime import datetime, timezone
 HERE = os.path.dirname(os.path.abspath(__file__))
 BRIEFS = os.environ.get("CC_BRIEFS_DIR", os.path.join(HERE, "briefs"))
 
-# Bounds. A brief that does not fit a small local model's context cannot do the
-# one job it exists for, so truncation is a feature and is reported, never silent.
+# Size bounds so a brief fits a small model's context; truncation is reported.
 CAPS = {"decisions": 12, "failed_paths": 10, "open_threads": 10, "files": 25,
         "constraints": 10, "state": 15}
 FIELD_CHARS = 600
@@ -61,10 +37,6 @@ SECTIONS = [
     ("goal", "Goal", str),
     ("constraints", "Constraints", list),
     ("decisions", "Decisions and why", list),
-    # Paths tried that failed, and why. Briefs measure weakest on "what
-    # failed" questions — and a missing failed path is exactly what the next
-    # agent re-tries. Recording it is cheaper than a search engine over
-    # transcripts.
     ("failed_paths", "Paths tried that failed, and why", list),
     ("state", "State", list),
     ("files", "Files touched", list),
@@ -84,8 +56,7 @@ def slugify(text, maxlen=48):
 
 
 def _clip(value, notes, where):
-    """Truncate a single field, and RECORD it. Silent truncation of a handoff
-    artifact loses exactly the decision the next agent needed."""
+    """Truncate one field to FIELD_CHARS, recording the truncation in notes."""
     text = str(value).replace("\r", "").strip()
     if len(text) > FIELD_CHARS:
         notes.append(f"{where}: truncated {len(text)} -> {FIELD_CHARS} chars")
@@ -118,11 +89,8 @@ def normalize(payload):
 
 
 def _reserve_brief_path(bid, notes):
-    """Claim briefs/<bid>.md, retrying with a -2/-3/... suffix on collision
-    instead of silently overwriting (same minute + same goal produce the same
-    id). O_CREAT|O_EXCL makes the claim atomic; bounded at 20 tries so a stuck
-    loop fails loud rather than spinning. A suffix is reported, exactly like
-    every other bound this tool enforces."""
+    """Atomically claim briefs/<bid>.md, adding a reported -2/-3/... suffix on
+    collision (max 20 tries); never overwrites."""
     os.makedirs(BRIEFS, exist_ok=True)
     for i in range(20):
         candidate = bid if i == 0 else f"{bid}-{i + 1}"
@@ -150,24 +118,15 @@ def write_brief(payload):
         "created": created,
         "harness": payload.get("harness") or os.environ.get("CC_HARNESS") or "unknown",
         "model": payload.get("model") or "unknown",
-        # Explicit payload wins, then CC_HOST_SLUG, then the nodename as an
-        # honest last resort — a machine's nodename is not always the name
-        # you'd use for it anywhere else.
+        # payload, then CC_HOST_SLUG, then the nodename
         "host": payload.get("host") or os.environ.get("CC_HOST_SLUG") or os.uname().nodename,
         "status": "open",
     }
-    # The transcript this brief summarizes. Declared, not mined: re-linking a
-    # brief to its transcript by timestamp and content is guesswork, while the
-    # harness's own session id is exact. Claude Code exports
-    # CLAUDE_CODE_SESSION_ID into every tool shell; other harnesses pass
-    # `session` in the payload. Verbatim recall is then one command
-    # (`claude --resume <session>` in Claude Code) — no index needed.
+    # Source transcript id: from the payload, or Claude Code's CLAUDE_CODE_SESSION_ID.
     session = payload.get("session") or os.environ.get("CLAUDE_CODE_SESSION_ID")
     if session:
         meta["session"] = session
-    # A brief authored somewhere else and delivered here. Record that on the
-    # artifact: the resume header tells the reader to treat constraints as
-    # binding, so where those constraints came from is not a detail.
+    # Record where a delivered brief came from; resume treats its constraints as binding.
     if payload.get("origin"):
         meta["origin"] = payload["origin"]
         meta["received"] = created
@@ -200,9 +159,7 @@ def write_brief(payload):
 
 
 def parse_brief(path):
-    """Minimal frontmatter split. Deliberately self-contained — this file is
-    handed verbatim to whatever harness or small local model is resuming a
-    brief, with zero repo dependencies."""
+    """Minimal frontmatter split; self-contained so this file has no repo dependencies."""
     text = open(path).read()
     meta, body = {}, text
     if text.startswith("---"):

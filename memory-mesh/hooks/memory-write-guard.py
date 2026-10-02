@@ -1,105 +1,19 @@
 #!/usr/bin/env python3
 """PreToolUse guard: block direct mutation of the auto-memory store.
 
-MemGhost (arXiv 2607.05189, "When Claws Remember but Do Not Tell") demonstrated
-a single crafted email getting a live Claude Code SDK agent to silently write
-a false, persistent memory fact -- 71.4% success rate in background mode. The
-/improve and /capture skills already gate memory writes behind
-memory_write.py's `lineage:` field (Story 029, OWASP ASI06: contains-untrusted
-facts land in QUARANTINE.md, never MEMORY.md, until Craig promotes them --
-enforced at fold time since 2026-07-30, mesh_lib.fold_events) -- but until now
-that gate was prose discipline only. Nothing stopped a session mid-task on
-untrusted content (triage, {{REDACTED}}-brief, ai-pulse itself) from just using
-Write/Edit or a shell redirect on MEMORY.md directly, skipping the lineage tag
-and the quarantine route entirely. This hook makes the gate a technical
-boundary instead of an honor system.
+Memory writes must go through memory_write.py so the `lineage:` field is set
+honestly; this hook denies Write/Edit into the store and Bash commands that
+name the store and carry a write shape.
 
 Contract (Claude Code PreToolUse hook): JSON event on stdin
-(tool_name, tool_input). To block: print the reason to STDERR and exit 2
-(stderr is fed back to the model). To allow: exit 0 with no output.
-Fail-open on any error the guard can't parse -- a broken guard must never
-brick a legitimate write.
+(tool_name, tool_input). To block: print the reason to STDERR and exit 2.
+To allow: exit 0 with no output. Fails open on any internal error.
 
-Known false positive (accepted, fail-closed): a read of the store redirected
-to a real file (`grep foo MEMORY.md > /tmp/out`) trips the write-shape check.
-Deciding that case needs redirect-TARGET analysis -- knowing that the store is
-only an input and /tmp/out is the only output -- across chains, pipelines and
-subshells. That is a much larger parser with real bypass surface (`cat store >
-a; echo x > store`), and it is not worth buying a formatting convenience with
-a hole in the one control standing between a poisoned page and permanent
-memory. The deny message says how to re-run; a security gate errs closed on
-ambiguity.
-Installed 2026-07-22, Craig ran the installer himself (MemGhost response).
-
-2026-07-26 (Craig applied this patch himself): two redirection forms that
-CANNOT write a file are stripped before the write-shape scan -- `/dev/null`
-targets and fd duplications (`2>&1`). Both appear in ordinary reads
-(`cat MEMORY.md 2>/dev/null`), and the bare `>` in the write-shape pattern
-was denying them. This narrows the check ONLY where a write is impossible by
-construction; every genuinely ambiguous shape still denies. See NOT_A_WRITE.
-
-2026-07-28 (Craig authorized): a `git commit` MESSAGE was being scanned as if
-it were shell syntax. A commit in an unrelated repo was denied because its
-message said "MEMORY.md" and contained `events/<host>.ndjson` -- whose `>` hit
-WRITE_SHAPE. Neither can write anything. Now the -m/-F argument of a git commit
-is stripped before both tests. Deliberately NOT a general "strip quoted
-strings": that would open `bash -c "echo x > MEMORY.md"`, which must keep
-denying. A commit cannot mutate the store -- the file write it records would
-already have been caught at the moment it happened. Verified with a 15-case
-matrix covering every deny shape, including a commit chained to a real write.
-See strip_commit_message().
-
-2026-07-30 (Craig authorized): two narrowings, after the guard false-positived
-four times in one session on work that could not touch the store -- a heredoc
-writing a review doc, an append to a project README, and a byte measurement.
-The Write branch was always right, because it resolves the real path through
-in_store(); the Bash branch was matching the literal string "MEMORY.md"
-anywhere in the command and calling that a reference to the store.
-
-  1. HEREDOC BODIES are data, for the same reason a commit message is
-     (strip_heredocs). A body cannot write anything: the redirect that makes
-     `cat > file <<EOF` a write sits on the COMMAND line, outside the body, so
-     stripping the body leaves every write shape visible. The one exception is
-     a body piped into an interpreter -- `cat <<EOF | bash` really does execute
-     its body -- so a heredoc whose command line contains a pipe is NOT
-     stripped.
-  2. A PATH IS RESOLVED, not string-matched (store_referenced). A token whose
-     basename is MEMORY.md/QUARANTINE.md but which carries a directory
-     component now counts only if it really resolves into the store, so
-     `memory-mesh/MEMORY.md` and `docs/about-MEMORY.md` stop being treated as
-     the store. A BARE `MEMORY.md` with no directory still counts, always:
-     the hook cannot know the shell's cwd, and `bash -c "echo x > MEMORY.md"`
-     is the exact bypass this guard exists to stop. Unknown cwd fails closed.
-
-Both narrowings remove text from consideration or resolve it more precisely;
-neither adds a path by which a store write becomes invisible. Proved by
-hooks/selftest_guard.py, whose deny set is unchanged and now includes a
-heredoc redirected INTO the store and a body piped to a shell.
-
-2026-07-31 (Craig authorized): the DISCRIMINATOR was examined and deliberately
-left alone; only the deny MESSAGE changed. A perf/usability audit hit a third
-false-positive class -- a `>` that is not a redirect at all (`->`, `=>`, `>=`,
-`-->`) sitting in an unrelated segment of a compound command that also READS
-the store, e.g. `wc -c <store>; python3 -c "print(a, '->', b)"`. The obvious
-narrowings were tested against bash and BOTH open a real bypass:
-
-  * `echo hello->probe_out` genuinely creates the file `probe_out` -- `>` is a
-    shell metacharacter, so an arrow tokenizes as word `-` plus redirect. An
-    arrow is NOT decorative to bash; exempting it would allow
-    `echo poison->MEMORY.md`.
-  * exempting quoted `>` fails for the same reason the 2026-07-28 note gives:
-    `bash -c 'echo x > MEMORY.md'` is entirely inside quotes and still writes.
-
-So the accepted-false-positive posture stands: this guard errs closed on
-ambiguity, and relating the write-shape to the store would need the
-redirect-TARGET parser the module docstring already rejects. What was actually
-broken was the message -- it said "if it was actually a READ redirected
-elsewhere, re-run without the redirect", which describes only the 2026-07-22
-FP class and sent the operator hunting for a redirect that did not exist. The
-message now quotes the exact token that matched WRITE_SHAPE, so the shape that
-tripped it is visible instead of guessed. No change to what is denied; the
-26-case matrix is unchanged and gained 5 arrow-class cases pinning the
-deny (they must KEEP denying) and asserting the token is named.
+Errs closed on ambiguity: a read of the store redirected to a file, or a
+non-redirect `>` (`->`, `=>`) in a command that also names the store, is
+denied. Redirect-target analysis is deliberately not attempted. Heredoc
+bodies, git commit messages, /dev/null targets and fd duplications are
+stripped before scanning because they cannot write.
 """
 import json
 import os
@@ -108,10 +22,8 @@ import shlex
 import sys
 
 def _store():
-    """One derivation, fleet- and seed-wide (mesh_lib.store_dir): the harness
-    keys the auto-memory store by the WORKSPACE path (memory-mesh's parent)
-    with / -> -. Was hardcoded to one host's path until 2026-09-17, which on
-    any other host denied every call (its selftest: 15/34 want=allow -> DENY)."""
+    """The auto-memory store path, keyed by the workspace path with / -> -
+    (same derivation as mesh_lib.store_dir)."""
     override = os.environ.get("MEMORY_WRITE_GUARD_STORE")
     if override:
         return os.path.realpath(override)
@@ -121,18 +33,9 @@ def _store():
 
 
 STORE = _store()
-# The one sanctioned write path. 2026-09-19: this used to be a bare substring
-# test (`SANCTIONED not in cmd`) against the RAW command, so ANY occurrence of
-# the string anywhere -- in a trailing `# memory_write.py` comment, in a
-# filename, in an echoed word -- exempted the WHOLE command. Verified bypass:
-# `printf x > STORE/f.md # memory_write.py` was allowed, rc=0, file created.
-# Sanctioning is now structural and PER SEGMENT (command_is_sanctioned).
-# 2026-09-19 (round 2, grok-4.6): a basename is not a credential either.
-# `python3 /tmp/not-the-door/memory_write.py … > STORE/f.md` was ALLOWED, because
-# the sanction test was `basename(prog) == "memory_write.py"`. The door is a
-# FILE, not a name: this install's own memory_write.py, one directory up from
-# the hook, compared by realpath. WORKSPACE is the base a workspace-relative
-# invocation (`python3 memory-mesh/memory_write.py …`) is resolved against.
+# The one sanctioned write path: this install's memory_write.py, compared by
+# realpath (a basename match is not enough). WORKSPACE is the base for a
+# workspace-relative invocation (`python3 memory-mesh/memory_write.py …`).
 SANCTIONED_BASENAME = "memory_write.py"
 DOOR = os.path.realpath(os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
@@ -141,10 +44,8 @@ WORKSPACE = os.path.dirname(os.path.dirname(DOOR))
 # The store's two named surfaces. A bare mention of either is treated as the
 # store even without a path, because the shell's cwd is unknowable here.
 STORE_FILES = {"MEMORY.md", "QUARANTINE.md"}
-# 2026-09-27 (bug bash #4, verify-A A2/G1): scp, rsync, install and ln (incl.
-# `ln -sfn`, which plants a symlink the door would then write THROUGH) all put
-# a file in the store and were ALLOWED -- bash really created each one in a
-# temp substitute store. unlink/shred are rm's siblings. Widening only.
+# Shell constructs that can create, modify or remove a file (ln included: a
+# planted symlink lets a later write go through it).
 WRITE_SHAPE = re.compile(
     r">|\btee\b|\bsed\s+-i\b|\bcp\b|\bmv\b|\brm\b|\btruncate\b|\bdd\b"
     r"|\bscp\b|\brsync\b|\binstall\b|\bln\b|\bunlink\b|\bshred\b"
@@ -152,39 +53,20 @@ WRITE_SHAPE = re.compile(
 # Redirections that cannot write a file, stripped before the write-shape scan.
 # Anchored so `>/dev/null/../MEMORY.md` is NOT stripped, and `>&` is dropped
 # only before a digit -- bash's `cmd >& file` really does write a file.
-#
-# 2026-07-30: the terminator set gained `)`, `"`, `'` and a backtick. It was
-# whitespace/`;`/`|`/`&`/end only, so `$(grep x MEMORY.md 2>/dev/null)` kept its
-# `>` and denied -- a command substitution is the single most common place a
-# /dev/null redirect ends, and this guard denied one of its own author's reads
-# minutes after being narrowed. What follows the word `/dev/null` cannot change
-# the fact that /dev/null is the target, so widening the terminator set removes
-# no protection; the anchor that matters is that `/dev/null` is the WHOLE path,
-# which is still enforced (a `/` following it does not terminate the match).
+# `/dev/null` must be the whole path; quotes, `)` and backticks may end it.
 NOT_A_WRITE = re.compile(
     r"(?:\d*|&)\s*>{1,2}\s*/dev/null(?=[\s;|&)\"'`]|$)"
     r"|\d*>&\d+")
 FILE_TOOLS = {"Write", "Edit", "NotebookEdit", "MultiEdit"}
 
-# 2026-07-28: a `git commit` MESSAGE is data, not shell syntax, and this guard
-# scanned it. A commit in an unrelated repo was denied because its message said
-# "MEMORY.md" (mentions_store) and contained `events/<host>.ndjson` -- whose `>`
-# matched WRITE_SHAPE. Neither can write anything.
-#
-# Strip ONLY the -m/-F argument of a git commit. NOT quoted strings in general:
-# `bash -c "echo x > MEMORY.md"` must keep denying, and stripping every quoted
-# string would open exactly that bypass. Handles combined short flags (-qm) and
-# repeated -m. A commit cannot mutate the store: the file write it records would
-# already have been caught above, at the moment it happened.
+# The -m/-F argument of a git commit: data, not shell. Only this is stripped,
+# not quoted strings in general (`bash -c "echo x > MEMORY.md"` must deny).
 GIT_COMMIT_MSG = re.compile(
     r"""(?<!\w)-[a-zA-Z]*[mF]\s+           # -m / -F, incl. combined like -qm
         (?:"[^"]*"|'[^']*'|\S+)""", re.X)
 
-# The opening of a heredoc: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<< "EOF"`.
-# 2026-09-27: the delimiter must END there. `<<E"OF"` used to match as the
-# delimiter `E` (bash's is `EOF`), so the stripper hunted for a line reading
-# `E`, never found one, and dropped every line after it -- including a write
-# on a later line. A shape this regex does not read is simply not stripped.
+# The opening of a heredoc: `<<EOF`, `<<-EOF`, `<<'EOF'`, `<< "EOF"`. The
+# delimiter must end there; shapes like `<<E"OF"` are not matched (not stripped).
 HEREDOC_OPEN = re.compile(
     r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1(?![\w'\"\\])")
 # What an UNQUOTED heredoc body executes: command substitution.
@@ -204,21 +86,12 @@ def strip_commit_message(cmd):
 
 
 def strip_heredocs(cmd):
-    """Remove heredoc BODIES -- prose, not shell syntax (2026-07-30).
+    """Remove heredoc bodies, which are data; the write redirect stays on the
+    command line.
 
-    Safe because the redirect that makes a heredoc a write is on the command
-    line, never in the body: `cat > MEMORY.md <<EOF` keeps both its `>` and its
-    path after stripping. What the body can no longer do is make a document
-    that merely DISCUSSES MEMORY.md look like a write to it.
-
-    NOT stripped when the opening line contains a pipe: `cat <<EOF | bash`
-    executes its body as shell, so there the body is code and must be scanned.
-
-    NOT stripped either when the delimiter is UNQUOTED and the body carries a
-    command substitution (2026-09-27, bug bash #4): bash runs `$(...)` and
-    backticks inside `<<EOF` while building the body, so `cat <<EOF` /
-    `$(printf x > STORE/f.md)` / `EOF` wrote the store and was ALLOWED. A
-    quoted delimiter (`<<'EOF'`) expands nothing, so its body stays prose.
+    Not stripped when the opening line contains a pipe (`cat <<EOF | bash`
+    executes the body), or when the delimiter is unquoted and the body has a
+    command substitution (bash expands it).
     """
     lines = cmd.splitlines()
     out, i = [], 0
@@ -253,16 +126,10 @@ def in_store(path):
 
 
 def store_referenced(text):
-    """Does `text` refer to the auto-memory store? (2026-07-30)
+    """Does `text` refer to the auto-memory store?
 
-    Replaces a bare `"MEMORY.md" in text` substring test. A token that names one
-    of the store's files is resolved: with a directory component it counts only
-    if it really lands in the store, so a project's own MEMORY.md or a doc
-    called about-MEMORY.md is no longer mistaken for the operator's brain.
-
-    A BARE filename always counts. That is not an oversight -- the guard cannot
-    see the shell's cwd, so `echo x > MEMORY.md` could be the store, and the
-    only safe reading of "could be" is yes.
+    A path token counts if it resolves into the store. A bare MEMORY.md or
+    QUARANTINE.md always counts, since the shell's cwd is unknown.
     """
     if STORE in text:
         return True
@@ -270,15 +137,8 @@ def store_referenced(text):
         tok = raw.strip("\"'")
         if not tok:
             continue
-        # ANY token that RESOLVES into the store counts, whatever it is named.
-        # The substring test above only sees the store spelled literally, so
-        # the same path written through a symlink or a `..` segment slipped
-        # past it: `printf x > $TMP/a/../store/f.md  # memory_write.py` was
-        # ALLOWED. On macOS EVERY temp path is such a spelling
-        # (/var/folders -> /private/var/folders), which is why M1-bash-guard's
-        # comment bypass passed on Linux and failed on macos-latest
-        # (CI 2026-09-19). realpath is the instrument in_store already uses;
-        # this only widens what the guard calls the store, never narrows it.
+        # Any token that resolves into the store counts (catches symlink and
+        # `..` spellings the literal substring test misses).
         if "/" in tok and in_store(tok):
             return True
         if os.path.basename(tok) not in STORE_FILES:
@@ -288,37 +148,21 @@ def store_referenced(text):
     return False
 
 
-# --- structural sanctioning (2026-09-19) -------------------------------------
+# --- structural sanctioning --------------------------------------------------
 # A command is sanctioned only where a real invocation of memory_write.py is
-# the PROGRAM of the simple command that carries the write shape. The old
-# substring test made the word itself the credential; anyone who could get the
-# eleven characters into the command -- a comment, a quoted string, a path --
-# could write the store with no door and no lineage. Being conservative is the
-# whole point here: any shape this parser cannot read DENIES.
-
-# A shell comment cannot execute, so `#` to end-of-line is removed before the
-# sanction parse ONLY (mentions_store / the write-shape scan still see the raw
-# scannable text, so this can never make a denied command allowed).
+# the program of the simple command that carries the write shape. Any shape
+# this parser cannot read denies. Shell comments are removed before the
+# sanction parse only.
 PY_INTERP = re.compile(r"^(?:python|python[0-9]+(?:\.[0-9]+)*|pypy[0-9]*)$")
 ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Operators that end one simple command and start the next.
 SEGMENT_OPS = ("&&", "||", ";;", ";", "|", "&", "\n", "(", ")")
 
-# --- opaque inline code (2026-09-19, round 2, grok-4.6) ----------------------
-# WRITE_SHAPE reads SHELL. A language runtime handed inline code writes files
-# with no shell redirect at all, so all three of these named the store and were
-# ALLOWED:
-#   python3 -c "pathlib.Path('STORE/x.md').write_text('…')"
-#   node -e "require('fs').writeFileSync('STORE/x.md','…')"
-#   ruby -e "File.write('STORE/x.md','…')"
-# The guard cannot interpret an arbitrary program in an arbitrary language, and
-# a partial interpreter is worse than none. So it stops guessing: a segment that
-# NAMES THE STORE and runs inline code in a runtime is denied unless it is the
-# door. This is a fail-closed narrowing -- `python3 -c "print(1)"`, which does
-# not name the store, is untouched. The accepted false positive is a READ of the
-# store written as inline code (`python3 -c "print(open('…/MEMORY.md').read())"`);
-# it is the same trade the module docstring already makes for `grep … > /tmp/out`,
-# and the deny message says how to re-run.
+# --- opaque inline code ------------------------------------------------------
+# Inline code in a language runtime (`python3 -c`, `node -e`, ...) can write
+# without a shell redirect, so a segment that names the store and runs inline
+# code is denied unless it is the door. Inline reads of the store are an
+# accepted false positive.
 RUNTIMES = {
     "node", "nodejs", "deno", "bun", "ruby", "irb", "perl", "php", "lua",
     "luajit", "tclsh", "wish", "Rscript", "osascript", "bash", "sh", "zsh",
@@ -354,17 +198,11 @@ def inline_code_flag(seg):
 
 
 def opaque_inline_write(scannable):
-    """(why, None) for a segment that names the store and runs inline code.
-
-    Returns None when nothing in the command matches. Sanctioned segments (the
-    real door) are exempt, but the door is never invoked as `-c`/`-e` anyway --
-    segment_program already refuses to look past an inline-code flag."""
+    """The inline-code flag of a non-door segment that names the store, or None."""
     try:
         segments = split_segments(strip_shell_comments(scannable))
     except ValueError:
         return None                  # the parse failure is handled elsewhere
-    # Per-segment, command-order bases here too: the inline-code path had the
-    # same "any cd in the command sanctions this segment" hole.
     bases_by_seg = _bases_per_segment(segments)
     for seg, base in zip(segments, bases_by_seg):
         if not store_referenced(seg):
@@ -379,11 +217,8 @@ def opaque_inline_write(scannable):
 
 
 def heredoc_into_runtime(cmd):
-    """A heredoc fed to a language runtime whose BODY names the store.
-
-    strip_heredocs() drops bodies as data, which is right for `cat > doc.md
-    <<EOF`. It is wrong for `python3 <<EOF`, where the body IS the program --
-    the store reference would be stripped before it was ever looked for."""
+    """A heredoc fed to a language runtime whose body names the store (the body
+    is the program there, so strip_heredocs must not hide it)."""
     lines = cmd.splitlines()
     i = 0
     while i < len(lines):
@@ -415,14 +250,11 @@ def heredoc_into_runtime(cmd):
     return None
 
 
-# --- the store spelled in pieces (2026-09-27, bug bash #4, verify-A G2) ------
-# store_referenced needs the path contiguous, so inline code that assembles it
-# -- `open('<parent>' + '/memory/x.md','w')`, `Path(parent, 'memory', 'x')` --
-# named nothing and was ALLOWED; bash then wrote the file. A runtime segment
-# that names the store's PARENT (the project dir, or its project key, or the
-# projects dir above it) AND carries a write-shaped call is denied too. This is
-# a speed bump, not a proof: an encoded path (base64, chr()) still gets past a
-# text scan -- the fold's manifest and alarm are the layer behind it.
+# --- the store spelled in pieces ---------------------------------------------
+# Inline code can assemble the store path from parts. A runtime segment that
+# names the store's parent (project dir, project key, or projects dir) and
+# carries a write-shaped call is denied. A speed bump only: encoded paths
+# still pass a text scan.
 INLINE_WRITE = re.compile(
     r"write|append|symlink|\blink|rename|replace|copy|move|unlink|remove"
     r"|rmtree|truncate|touch|mkdir|os\.open|fdopen")
@@ -466,12 +298,9 @@ def split_path_inline_write(scannable):
 
 
 def strip_shell_comments(text):
-    """Drop `# ...` to end of line, outside quotes, line by line. bash starts a
-    comment only at the beginning of a word, so `foo#bar` is NOT a comment.
+    """Drop `# ...` to end of line outside quotes (only at a word start).
 
-    A quote left open at end-of-line means the line-by-line reading is wrong
-    (the next line is inside that string), so nothing is stripped at all --
-    stripping is an optimisation for the sanction parse, never a safety claim.
+    If any line leaves a quote open, nothing is stripped.
     """
     try:
         return "\n".join(_strip_line_comment(ln) for ln in text.split("\n"))
@@ -588,17 +417,9 @@ def segment_program(seg):
 
 
 def _bases_per_segment(segments):
-    """The base each segment's RELATIVE program token resolves against, in
-    COMMAND ORDER — one entry per segment.
+    """The cwd each segment runs in, tracking `cd` in command order.
 
-    `_resolution_bases` returned the set of EVERY cd target in the command, so
-    one legitimate `cd <mesh>` anywhere sanctioned an impostor reached by a
-    LATER cd: `cd <mesh> && cd <fake> && python3 memory_write.py > STORE/f.md`
-    was ALLOWED (gpt-6-astra, SEED-081 review, reproduced here 2026-09-19).
-    A shell has one current directory at a time and `cd` replaces it; the
-    guard now models that. WORKSPACE stays available only to tokens that
-    carry a directory component (`memory-mesh/memory_write.py`), never to a
-    bare name — a bare name is whatever the CURRENT directory holds.
+    One entry per segment; the last cd in a segment applies to later ones.
     """
     here = os.getcwd()
     out = []
@@ -610,39 +431,19 @@ def _bases_per_segment(segments):
 
 
 def _resolution_bases(segments):
-    """DEPRECATED — kept only so an out-of-tree caller fails loudly.
-
-    Superseded by _bases_per_segment: returning every cd target in the command
-    as one set is what let a later impostor inherit an earlier legitimate cd.
-    """
+    """Deprecated; raises so any remaining caller fails loudly."""
     raise RuntimeError("_resolution_bases is superseded by _bases_per_segment "
                        "(command order matters; see SEED-081, 2026-09-19)")
 
 
 def _unused_resolution_bases_doc(segments):
-    """Bases a RELATIVE program token may be resolved against.
-
-    The process cwd is dropped the moment the command contains a `cd`: the
-    shell has moved, and resolving `memory_write.py` against where the HOOK
-    happens to be running sanctions an impostor door that the command never
-    reached. `cd <impostor> && python3 memory_write.py … > STORE/f.md` was
-    ALLOWED for exactly this reason whenever the agent's cwd was the mesh
-    directory (caught on {{REDACTED}}, 2026-09-19 — it reproduces on any host, the
-    cwd is the variable, not the platform). A real `cd <mesh> && python3
-    memory_write.py` still resolves: the cd target IS the door's directory.
-    """
+    """Unused: bases a relative program token may be resolved against."""
     cd = _cd_targets(segments)
     return cd + ([] if cd else [os.getcwd()]) + [WORKSPACE]
 
 
 def _cd_targets(segments):
-    """Directories an earlier `cd`/`pushd` in the same command would move to.
-
-    A relative program token in a later segment is resolved against these too,
-    so `cd <workspace> && python3 memory-mesh/memory_write.py ...` still names
-    the real door. This can only ever make the DOOR reachable -- the comparison
-    below is realpath-equality with one exact file, so a wrong base cannot
-    sanction anything."""
+    """Targets of `cd`/`pushd` in these segments, in order."""
     out = []
     for seg in segments:
         try:
@@ -660,24 +461,15 @@ def _cd_targets(segments):
 
 
 def resolves_to_door(prog, bases):
-    """Does this program token name THIS install's own memory_write.py?
-
-    2026-09-19 (round 2): the check used to be `basename(prog) ==
-    "memory_write.py"`, which sanctioned any file anywhere with that name --
-    `python3 /tmp/x/memory_write.py --text ... > STORE/f.md` was ALLOWED and
-    wrote the store with no door and no lineage. Sanction is now identity, not
-    a name: realpath of the token must equal DOOR. A token that resolves to
-    nothing resolves to nothing -- it simply is not the door, so it denies."""
+    """Does this program token resolve (by realpath) to DOOR?"""
     if not prog:
         return False
     prog = os.path.expanduser(prog)
     if os.path.isabs(prog):
         candidates = [prog]
     else:
-        # A bare `memory_write.py` means "in the current directory" and
-        # nothing else. Joining WORKSPACE to it would re-open the impostor
-        # hole from the other side: `cd <fake> && python3 memory_write.py`
-        # would resolve against the workspace and find the real door.
+        # A bare name resolves against the current directory only, never
+        # WORKSPACE.
         bases = list(bases) if "/" in prog else [b for b in bases
                                                  if b != WORKSPACE]
         candidates = [os.path.join(b, prog) for b in bases]
@@ -696,11 +488,8 @@ def segment_is_sanctioned(seg, bases):
 
 
 def command_is_sanctioned(scannable):
-    """(sanctioned, why_not). Sanctioned only when EVERY segment that carries a
-    write-shaped token is itself an invocation of THIS install's memory_write.py
-    (resolved by realpath, never by basename). A sanctioned segment never
-    sanctions a sibling: `python3 memory_write.py x && printf y > STORE/f.md`
-    is denied on the second segment."""
+    """(sanctioned, why_not). Sanctioned only when every write-shaped segment
+    is itself an invocation of DOOR, with no redirect."""
     try:
         text = strip_shell_comments(scannable)
         segments = split_segments(text)
@@ -712,9 +501,7 @@ def command_is_sanctioned(scannable):
         if WRITE_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
             writing.append((seg, [base, WORKSPACE]))
     if not writing:
-        # The write shape is not in any executable segment (a comment, say).
-        # Preserve the historical verdict rather than trust this parser to be
-        # the only thing standing between a poisoned page and the store.
+        # The write shape is only in a non-executable part (e.g. a comment).
         return False, "no executable segment carries the write; denying anyway"
     for seg, bases in writing:
         try:
@@ -722,16 +509,8 @@ def command_is_sanctioned(scannable):
                 return False, (
                     "the command that writes is not this install's "
                     f"memory_write.py ({DOOR}): {seg.strip()[:120]!r}")
-            # Authorising the PROGRAM does not authorise its redirections.
-            # The shell opens `> STORE/f.md` itself, before the door runs and
-            # entirely outside its lineage gate, so `python3 <real door>
-            # --help > STORE/probe.md` wrote the store with no lineage and was
-            # ALLOWED (gpt-6-astra, SEED-081 review, reproduced 2026-09-19).
-            # The door is never invoked WITH a redirect in normal use — it
-            # writes the store itself — so a redirect in an otherwise
-            # sanctioned segment is refused rather than parsed for its target,
-            # which is the redirect-target analysis this module's docstring
-            # declines to attempt.
+            # A redirect is opened by the shell, outside the door's lineage
+            # gate, so a door segment with a redirect is refused.
             if REDIRECT_SHAPE.search(NOT_A_WRITE.sub(" ", seg)):
                 return False, (
                     "this segment redirects with '>' while naming the store. "
@@ -769,13 +548,10 @@ def main():
 
     if tool == "Bash":
         cmd = inp.get("command", "") or ""
-        # Heredoc bodies and git commit messages are DATA. Strip both before
-        # either test -- otherwise text that merely names the store still reads
-        # as a reference to it.
+        # Heredoc bodies and git commit messages are data; strip both first.
         scannable = strip_heredocs(strip_commit_message(cmd))
         mentions_store = store_referenced(scannable)
-        # Inline code in a language runtime is opaque to the shell-shaped
-        # write scan below, so it is decided first and on its own terms.
+        # Inline runtime code is opaque to the shell write scan; check it first.
         opaque = None
         if mentions_store:
             opaque = opaque_inline_write(scannable)
@@ -803,11 +579,7 @@ def main():
         if mentions_store and hit:
             sanctioned, why_not = command_is_sanctioned(scannable)
         if mentions_store and not sanctioned and hit:
-            # Quote the token that matched. The guard cannot tell a redirect
-            # from an arrow in a string (see the 2026-07-31 note: to bash they
-            # are the same token), so it denies either way -- but naming the
-            # match tells the operator WHICH shape to change instead of
-            # sending them looking for a redirect that may not exist.
+            # Name the matched token so the caller knows which shape to change.
             token = hit.group(0).strip() or hit.group(0)
             deny(
                 "memory-write-guard: this command names the auto-memory store "
@@ -834,5 +606,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception:
-        # Fail-open: a broken guard must never block work it can't parse.
+        # Fail open on internal errors.
         sys.exit(0)

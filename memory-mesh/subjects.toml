@@ -1,10 +1,8 @@
-# Subject registry — the controlled vocabulary that makes contradiction
-# detection possible. Two sessions naming one subject differently never
-# collide, so the detector silently fails (Grok review 3, finding 2). The
-# fold PARKS any event whose subject class isn't registered here.
+# Subject registry: the controlled vocabulary for event subjects, so that
+# contradictions on one subject can be detected. The fold parks any event
+# whose subject class is not registered here.
 #
-# Shape: <class>/<entity>. Entities are free-form within the class but
-# host entities MUST use canonical fleet slugs (FLEET.md table).
+# Shape: <class>/<entity>. Host entities must use canonical fleet slugs.
 
 [classes]
 ssh-route = "reachability of a host over ssh (entity = fleet slug)"

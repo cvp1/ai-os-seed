@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
-"""report.py — shared HTML report emitter for CC skills.
+"""report.py — save a skill's output as a dated, self-contained HTML report (stdlib-only).
 
-Skills keep printing to the terminal as usual, and *additionally* call this to
-drop a self-contained, dated HTML artifact under
-``<repo-root>/reports/<skill>/<date>.html`` — archived and served by cc-docs at
-``:8090/reports/<skill>/``. Stdlib only, so every skill that already imports
-from ``_lib`` can use it with no new deps.
-
-Two ways to use it:
+Writes ``<repo-root>/reports/<skill>/<date>.html`` and regenerates the indices.
 
   Python skills (have structured data) — build a report:
       from report import Report                 # via the _lib sibling bootstrap
@@ -22,14 +16,8 @@ Two ways to use it:
           --skill triage --title "Inbox triage" --badge "3 need reply:warn"
   (prints the cc-docs URL of the saved report)
 
-Live embeds: a ````` ```html preview ````` fence (or ``r.embed(html, height=…)``) renders
-as a sandboxed, theme-injected iframe instead of escaped text — so a skill can drop a live
-Chart.js/Leaflet/`<canvas>` widget straight into its report. The frame is null-origin and a
-CSP forbids ``eval``; network stays open so CDN libs and ``fetch`` work when viewed online.
-
-Archive hygiene: ``save(keep=N)`` prunes to the last N reports per skill.
-Indices (root + per-skill) are regenerated on every save as a self-healing
-projection of whatever files are present on disk.
+A ```` ```html preview ```` fence (or ``r.embed(html, height=…)``) renders as a
+sandboxed iframe. ``save(keep=N)`` prunes to the last N reports per skill.
 """
 import argparse
 import datetime
@@ -93,12 +81,9 @@ tr:hover td{background:var(--panel)}
 """
 
 
-# ---------- sandboxed live-HTML embed (the OpenKnowledge ```html preview idea) ----------
-# A ```html preview fence (or Report.embed(...)) renders as a sandboxed iframe rather
-# than escaped <pre>. The iframe is null-origin (sandbox without allow-same-origin → it
-# can't touch the parent DOM, cookies, or localStorage), a CSP forbids eval, and CC's
-# dark theme tokens are injected so charts/maps inherit the palette. Network is left open
-# on purpose so CDN libs (Chart.js, Leaflet) and live fetch() work when viewed online.
+# ---------- sandboxed live-HTML embed ----------
+# Null-origin iframe (no allow-same-origin), CSP denies eval, theme tokens injected.
+# Network stays open so CDN libs and fetch() work.
 _EMBED_THEME = (
     ":root{--chart-1:#3B82F6;--chart-2:#22c55e;--chart-3:#f59e0b;--chart-4:#a78bfa;"
     "--chart-5:#ec4899;--chart-6:#14b8a6;--foreground:#e8eaed;--background:#0c0e13;"
@@ -113,8 +98,7 @@ _EMBED_CSP = ("default-src 'self' data: blob: https:; "
               "img-src 'self' data: blob: https:; "
               "connect-src 'self' https: data: blob:; "
               "font-src https: data:;")
-# Parent-side listener that grows each embed to its content height (idempotent — the
-# window flag means duplicate copies across multiple embeds install only once).
+# Parent-side listener that resizes each embed to its content height; installs once.
 _EMBED_LISTENER = (
     "<script>if(!window.__okEmbedInit){window.__okEmbedInit=1;"
     "window.addEventListener('message',function(e){var d=e.data;"
@@ -127,8 +111,7 @@ _EMBED_LISTENER = (
 def _embed_iframe(code, height=None):
     """Wrap a standalone HTML/CSS/JS snippet as a sandboxed, theme-injected iframe."""
     eid = "okemb" + hashlib.md5((code or "").encode("utf-8")).hexdigest()[:10]
-    # measure body (content-driven) not documentElement (which floors at the iframe
-    # viewport height, so the frame could only ever grow, never shrink to fit).
+    # measure body, not documentElement, which floors at the viewport height.
     resize = ("<script>(function(){function r(){try{var b=document.body,"
               "h=Math.ceil((b&&b.scrollHeight)||document.documentElement.scrollHeight);"
               "parent.postMessage({okEmbed:%r,h:h},'*')}catch(e){}}"
@@ -283,8 +266,7 @@ class Report:
         return self
 
     def embed(self, html_str, height=None):
-        """Embed a standalone HTML/JS snippet as a sandboxed, theme-injected iframe
-        (charts, maps, live widgets). Same engine as a ```html preview markdown fence."""
+        """Embed a standalone HTML/JS snippet as a sandboxed, theme-injected iframe."""
         self._body.append(_embed_iframe(html_str, height))
         return self
 

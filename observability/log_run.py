@@ -4,18 +4,9 @@
 Usage:
     log_run.py --job morning_brief -- /usr/bin/python3 /path/to/morning_brief.py [args...]
 
-Behaviour contract (so it can sit transparently between {{REDACTED}} cron and the real
-script):
-  * The wrapped command's stdout is streamed to OUR stdout unchanged — {{REDACTED}}
-    decides delivery from stdout, so this preserves the "ping only on non-empty
-    stdout" semantics of the failure-only jobs.
-  * The wrapped command's stderr is streamed to OUR stderr unchanged.
-  * We exit with the wrapped command's exit code.
-  * Exactly one row is written to the runs table, even if the child crashes or
-    is killed by a signal. Observability never changes the job's outcome: if
-    logging itself fails, we warn on stderr and still return the child's code.
-
-Stdlib only; targets /usr/bin/python3.
+Transparent wrapper: child stdout/stderr pass through unchanged, the child's
+exit code is returned, and exactly one runs row is written. A logging failure
+only warns on stderr; it never changes the job's outcome.
 """
 import argparse
 import json
@@ -30,11 +21,8 @@ from datetime import datetime, timezone
 import db
 import switches
 
-# The ledger's `host` column is the FLEET SLUG, never the raw hostname: on
-# {{REDACTED}} gethostname() is `iMac`, and until 2026-09-06 that split every
-# per-host query (94,271 `iMac` rows vs 44 `{{REDACTED}}` over 30d). Resolved
-# through _lib.fleet_host; if _lib is missing or broken we fall back to the raw
-# hostname rather than break the estate — this wrapper runs EVERY scheduled job.
+# `host` is the fleet slug from _lib.fleet_host; fall back to the raw hostname
+# if _lib is unavailable.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from _lib import fleet_host as _fleet_host  # noqa: E402
@@ -54,10 +42,8 @@ def _host() -> str:
 SUMMARY_MAX = 500      # chars stored for the first stdout line
 ERRTAIL_MAX = 2000     # chars stored for the stderr tail (any run that wrote one)
 
-# A wrapped job can report token usage by appending one JSON object per line to
-# the file named in $CC_OBS_TOKENS_FILE, with any of: tokens_in, tokens_out,
-# cache_read, cost_usd. log_run sums them into the run's row. Jobs that spend no
-# tokens just ignore the env var (the columns stay NULL). See README "Cost tracking".
+# A job may append JSONL usage records (tokens_in, tokens_out, cache_read,
+# cache_creation, cost_usd, model) to $CC_OBS_TOKENS_FILE; they are summed.
 TOKENS_ENV = "CC_OBS_TOKENS_FILE"
 
 
@@ -74,12 +60,8 @@ SINK_TAIL_MAX = 64 << 10    # bytes kept from the end (error_tail lives here)
 
 
 class _Sink:
-    """Bounded accumulator for one stream (Principle 8, bug-bash 2026-09-08 A18).
-
-    Forwarding to the terminal stays live and unbounded; what is KEPT for the
-    runs.db row is the first SINK_HEAD_MAX bytes plus the last SINK_TAIL_MAX,
-    with the true total in `.total`. Before this every byte of a chatty job
-    was held in memory twice (list + join) until the row was written."""
+    """Bounded copy of one stream: first SINK_HEAD_MAX + last SINK_TAIL_MAX
+    bytes, with the true byte count in `.total`."""
 
     def __init__(self):
         self.head = bytearray()
@@ -127,10 +109,7 @@ def main() -> int:
         print("log_run.py: no command given after --", file=sys.stderr)
         return 2
 
-    # Soft-disabled via the status-site control panel: skip instantly. We don't
-    # run the child, don't write a run row (keeps the log clean), and emit nothing
-    # on stdout with exit 0 (so {{REDACTED}} sends no ping). freshness.py likewise
-    # ignores disabled jobs, so this won't page as STALE.
+    # Soft-disabled job: skip silently, exit 0, write no row.
     if switches.is_disabled(args.job):
         return 0
 
@@ -142,10 +121,8 @@ def main() -> int:
     # Hand the child a fresh file to append token usage to (it may ignore it).
     tokens_fd, tokens_path = tempfile.mkstemp(prefix="cc_obs_tok_")
     os.close(tokens_fd)
-    # CC_SCHEDULED_JOB is the positive "a supervised scheduled job" signal
-    # that _lib/mail.py and ontology/_sender require alongside systemd's
-    # INVOCATION_ID (2026-09-09: INVOCATION_ID alone let Corral panes -- an
-    # inherited environment under a systemd unit -- pass as scheduled).
+    # CC_SCHEDULED_JOB marks a supervised scheduled run; senders require it
+    # alongside systemd's INVOCATION_ID, which alone can be inherited.
     child_env = {**os.environ, TOKENS_ENV: tokens_path, "CC_SCHEDULED_JOB": args.job}
 
     try:
@@ -231,13 +208,8 @@ def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage,
                 summary = line.strip()[:SUMMARY_MAX]
                 break
         ok = 1 if exit_code == 0 else 0
-        # Keep the stderr tail whenever the child wrote one — NOT only on
-        # failure. A job that catches its own exception, logs the reason to
-        # stderr and exits 0 is the "soft failure" shape: healthy to every
-        # consumer while doing nothing at all. rain_watch sat there for 26 days
-        # (7,505 runs, all exit 0, ~260 bytes of stderr each) because this line
-        # stored a byte count and threw the words away. freshness.py now reads
-        # these tails to catch the shape; see cron/AUDIT-2026-07-26.md.
+        # Keep the stderr tail on every run, not only failures: freshness.py
+        # reads it to detect jobs that log errors but exit 0.
         error_tail = stderr_s.strip()[-ERRTAIL_MAX:]
         duration_ms = int((finished - started).total_seconds() * 1000)
         tok_in = usage.get("tokens_in") if usage else None

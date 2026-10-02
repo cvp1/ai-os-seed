@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""index_growth — record how full the always-on doctrine index is, over time.
+"""index_growth: record how full the always-on MEMORY.md index is, over time.
 
-The harness injects the whole of `MEMORY.md` into every session and silently
-truncates past 200 lines or ~25 KB, so `mesh_lib` publishes under a hard ceiling
-and sheds content to fit. The shed order matters: named on-demand slugs go first
-(reachable by `/recall` anyway), and only when those run out does it start
-dropping INDEX ROWS — a row being the sole always-on trace of a memory.
-
-So the number that matters is not raw file size, it is **remaining slack** — the
-bytes of appendix left to shed before doctrine rows start disappearing. Measured
-2026-07-29: 23,929 B of a 24,986 B ceiling with 2,552 B of appendix left, i.e.
-~14 rows of runway.
-
-This exists because the same measurement raised a question it could not answer:
-the event store was two days old (118 backfill events, then 19), so the organic
-growth rate was unknowable and both "we have a month" and "we are fine" were
-unfalsifiable. One point a day makes it answerable.
+Reports bytes/lines/rows against the loader ceiling and the remaining slack:
+bytes of on-demand appendix that can be shed before index rows start dropping.
 
     python3 memory-mesh/index_growth.py --dry-run
 
-Stdlib; _lib.influx optional (the seed does not ship it — the write is then
-skipped, loudly). Targets /usr/bin/python3.
+Stdlib; _lib.influx optional (the write is skipped with a stderr note if absent).
 """
 import argparse
 import os
@@ -38,12 +24,7 @@ ROW_RE = re.compile(r"^- \[")
 
 
 def snapshot():
-    """Current index composition, or None when this host has not opted in.
-
-    Reads what is ON DISK rather than re-rendering: the published artifact is what
-    sessions actually load, and a re-render could disagree with it (that gap is
-    precisely the failure the write gate exists to catch).
-    """
+    """Return the on-disk index composition, or None when this host has not opted in."""
     store = M.harness_store()
     if store is None:
         return None
@@ -58,8 +39,7 @@ def snapshot():
     nbytes = len(text.encode("utf-8"))
     rows = [l for l in lines if ROW_RE.match(l)]
 
-    # The appendix is the shock absorber: everything from the on-demand heading to
-    # EOF is sheddable before any row is at risk. Its size IS the slack.
+    # Slack = size of the on-demand appendix (heading to EOF).
     slack = 0
     named = total_ondemand = 0
     for i, l in enumerate(lines):
@@ -67,10 +47,8 @@ def snapshot():
             slack = len(("\n".join(lines[i:]) + "\n").encode("utf-8"))
             tail = "\n".join(lines[i:])
             named = tail.count(" · ") + max(0, tail.count("\n") - 1)
-            # Two summary-line shapes leave mesh_lib._assemble_harness_memory:
-            # "... (N on-demand total)" when some slugs are still named, or
-            # "N on-demand memories - not listed here" when none are (named=0,
-            # the all-demoted case) - match both or this silently reads 0.
+            # Match both summary-line shapes: "(N on-demand total)" and
+            # "N on-demand memories".
             m = (re.search(r"\((\d+) on-demand total\)", tail)
                  or re.search(r"(\d+) on-demand memories", tail))
             total_ondemand = int(m.group(1)) if m else 0
@@ -83,8 +61,7 @@ def snapshot():
         "ceiling_bytes": M.LOADER_BYTE_CEILING,
         "ceiling_lines": M.LOADER_LINE_CEILING,
         "pct_full": round(100.0 * nbytes / M.LOADER_BYTE_CEILING, 2),
-        # Bytes of appendix left to shed before doctrine rows start dropping, and
-        # that slack expressed in rows — the operator-legible form of the same fact.
+        # Slack in bytes and as an approximate row count.
         "slack_bytes": slack,
         "slack_rows": (slack // max(1, nbytes // max(1, len(rows)))) if rows else 0,
         "ondemand_named": named,
@@ -116,7 +93,7 @@ def main():
 
     ts = int(datetime.now(timezone.utc).timestamp() * 1e9)
     try:
-        from _lib import influx  # lazy: the seed ships no influx.py (bug bash 2026-09-27 #15)
+        from _lib import influx  # lazy: _lib.influx may be absent
     except ImportError as e:
         print(f"index_growth: skipped — _lib.influx unavailable ({e})", file=sys.stderr)
         return 0

@@ -1,172 +1,45 @@
 #!/usr/bin/env python3
-"""session_provenance.py — a second signal for memory_write.py's craig-direct
-writes, independent of the self-declared `lineage:` tag: did THIS session
-touch an untrusted-content tool (a web fetch, a Gmail/Outlook/Calendar/Drive
-read) before this write?
+"""session_provenance.py — records whether a session touched untrusted content.
 
-Continuous-verification audit, Epic B, story B2 (2026-08-06). B1
-(evals/memory_poison_probe.py) proved the lineage tag alone gates nothing: a
-GhostWriter-style mistag (external text phrased to read as Craig's own
-reported preference, tagged `craig-direct`) is admitted to the servable
-index unscreened. B1's Opus-verification pass then REFUTED the originally
-proposed fix (an instruction-pattern content heuristic — 96.5% of the real
-memory corpus is directive language, so "is this instruction-shaped" cannot
-discriminate poison from the legitimate store) and re-scoped B2 to this:
-machine-derived session provenance as a second signal, independent of
-whatever the caller (human or agent) asserts.
+A second signal for memory_write.py, independent of the self-declared
+`lineage:` tag: did this session use an untrusted-content tool (web fetch,
+mail/calendar/drive read) before a write?
 
-***********************************************************************
-* WIRED AND LIVE. Both hook blocks are installed in                   *
-* ~/.claude/settings.json and this file runs in front of every Bash   *
-* call. It was authorized by Craig; this banner said "STAGED, NOT     *
-* WIRED" for weeks afterwards and was corrected 2026-09-14.           *
-* A SECOND classifier (`classify_tool_next`) now runs alongside the   *
-* enforcing one in SHADOW — see "TWO CLASSIFIERS" below. Nothing it   *
-* decides can move a verdict until SESSION_PROVENANCE_ENFORCE_NEXT=1. *
-***********************************************************************
+Hooks (pure observation: always exit 0, no output):
+    SessionStart:  session_provenance.py record --event SessionStart
+    PreToolUse:    session_provenance.py record --event PreToolUse
+    PreToolUse matcher: WebFetch|WebSearch|Bash|mcp__claude_ai_Gmail__.*|
+      mcp__claude_ai_Google_Calendar__.*|mcp__claude_ai_Google_Drive__.*|
+      mcp__composio-outlook__.*|mcp__composio-personal-outlook__.*|
+      mcp__playwright__browser_navigate|mcp__playwright__browser_network_request
 
-WHAT IT DOES
-------------
-    SessionStart hook:
-        session_provenance.py record --event SessionStart
-    PreToolUse hook (matcher below):
-        session_provenance.py record --event PreToolUse
+The SessionStart row witnesses that the channel was live, so memory_write.py
+can tell CLEAN (SessionStart, no untrusted row) from UNVERIFIED (no witness).
 
-Both are pure OBSERVATION — this script never blocks a tool call (always
-exits 0, no stderr, no stdout). The enforcement happens later and elsewhere,
-at memory_write.py's `_cmd_write`, which reads what this recorded.
-
-WHY A SessionStart ROW MATTERS (the ambiguity this design exists to kill)
----------------------------------------------------------------------------
-An empty result for a session is ambiguous on its own: it could mean "this
-session touched nothing untrusted" (the good case) or "this hook was never
-wired / never fired for this session" (a channel outage that must NOT read
-as clean — PRINCIPLES 4, degrade toward safety; the exact failure this file's
-own docstring elsewhere calls out: no-data-must-not-render-as-positive-data).
-The SessionStart row is the "the channel was live" witness: memory_write.py
-distinguishes CLEAN (a SessionStart row exists, no untrusted-touch row
-follows it) from UNVERIFIED (no SessionStart row at all — the channel was
-never proven live for this session). Measured 2026-09-14, with the hook
-live: 1,345 of 1,444 sessions read CLEAN and 99 FLAGGED — so "unverified" is
-now the exception, not the universal state this paragraph once described.
-
-STORAGE
--------
-One bounded, append-only JSONL log — same shape as session-registry's, on
-purpose (that file already proved the pattern: bounded, fold-at-read,
-never stores derived state). This is a SEPARATE log, not a repurposing of
-session-registry.jsonl: session-registry answers "does this session need
-Craig's attention" (a UX-liveness concern); this answers "did this session
-touch untrusted content" (a security-provenance concern). Conflating the two
-concerns in one file was considered and rejected — PRINCIPLES 12, small sharp
-tools, one concern per artifact.
-
-Rows:
+Storage: a bounded append-only JSONL log. Rows:
     {"at": iso, "event": "SessionStart"|"UntrustedToolUse"
                          |"ProvenanceShadow"|"ProvenanceShadowError",
      "session": <session id>, "tool": <tool name>|"", "detail": <str>|""}
+Only "UntrustedToolUse" is a verdict input.
 
-Only "UntrustedToolUse" is a verdict input. The two Provenance* events are
-measurement and are dropped explicitly by `state_for_session`.
+Two classifiers: `classify_tool` enforces (tool-name plus Bash substring
+match); `classify_tool_next` runs in shadow (argv-aware, flags external
+http(s) fetches but not LAN/loopback). A ProvenanceShadow row is written only
+where they disagree. Set SESSION_PROVENANCE_ENFORCE_NEXT=1 to enforce the
+next classifier.
 
-WIRING — APPLIED. (Corrected 2026-09-14: this section said "STAGED (not
-applied)" for weeks after Craig authorized it, and `state_for_session`'s
-docstring still claimed every session reads `unverified` "since the hook is
-unwired". Both were false. A reader trusting them would have discounted every
-`clean` stamp the instrument ever issued — the opposite of the truth. Measured
-at the time of the correction: both blocks present in ~/.claude/settings.json
-(`PreToolUse[3]`, `SessionStart[4]`), 2,932 rows, 1,445 sessions witnessed, 99
-flagged.) The blocks below are what is installed:
-
-TWO CLASSIFIERS — `classify_tool` ENFORCES, `classify_tool_next` SHADOWS
-------------------------------------------------------------------------
-Craig authorized items 2 and 3 of
-memory-mesh/reviews/2026-09-14-provenance-coverage-gap.md on 2026-09-14
-("do 2 and 3"), after the instrument was wrong in both directions in one
-session: ~15 external pages fetched by `curl` in Bash produced ZERO untrusted
-rows (so two craig-direct memory writes were stamped `clean`), while a command
-line that merely QUOTED "read_proton.py" as test data produced five real
-UntrustedToolUse rows for mail that was never read.
-
-`classify_tool_next` fixes both — an EXTERNAL http(s) fetch is untrusted, a
-LAN/loopback one is not (Craig 2026-07-27: a ranch-LAN host is first-class
-local), and matching is argv-position rather than raw-substring so a mention
-is not an invocation. It does NOT enforce: `state_for_session` reads only
-`UntrustedToolUse` rows and explicitly drops `ProvenanceShadow`, so today's
-verdicts cannot move. `record()` writes a ProvenanceShadow row only where the
-two classifiers DISAGREE, which measures the blast radius this log could never
-supply on its own — it holds no row for an unflagged Bash call, so the
-coverage gap destroyed the evidence needed to size its own fix.
-
-Read `session_provenance.py shadow-report`, then promote by setting
-SESSION_PROVENANCE_ENFORCE_NEXT=1 (one named change). Until then the legacy
-false positive keeps firing, by design — swapping enforcement before the
-measurement exists is the thing the shadow run is for.
-
-    session_provenance.py shadow-report          # what would change
-    session_provenance.py classify --command ... # both verdicts, one command
-
-Add to ~/.claude/settings.json's "hooks":
-
-    "SessionStart": [
-      {"hooks": [{"type": "command",
-        "command": "/usr/bin/python3 /home/{{REDACTED}}/{{REDACTED}}/memory-mesh/hooks/session_provenance.py record --event SessionStart"}]}
-    ],
-    "PreToolUse": [
-      {"matcher": "WebFetch|WebSearch|Bash|mcp__claude_ai_Gmail__.*|mcp__claude_ai_Google_Calendar__.*|mcp__claude_ai_Google_Drive__.*|mcp__composio-outlook__.*|mcp__composio-personal-outlook__.*|mcp__playwright__browser_navigate|mcp__playwright__browser_network_request",
-       "hooks": [{"type": "command",
-        "command": "/usr/bin/python3 /home/{{REDACTED}}/{{REDACTED}}/memory-mesh/hooks/session_provenance.py record --event PreToolUse"}]}
-    ]
-
-(SessionStart already has entries in settings.json — this would be a fourth
-block in that array, same pattern as session_registry's own entry. PreToolUse
-likewise gains a fourth matcher block alongside memory-write-guard/
-memory-fresh/safety-gate.)
-
-KNOWN COVERAGE GAP — narrowed, not closed
---------------------------------------------
-Tool-name matching cannot see a Bash-invoked reader unless its command line
-is grepped: `UNTRUSTED_BASH_SUBSTRINGS` below covers the paths CLAUDE.md
-already names as the narrowed-not-closed OTP-guard surface (Proton, the
-first-party Gmail read helpers, sasha-{{REDACTED}}'s triage), but any other
-shell-capable route to mail/web content (raw curl, imaplib, a renamed
-script) is invisible to this instrument — same posture this fleet already
-states for otp_guard, not a new admission. **This gap FIRED for real on
-2026-09-14** (~15 external pages fetched by curl, zero rows, two memory
-writes stamped clean) and is what `classify_tool_next` exists to close; it is
-still open in the ENFORCING path until that classifier is promoted. Note the
-legacy scan also fires the other way — quoting a needle is indistinguishable
-from invoking it, which produced five false mail flags in that same session. A subagent that itself touched
-untrusted content and reported back through the Task tool is ALSO invisible
-here: whether Claude Code fires PreToolUse hooks for a subagent's own tool
-calls (as opposed to only the parent's `Task` invocation) is UNVERIFIED as of
-this writing — flagged as a residual, not assumed either way.
-
-THE CEILING — carelessness, not compromise (named explicitly, 2026-08-06,
-per Grok's adversarial review, finding F4)
---------------------------------------------------------------------------
-This instrument and the agent it observes run as the SAME principal. The
-evidence log lives under `~/.claude/`, writable by whatever wrote it, and
-nothing here prevents an agent from truncating or editing it before a
-memory_write.py call reads it back — an "always exits 0, never blocks"
-observation hook plus a same-uid log is not a control against a fully
-adversarial or compromised agent, only against an honest one that forgot
-what it just read. Closing that for real (root-owned append-only log, or a
-privileged daemon owning the write) is real infrastructure, not a quick
-fix — filed as a follow-up in
-audits/2026-08-05-continuous-verification/BACKLOG.md rather than built
-here. Ceiling stated plainly so nobody reads "B2 is wired" as "GhostWriter
-is solved against an adversarial agent" — it solves the honest-mistake case,
-which is the case B1 actually measured.
+Limits: Bash readers not in the needle lists, and subagent tool calls, may
+be invisible. The log is writable by the observed agent, so this catches
+honest mistakes, not a compromised agent.
 
 Usage:
     session_provenance.py record --event SessionStart      # hook, stdin JSON
     session_provenance.py record --event PreToolUse         # hook, stdin JSON
     session_provenance.py state --session <id>               # human/debug view
+    session_provenance.py shadow-report                      # what would change
+    session_provenance.py classify --command ...             # both verdicts
     session_provenance.py prune [--keep N]
     session_provenance.py --selftest
-
-Stdlib only.
 """
 import argparse
 import ipaddress
@@ -182,14 +55,12 @@ from urllib.parse import urlsplit
 HOME = Path(os.environ.get("SESSION_PROVENANCE_HOME", Path.home() / ".claude"))
 LOG = Path(os.environ.get("SESSION_PROVENANCE_LOG", HOME / "session-provenance.jsonl"))
 
-MAX_LINES = 5000            # bounded (PRINCIPLES 8); prune keeps the newest
-MAX_DETAIL_CHARS = 200      # bounded row payload — never the untrusted CONTENT
+MAX_LINES = 5000            # prune keeps the newest
+MAX_DETAIL_CHARS = 200      # bounded row payload — never the untrusted content
 
-# Tool names that read content this fleet does not control the authorship of.
-# Matched by PREFIX so a connector growing its tool list (Gmail's already has
-# twice, per connector-drift/A1) stays covered without an edit here — kept
-# narrower than a bare "mcp__" so a first-party-only MCP server (garden,
-# board, recall, cost, ...) is never miscounted as untrusted.
+# Tools that read externally authored content, matched by prefix so new tools
+# on these connectors stay covered. Narrower than "mcp__" so first-party MCP
+# servers are not counted.
 UNTRUSTED_TOOL_PREFIXES = (
     "mcp__claude_ai_Gmail__",
     "mcp__claude_ai_Google_Calendar__",
@@ -199,60 +70,34 @@ UNTRUSTED_TOOL_PREFIXES = (
 )
 UNTRUSTED_TOOL_EXACT = {"WebFetch", "WebSearch"}
 
-# Browser tools that name their destination in the call. A navigate (or raw
-# request) to an EXTERNAL host brings in content authored outside Craig's
-# control; a LAN dashboard does not (2026-07-27 ruling — same carve-out as
-# `_external_urls`). Snapshot/click/type carry no URL: the navigate that put
-# the page there is the row. A missing or unparseable URL flags (PRINCIPLES 4).
+# Browser tools that name their destination. An external host is untrusted, a
+# LAN host is not; a missing or unparseable URL flags.
 BROWSER_URL_TOOLS = frozenset({
     "mcp__playwright__browser_navigate",
     "mcp__playwright__browser_network_request",
 })
 
-# Bash-invoked readers of the same mailboxes a tool-NAME match cannot see —
-# see "KNOWN COVERAGE GAP" above.
+# Bash-invoked mail readers that a tool-name match cannot see.
 UNTRUSTED_BASH_SUBSTRINGS = (
     "read_proton.py", "gmail_recent", "gmail_search", "gmail_read",
     "inbox_triage.py",
 )
 
 # --------------------------------------------- the NEXT classifier (SHADOW)
-# Craig authorized items 2 and 3 of
-# memory-mesh/reviews/2026-09-14-provenance-coverage-gap.md ("do 2 and 3").
-#
-# Item 2 — an EXTERNAL http(s) fetch brings in content authored outside
-# Craig's control and is untrusted; a LAN or loopback target does not, per his
-# 2026-07-27 ruling that a host on the ranch LAN is first-class local, not
-# remote. A blanket `curl` needle was REJECTED in that review: it would flag
-# every internal probe and healthcheck and quarantine ordinary memory writing.
-# Item 3 — match INVOCATION, not mention. The legacy substring scan cannot
-# tell `python3 read_proton.py` from a command line that merely quotes the
-# string "read_proton.py" as test data, which is how this session was falsely
-# recorded as having read Proton mail (same defect class as the already-known
-# safety-gate-prose-false-positive).
-#
-# This classifier does NOT enforce. `classify_tool()` above is unchanged and
-# remains the only input to `state_for_session()`. `record()` writes a
-# ProvenanceShadow row ONLY where the two disagree, so the shadow run measures
-# the blast radius that the coverage gap itself destroyed the evidence for —
-# you cannot size an instrument's false-negative rate from its own output.
-# Promote by flipping ENFORCE_NEXT (one named change, after reading
-# `shadow-report`). PRINCIPLES 13: nothing agentic is done until it has run
-# end-to-end once for real.
+# Flags an external http(s) fetch (not LAN/loopback) and matches invocation
+# rather than mention. Does not enforce unless ENFORCE_NEXT is set.
 ENFORCE_NEXT = os.environ.get("SESSION_PROVENANCE_ENFORCE_NEXT") == "1"
 
 FETCHER_BINARIES = frozenset({
     "curl", "wget", "httpie", "http", "https", "xh", "aria2c", "lynx",
     "w3m", "links", "fetch",
 })
-# Scripts whose INVOCATION means a mailbox was read. Same five paths the
-# legacy list names — CLAUDE.md's narrowed-not-closed OTP-guard surface.
+# Scripts whose invocation means a mailbox was read.
 MAIL_READER_SCRIPTS = frozenset({
     "read_proton.py", "gmail_recent", "gmail_search", "gmail_read",
     "inbox_triage.py",
 })
-# Tokens that make a `python -c` payload a FETCH rather than a document that
-# happens to quote a URL. Both must be present.
+# Tokens that make a `python -c` payload a fetch; a URL must also be present.
 _PY_FETCH_TOKENS = ("urlopen", "urlretrieve", "requests.get", "requests.post",
                     "httpx.get", "httpx.post", "urllib.request")
 # Wrappers that precede the real executable and must be stepped over.
@@ -261,8 +106,7 @@ _WRAPPERS = frozenset({
     "timeout", "xargs", "builtin", "exec", "then", "do", "else",
 })
 _URL_RE = re.compile(r"https?://[^\s'\"<>|;)\]}]+", re.I)
-# A scheme with no host after it — `curl https://` — is a destination we
-# cannot evaluate, which PRINCIPLES 4 sends to the safe default (flag).
+# A scheme with no host (`curl https://`) cannot be evaluated, so it flags.
 _BARE_SCHEME_RE = re.compile(r"https?://(?![^\s'\"<>|;)\]}])", re.I)
 _SHELL_OPERATORS = frozenset({";", "|", "||", "&", "&&", "\n"})
 _HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
@@ -271,12 +115,9 @@ _LOCAL_HOST_LITERALS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0",
 
 
 def _strip_heredocs(cmd):
-    """Remove heredoc BODIES, keeping the command line that opened them.
+    """Remove heredoc bodies (data), keeping the opening command line.
 
-    A heredoc body is data being written, not commands being run. Leaving it
-    in is how a document that quotes `curl https://vendor.example` — exactly
-    what this review's own writeup does — would flag the session that wrote
-    it. Returns (command_without_bodies, n_bodies_stripped)."""
+    Returns (command_without_bodies, n_bodies_stripped)."""
     lines = cmd.split("\n")
     out, stripped, i = [], 0, 0
     while i < len(lines):
@@ -293,11 +134,8 @@ def _strip_heredocs(cmd):
 
 
 def _is_local_host(host):
-    """LAN, loopback and link-local are first-class local (Craig 2026-07-27).
-    A bare single-label name (`{{REDACTED}}`) is a LAN name. Anything that
-    cannot be resolved to one of those is treated as EXTERNAL — an unknown
-    destination is an unknown, and PRINCIPLES 4 sends unknowns to the safe
-    default, which here means flagging."""
+    """True for LAN, loopback, link-local, .local/.lan and single-label names.
+    Anything else is treated as external."""
     if not host:
         return False
     host = host.strip().strip("[]").lower()
@@ -315,9 +153,7 @@ def _is_local_host(host):
 
 
 def _external_urls(tokens):
-    """(externals, unparseable) — hostnames only, never query strings. A URL's
-    PATH can carry content; its host is a destination, which is what an audit
-    of the LAN carve-out needs."""
+    """(external hostnames, unparseable-URL count) across tokens."""
     externals, unparseable = [], 0
     for tok in tokens:
         for raw in _URL_RE.findall(tok):
@@ -334,8 +170,7 @@ def _external_urls(tokens):
 
 
 def classify_browser(tool_name, tool_input):
-    """(touched, detail) for a browser tool that names its destination.
-    Detail is the tool name plus the HOST — never the path, never content."""
+    """(touched, detail) for a browser tool; detail is tool name plus host."""
     if tool_name not in BROWSER_URL_TOOLS:
         return False, ""
     url = (tool_input or {}).get("url") or ""
@@ -353,11 +188,8 @@ def classify_browser(tool_name, tool_input):
 def _simple_commands(cmd):
     """Yield (tokens, parsed_ok) for each simple command in a shell line.
 
-    Tokenise ONCE with shlex, then split the token stream on operator tokens.
-    Splitting the raw string on `;`/`|` first (the obvious approach) severs
-    quoted payloads — `python3 -c "import x; fetch()"` became two broken
-    fragments and the fetch went unseen. shlex is quote-aware and already
-    emits `;`, `|`, `&&`, `||` and `&` as their own tokens."""
+    Tokenises with shlex first, then splits on operator tokens, so quoted
+    payloads containing `;` stay intact."""
     body, _ = _strip_heredocs(cmd)
     try:
         toks = shlex.split(body, comments=True)
@@ -389,10 +221,8 @@ def _executable(tokens):
         if PurePosixPath(tok).name in _WRAPPERS:
             i, saw_wrapper = i + 1, True
             continue
-        # A wrapper's own option or numeric argument (`timeout 10`, `nice -n 5`)
-        # is not the executable. Only skip these AFTER a wrapper, so a bare
-        # `-x` first token still reads as "no executable" rather than silently
-        # scanning past real arguments.
+        # Skip a wrapper's own options/numeric args (`timeout 10`), only
+        # after a wrapper.
         if saw_wrapper and (tok.startswith("-")
                             or re.fullmatch(r"\d+(\.\d+)?[smhd]?", tok)):
             i += 1
@@ -406,8 +236,8 @@ def _executable(tokens):
 def classify_bash_next(cmd):
     """(touched, detail) for a Bash command line — argv-aware.
 
-    Flags a mail-reader INVOCATION and an EXTERNAL http(s) fetch. Does not
-    flag a command that merely mentions either, which is the whole point."""
+    Flags a mail-reader invocation and an external http(s) fetch, not a
+    mere mention of either."""
     cmd = cmd or ""
     reasons = []
     for tokens, parsed_ok in _simple_commands(cmd):
@@ -479,9 +309,8 @@ def _iso(dt=None):
 
 
 def classify_tool(tool_name, tool_input):
-    """(touched: bool, detail: str). `detail` is bounded and safe to log — it
-    is always the tool name (plus, for Bash, which known substring matched),
-    never the untrusted CONTENT itself."""
+    """(touched, detail) — the enforcing classifier. Detail is the tool name
+    (plus the matched Bash needle), never content."""
     tool_name = tool_name or ""
     if tool_name in UNTRUSTED_TOOL_EXACT:
         return True, tool_name
@@ -498,11 +327,8 @@ def classify_tool(tool_name, tool_input):
 
 
 def record(event, payload=None, log=None):
-    """Append one row. Never raises — a broken instrument must not break the
-    session it observes (same contract as session_registry.record). Silent
-    (no row) for a PreToolUse call that didn't match anything (PRINCIPLES 7,
-    edge-trigger: only the anomaly is worth a row, not every benign call).
-    Returns the row written, or None."""
+    """Append one row for this hook event; never raises. Writes nothing for a
+    benign PreToolUse call. Returns the row written, or None."""
     payload = payload or {}
     session = payload.get("session_id") or ""
     row = None
@@ -516,12 +342,8 @@ def record(event, payload=None, log=None):
             legacy, detail = classify_tool(tool_name, tool_input)
         except Exception:                                # noqa: BLE001
             legacy, detail = False, ""
-        # The NEXT classifier parses arbitrary shell text, so it has strictly
-        # more ways to throw than the substring scan it replaces. This hook
-        # runs in front of EVERY Bash call: a crash here must not break the
-        # session it observes (record()'s stated contract), and must not
-        # silently become a clean verdict either. On error, fall back to the
-        # legacy verdict and leave a visible row saying the parse failed.
+        # On a next-classifier crash, fall back to the legacy verdict and
+        # record a ProvenanceShadowError row.
         nxt_failed = ""
         try:
             nxt, nxt_detail = classify_tool_next(tool_name, tool_input)
@@ -535,10 +357,8 @@ def record(event, payload=None, log=None):
                     log)
         touched, detail = ((nxt, nxt_detail) if ENFORCE_NEXT
                            else (legacy, detail))
-        # SHADOW: record only where the two classifiers DISAGREE
-        # (PRINCIPLES 7, edge-trigger — agreement is the steady state and
-        # earns no row). This row is deliberately NOT an UntrustedToolUse, so
-        # `state_for_session` cannot see it and today's verdicts cannot move.
+        # Shadow row only where the classifiers disagree; it is not a verdict
+        # input.
         if legacy != nxt:
             _append({"at": _iso(), "event": "ProvenanceShadow",
                      "session": session, "tool": tool_name,
@@ -558,8 +378,7 @@ def record(event, payload=None, log=None):
 
 
 def _append(row, log=None):
-    """Append one JSON row. Never raises — a broken instrument must not break
-    the session it observes. Returns True on success."""
+    """Append one JSON row; never raises. Returns True on success."""
     path = Path(log or LOG)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -571,9 +390,7 @@ def _append(row, log=None):
 
 
 def _read(log=None):
-    """Rows, plus a bad-line count (None = log exists but unreadable). Mirrors
-    session_registry._read: a malformed line is COUNTED, never silently
-    dropped."""
+    """(rows, bad-line count); count is None when the log is unreadable."""
     path = Path(log or LOG)
     if not path.exists():
         return [], 0
@@ -603,11 +420,7 @@ def state_for_session(session_id, log=None):
       "unverified" — anything else: no session id, no SessionStart row (the
                       channel was never proven live this session), only
                       shadow-measurement rows, or the log is
-                      unreadable/corrupt. Never conflated with "clean" — an
-                      absent instrument is not a clean verdict. (Corrected
-                      2026-09-14: this said "today, that is EVERY session,
-                      since the hook is unwired". The hook IS wired; 1,345 of
-                      1,444 sessions read clean.)
+                      unreadable/corrupt. Never conflated with "clean".
     """
     if not session_id:
         return "unverified", "no session id available to this write"
@@ -619,10 +432,8 @@ def state_for_session(session_id, log=None):
         return "unverified", (
             "no provenance rows for this session — the recording hook is "
             "not wired, did not fire, or this session predates it")
-    # ProvenanceShadow rows are measurement, never a verdict input — the
-    # shadow classifier must not be able to move a stamp before Craig
-    # promotes it. Excluded here explicitly, including from the row count, so
-    # the exclusion is a stated property and not an accident of filtering.
+    # ProvenanceShadow rows are measurement, never a verdict input (also
+    # excluded from the row count).
     mine = [r for r in mine if r.get("event") != "ProvenanceShadow"]
     if not mine:
         return "unverified", (
@@ -635,19 +446,13 @@ def state_for_session(session_id, log=None):
         return "flagged", f"session touched: {tools}"
     if started:
         return "clean", f"{len(mine)} row(s), channel active, no untrusted touches"
-    # An UntrustedToolUse row with no SessionStart witness should not happen
-    # (SessionStart always fires first) — treat as "no witness", loudly,
-    # rather than guessing which side is true.
+    # Rows but no SessionStart witness: do not guess.
     return "unverified", "no SessionStart witness for this session"
 
 
 def shadow_report(log=None):
-    """What the NEXT classifier would change, measured rather than guessed.
-
-    This is the number the coverage gap destroyed the evidence for: the log
-    holds no row for an unflagged Bash call, so the only way to size the
-    change is to run both classifiers forward and count the disagreements.
-    Returns a dict; `main` prints it."""
+    """Summarise what enforcing the next classifier would change, from the
+    recorded disagreements. Returns a dict."""
     rows, bad = _read(log)
     shadow = [r for r in rows if r.get("event") == "ProvenanceShadow"]
     enforcing = [r for r in rows if r.get("event") == "UntrustedToolUse"]
@@ -661,8 +466,7 @@ def shadow_report(log=None):
     flagged_now = _by_session(enforcing)
     add_sessions = _by_session(would_add) - flagged_now
     drop_sessions = _by_session(would_drop)
-    # A session only stops being flagged if EVERY one of its enforcing rows
-    # would be dropped — one surviving row keeps it flagged.
+    # A session is cleared only if every one of its enforcing rows is dropped.
     truly_cleared = set()
     for sess in drop_sessions:
         legacy_rows = [r for r in enforcing if r.get("session") == sess]
@@ -708,8 +512,7 @@ def prune(log=None, keep=MAX_LINES):
 
 # ------------------------------------------------------------------ selftest
 def selftest():
-    """Deterministic, isolated, bounded. No network, no real ~/.claude paths —
-    every check uses an explicit `log=` pointed at a tempfile."""
+    """Offline selftest; every check uses a tempfile log."""
     import shutil
     import tempfile
 
@@ -757,9 +560,7 @@ def selftest():
         check("Bash reading proton mail is untrusted (substring match)",
               classify_tool("Bash", {"command": "python3 read_proton.py --recent"})[0])
 
-        # ---- the NEXT classifier (items 2 + 3, 2026-09-14). The first two
-        # checks are the two REAL failures from the session that found this,
-        # kept as regression fixtures.
+        # ---- the NEXT classifier; the first two are regression fixtures.
         def nxt(cmd):
             return classify_bash_next(cmd)[0]
 
@@ -775,7 +576,7 @@ def selftest():
               nxt("python3 read_proton.py --recent"))
         check("invoking it by path IS untrusted to next",
               nxt("/home/{{REDACTED}}/{{REDACTED}}/cc-skills/proton-mail/read_proton.py"))
-        check("LAN curl by IP is NOT untrusted (Craig 2026-07-27)",
+        check("LAN curl by IP is NOT untrusted",
               not nxt("curl -sk --max-time 5 https://192.0.2.75:8123/api/"))
         check("loopback curl is NOT untrusted",
               not nxt("curl -s http://127.0.0.1:8099/api/panes"))
@@ -855,8 +656,7 @@ def selftest():
         bad_log = tmp / "corrupt.jsonl"
         bad_log.write_text("not valid json\n{\"also\": \"broken\n")
         rows, bad = _read(bad_log)
-        # ---- the no-behaviour-change guarantee. A ProvenanceShadow row is
-        # measurement; if it can move a stamp, the shadow run is not a shadow.
+        # ---- a ProvenanceShadow row must not move a verdict.
         slog = tmp / "shadow.jsonl"
         record("SessionStart", {"session_id": "sess-shadow"}, log=slog)
         _append({"at": _iso(), "event": "ProvenanceShadow",
@@ -891,8 +691,7 @@ def selftest():
         check("...but the disagreement WAS recorded for measurement",
               shadow_report(log=rlog)["new_flags"] == 1)
 
-        # ---- the classifier must not be able to break the session it
-        # observes. This hook runs in front of every Bash call.
+        # ---- a crashing classifier must not break record().
         elog = tmp / "err.jsonl"
         record("SessionStart", {"session_id": "sess-err"}, log=elog)
         _saved = globals()["classify_tool_next"]

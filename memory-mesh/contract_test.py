@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """contract_test — the six properties that define "the memory works".
 
-SEED-080. Before this file, "the memory mesh works" had no checkable meaning,
-so a seed install could ship a store with no writer, a writer no skill names,
-and a retrieval hook nothing wires — and every test in the tree stayed green.
-Each fix shipped without a definition of done. These are the six:
+The six properties:
 
     M1  ONE DOOR        — exactly one writer exists, a write goes through it,
                           and a direct store write is refused.
@@ -19,24 +16,17 @@ Each fix shipped without a definition of done. These are the six:
     M6  IT REPORTS ITS  — the instruments fail loudly on a dark corpus and a
         OWN BREAKAGE      stale fold, and something outside the fold watches.
 
-Run against a DISPOSABLE mesh and a DISPOSABLE store, never the operator's:
-the sandbox is `drill.Mesh` (three clones, real git transport) plus a temp
-store wired through MESH_STORE_DIR/MEMORY_WRITE_STORE. `harness_store()`'s
-sandbox guard means a run here can never publish over the live MEMORY.md.
-
-A property that cannot be attempted here is SKIP, reported by name, and is
-NOT a pass (drill.py's 2026-07-31 lesson: a silent skip reported green
-exactly where the proof mattered).
+Runs against a disposable install (a fake HOME with its own mesh and store),
+never the live one. A property that cannot be attempted is SKIP, reported by
+name, and is not a pass.
 
     contract_test.py                     # script half, every property
     contract_test.py --harness claude    # + the harness half of M1/M4/M5
     contract_test.py --only M1 M3
     contract_test.py --json evidence.json
 
-Harness scope (2026-09-18): `--harness` takes claude, codex or grok. The
-codex and grok lanes have no hook event, so their M4 is an accepted
-exception, and a harness whose non-interactive prompt shape this file has
-not verified is SKIPped by name rather than guessed at.
+`--harness` takes claude, codex or grok. codex and grok have no hook event,
+so their M4 wiring is SKIP; an unverified harness prompt shape is SKIP too.
 
 Stdlib only; targets /usr/bin/python3.
 """
@@ -58,9 +48,7 @@ PROBE_SLUG = "contract-probe-one-door"
 PROBE_DESC = "the contract probe memory planted by contract_test.py"
 PROBE_RULE = ("Ranch wombat telemetry is read from the zircon feed, never "
               "from the copper feed — the copper feed lags by a day.")
-# The turn M4/M5 must serve the probe back for. Deliberately NOT the slug:
-# retrieval that only works when you already know the slug is a lookup, not
-# recall.
+# The turn M4/M5 must serve the probe back for; deliberately not the slug.
 PROBE_TURN = "where does ranch wombat telemetry come from, zircon or copper?"
 
 TIMEOUT = 120
@@ -76,13 +64,8 @@ def record(prop, status, detail=""):
     print(f"  {tag}: {prop}" + (f" — {detail}" if detail else ""))
 
 
-# Every ambient variable that can move the store, the event log or the
-# provenance log out from under a sandboxed run. Until 2026-09-19 run() merged
-# the sandbox's values INTO os.environ without clearing these, so a shell that
-# happened to export MEMORY_WRITE_STORE/MESH_ROOT — the drill's own shape —
-# made M1's real writer plant its probe OUTSIDE the sandbox and the contract
-# then passed on a file it had not written there (SEED-080 review, finding 7,
-# executed as ambient_override_actual_write: intended=False, outside=True).
+# Ambient variables that could move the store, event log or provenance log
+# out from under a sandboxed run; scrubbed from every child environment.
 SCRUB_PREFIXES = ("MESH_", "MEMORY_WRITE_", "SESSION_PROVENANCE_")
 
 
@@ -92,12 +75,8 @@ def scrubbed_environ():
 
 
 def _claude_oauth_env():
-    """{'CLAUDE_CODE_OAUTH_TOKEN': ...} read at point of use through the
-    workspace's own _lib.secrets, or {} — same rule as _lib/claude_headless
-    oauth_env(). A run started by ssh or a scheduler has no keychain on macOS,
-    so the CLI's interactive login is absent and the harness half failed "Not
-    logged in" ({{REDACTED}}, 2026-09-26). Only ADDS auth where there was none;
-    never touches os.environ; a locked vault means "no token", not a crash."""
+    """{'CLAUDE_CODE_OAUTH_TOKEN': ...} from _lib.secrets, or {} if already set
+    or unavailable. Needed when no interactive login exists (ssh/scheduler)."""
     if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
         return {}
     try:
@@ -119,11 +98,8 @@ def run(cmd, env=None, cwd=None, timeout=TIMEOUT, stdin=None):
 
 
 # ── the door ────────────────────────────────────────────────────────────────
-# Resolved, never assumed. Before Step 2 the engine lives in the vault's
-# skills-core (installed at ~/.claude/skills/improve/); after it, in
-# memory-mesh/. BOTH existing is not a tolerable transition state — it is two
-# doors, which is the whole failure this property exists to catch — so the
-# candidates are counted, not searched in priority order.
+# Candidate writer locations. They are counted, not searched in order: more
+# than one existing is two doors, which M1 fails.
 DOOR_CANDIDATES = (
     HERE / "memory_write.py",
     Path.home() / ".claude" / "skills" / "improve" / "memory_write.py",
@@ -145,19 +121,12 @@ def doors():
 
 
 class Sandbox:
-    """A disposable INSTALL — a fake HOME — and the env every probe runs under.
+    """A disposable install — a fake HOME — and the env every probe runs under.
 
-    Not a MESH_ROOT override. `harness_store()` refuses to publish whenever
-    MESH_ROOT is not the default (the 2026-07-29 sandbox guard: a drill run
-    had published test fixtures over the operator's live MEMORY.md), so under
-    a MESH_ROOT override the fold writes no index, no quarantine list and no
-    servable manifest — M3, M4 and M5 could only ever fail, and they would
-    fail for the guard's reason rather than the property's.
-
-    A fake HOME moves DEFAULT_MESH_ROOT, store_dir() and the writer's own
-    store together, so every path resolves normally inside the sandbox and
-    the guard stays armed exactly as it is in production. It is also the
-    honest shape of the thing being proven: a fresh seed install.
+    A fake HOME (not a MESH_ROOT override) moves the mesh root, store_dir()
+    and the writer's store together, so paths resolve normally and
+    harness_store()'s sandbox guard (which refuses to publish under a
+    MESH_ROOT override) stays armed as in production.
     """
 
     def __init__(self, root):
@@ -180,8 +149,7 @@ class Sandbox:
         self.store.mkdir(parents=True)
         # The fold only generates MEMORY.md for a store that has opted in.
         (self.store / ".mesh-generated").write_text("contract_test\n")
-        # Checked, not assumed (PRINCIPLES 1): the environment a sandboxed
-        # child will actually receive must carry no override but the
+        # A sandboxed child's environment must carry no override but the
         # sandbox's own.
         composed = dict(scrubbed_environ(), **self.env)
         leaked = sorted(k for k in composed if k.startswith(SCRUB_PREFIXES)
@@ -199,10 +167,8 @@ class Sandbox:
 
     @property
     def env(self):
-        # Deliberately NO store override: mesh_lib and memory_write.py each
-        # derive the store their own way, and M2 is the assertion that they
-        # agree. Handing both the same env var would make the test the thing
-        # making them agree.
+        # No store override: M2 asserts mesh_lib and memory_write.py derive
+        # the same store on their own.
         return {"HOME": str(self.home), "MESH_HOST": "contract",
                 "MESH_SESSION_ID": "contract-test"}
 
@@ -213,15 +179,10 @@ class Sandbox:
 
 # ── what was tested ─────────────────────────────────────────────────────────
 def tested_identity():
-    """The identity of the PACKAGE this contract is running inside, or None.
+    """(tested_root, package_sha) from this install's receipt, or (None, None).
 
-    2026-09-19 (SEED-080 bug bash, finding 3): the evidence file used to be
-    bound to dist/ at RECORD time, so a green run produced against one build
-    could be stamped onto a different one — publish.sh then gated on a proof
-    about bytes nobody had tested. A run now carries the sha of the package
-    it was installed from, straight out of that install's own receipt, and
-    contract_evidence.record() refuses when it does not match the dist being
-    published.
+    contract_evidence.record() refuses evidence whose package sha does not
+    match the dist being published.
     """
     doc = install_receipt()
     if doc is None:
@@ -239,32 +200,19 @@ def install_receipt():
 
 
 # ── M0: what actually ran ───────────────────────────────────────────────────
-# 2026-09-19 round 2 (R2). `tested_sha` above was the receipt's CLAIM about the
-# dist the install came from — never a measurement of the bytes under test.
-# Reproduced on {{REDACTED}}: append one line to <root>/memory-mesh/
-# memory_write.py after installing, and the contract still reported the clean
-# dist sha, went 14/14 GREEN, and contract_evidence recorded AND verified it.
-# The publish gate was proving dist/, not the tree the contract ran inside.
+# Measures whether the bytes under test match what the install wrote.
 #
-# installed_sha() below is a BYTE-IDENTICAL copy of install.py's function of
-# the same name (this file lives in the installed tree and cannot import the
-# installer). cc-seed/tools/selftest_installed_sha.py asserts the two agree on
-# the same tree, so the copies cannot drift apart unnoticed. The algorithm is
-# contract_evidence.dist_sha()'s exactly: sorted relative posix path, then the
-# sha256 of each file's bytes.
-# Prefixes a shipped tool WRITES INTO at runtime, by design: the run log and
-# the brief store. Nothing is shipped under them, so hashing their contents
-# measures how much the system has been USED, not whether its bytes are
-# intact — runs.db alone changes on every scheduled job, so M0 went red
-# within minutes of any real install and stayed red (found on {{REDACTED}},
-# 2026-09-19, where it read as "the bytes running here are not the bytes
-# this install wrote"). check 1 already skipped exactly these; the hash had
-# never been told.
+# installed_sha() must stay behaviourally identical to install.py's function
+# of the same name (this file cannot import the installer);
+# cc-seed/tools/selftest_installed_sha.py asserts they agree. Algorithm:
+# sorted relative posix path, then sha256 of each file's bytes.
+#
+# Prefixes shipped tools write into at runtime; excluded from the hash.
 RUNTIME_WRITABLE_PREFIXES = ("observability/data/", "session-brief/briefs/")
 
 INSTALLED_SHA_EXEMPT = {
     "scheduler/manifest.yml",
-    # the operator's own config (install.py OPERATOR_EDITABLE_CONFIG, 2026-09-26)
+    # user-editable config (install.py OPERATOR_EDITABLE_CONFIG)
     "observability/freshness.json",
     "memory-mesh/mesh.toml",
 }
@@ -286,11 +234,7 @@ def installed_sha(target, components, root_files):
             paths.append(p)
     for p in sorted(paths):
         rel = p.relative_to(Path(target)).as_posix()
-        # .git is a working checkout's own churn — index, FETCH_HEAD and
-        # the ref logs move on every fetch, so a component kept under
-        # version control (memory-mesh on {{REDACTED}} is, by doctrine) was
-        # permanently "drifted": 446 measured paths differed, 400+ of
-        # them .git internals. Same reasoning as __pycache__.
+        # .git and __pycache__ churn independently of shipped bytes.
         if "__pycache__" in p.parts or ".git" in p.parts \
                 or rel in INSTALLED_SHA_EXEMPT:
             continue
@@ -308,13 +252,8 @@ ROOT_FILES = ["PRINCIPLES.md", "PROPOSALS.md", "CLAUDE.md.template",
 def m0_package_integrity():
     """Do the bytes under test still match what the install wrote?
 
-    Recorded ONLY inside an install. Run from a working copy (the fleet's own
-    memory-mesh) there is no receipt and nothing claims what these bytes should
-    be, so there is no property to score — and a run with no M0 row cannot be
-    recorded as evidence, because contract_evidence requires it. That is the
-    intended shape: evidence comes from an install, never from a working copy.
-
-    Returns the live hash, or None when this is not an install.
+    Recorded only inside an install (a working copy has no receipt, so no M0
+    row and no recordable evidence). Returns the live hash, or None.
     """
     doc = install_receipt()
     if doc is None:
@@ -362,8 +301,7 @@ def m1_one_door(sb, harness):
     if not landed:
         return door
 
-    # The door is only "the one door" if the other paths are shut. The guard
-    # is what makes that technical rather than prose.
+    # The door is only "the one door" if the guard shuts the other paths.
     guard = HERE / "hooks" / "memory-write-guard.py"
     if not guard.is_file():
         record("M1-guard", "FAIL", f"no write guard at {guard}")
@@ -375,9 +313,7 @@ def m1_one_door(sb, harness):
                        "content": "---\nname: bypass\n---\nwritten around the door\n"},
     })
     g = run([sys.executable, str(guard)], env=sb.env, stdin=payload)
-    # rc==2 specifically: the hook contract's "block" code. `!= 0` would have
-    # scored a guard that crashed on its own input as a successful denial
-    # (2026-09-19 review, M1 row).
+    # rc==2 specifically (the hook "block" code), so a crash is not a denial.
     blocked = g.returncode == 2 and "memory-write-guard" in (g.stdout + g.stderr)
     record("M1-guard", "PASS" if blocked else "FAIL",
            "direct store write refused" if blocked
@@ -388,8 +324,7 @@ def m1_one_door(sb, harness):
 
 
 def _guard_says(guard, sb, command):
-    """The guard's DECISION on a Bash command. The command is never executed —
-    only the hook is run, on a synthetic PreToolUse event."""
+    """The guard's decision on a Bash command (never executed)."""
     payload = json.dumps({
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
@@ -399,12 +334,10 @@ def _guard_says(guard, sb, command):
 
 
 def m1_bash_guard(sb, guard):
-    """M1's Write-tool denial says nothing about the SHELL, which is where the
-    2026-09-19 bypass lived: `printf x > STORE/f.md # memory_write.py` was
-    allowed, because sanctioning was a substring test on the raw command.
+    """The guard must refuse shell-level bypasses of the door.
 
-    Healthy baseline first (a plain read must be ALLOWED), so a guard that
-    denies everything — or crashes on every input — cannot score a pass here.
+    Checks a healthy baseline first (a plain read is allowed) and that the
+    real door still passes, so a deny-everything guard cannot score a pass.
     """
     target = sb.store / "bash-bypass-probe.md"
     healthy = _guard_says(guard, sb, f"grep -c foo {sb.store}/MEMORY.md")
@@ -413,11 +346,8 @@ def m1_bash_guard(sb, guard):
                f"the guard refused a plain READ (rc={healthy.returncode}); "
                "a guard that denies everything proves nothing")
         return
-    # 2026-09-19 round 2: an IMPOSTOR door — a real file named memory_write.py
-    # that is not this install's — plus inline code in a runtime, which writes
-    # the store with no shell redirect at all. Both were ALLOWED by the
-    # round-1 guard. The impostor has to be a real file on disk, or the case
-    # proves only that an unresolvable path denies.
+    # An impostor door must be a real file on disk, or the case proves only
+    # that an unresolvable path denies.
     impostor_dir = Path(sb.mesh_root).parent / "impostor-door"
     impostor_dir.mkdir(parents=True, exist_ok=True)
     impostor = impostor_dir / "memory_write.py"
@@ -440,8 +370,7 @@ def m1_bash_guard(sb, guard):
             record("M1-bash-guard", "FAIL",
                    f"ALLOWED (rc={r.returncode}): {what}")
             return
-    # ...and the REAL door must still get through, or "denies everything" would
-    # score a pass on the three cases above.
+    # The real door must still get through.
     genuine = _guard_says(
         guard, sb,
         f"/usr/bin/python3 {door} write --slug x --text 'MEMORY.md' --commit")
@@ -456,13 +385,10 @@ def m1_bash_guard(sb, guard):
 
 
 def m1_harness(sb, door, harness):
-    """The incident shape: a harness turn, with only the skill's own text,
-    must reach the door — not emit.py, not a hand-written file.
+    """A harness turn, given only a prompt, must write through the door.
 
-    Runs under the REAL HOME (the CLI's own auth lives there) with the store
-    and the event log diverted to the sandbox by explicit override, so the
-    turn can never write the operator's memory. Checked, not assumed: the
-    probe asserts the sandbox store received the file.
+    Runs under the real HOME (for CLI auth) with the store and event log
+    overridden to the sandbox; asserts the sandbox store received the file.
     """
     spec = harness_spec(harness)
     if spec is None:
@@ -491,9 +417,7 @@ def m1_harness(sb, door, harness):
                f"the {harness} turn timed out at {HARNESS_TIMEOUT}s")
         return
     new_files = set(p.name for p in sb.store.glob("*.md")) - before
-    # WHICH writer ran. A door write leaves an event whose subject names the
-    # slug; a direct emit.py call or a hand-written file leaves the store
-    # file with no matching event, which is the exact bypass shape.
+    # A door write leaves an event naming the slug; a bypass leaves none.
     log = sb.mesh_root / "events" / "contract.ndjson"
     evented = log.is_file() and slug in log.read_text(encoding="utf-8", errors="replace")
     ok = f"{slug}.md" in new_files and evented
@@ -518,13 +442,8 @@ def m2_one_store(sb, door):
     record("M2-resolve", "PASS" if agree else "FAIL",
            f"mesh_lib={mesh_store} writer={writer_store} expected={sb.store}")
 
-    # A hardcoded absolute store or door path is one host's truth shipped to
-    # every host. Scan the group's own source, not the whole tree.
-    # Composed, not written out: a contiguous copy of the old door path in
-    # this file would itself be the fleet literal the seed build refuses to
-    # ship (build_seed.fleet_literal_audit). The store needle is derived from
-    # THIS host's home, so it catches whatever absolute store path a given
-    # host would have hardcoded, not just the one that bit us.
+    # No shipped source may hardcode an absolute store or door path. Needles
+    # are composed so this file does not itself contain the literal.
     literals = (str(Path.home() / ".claude" / "projects"), "/Users/",
                 "/".join(("~/.claude", "skills", "improve", "memory_write.py")))
     hits = []
@@ -549,13 +468,11 @@ def m3_fold_projects(sb):
     memory = sb.store / f"{PROBE_SLUG}.md"
     index = sb.store / "MEMORY.md"
     exclude = sb.store / "_index-exclude.txt"
-    # The door files a new memory on-demand by default (admission policy E),
-    # so "projected" means the index DECIDED about it — a row in MEMORY.md or
-    # a line in the on-demand list — not that it rode the always-on tier.
+    # "Projected" means the index decided about it: a row in MEMORY.md or a
+    # line in the on-demand list.
     decided = ((index.is_file() and PROBE_SLUG in index.read_text(encoding="utf-8"))
                or (exclude.is_file() and PROBE_SLUG in exclude.read_text(encoding="utf-8")))
-    # The delivery manifest is mesh state, not store content (mesh_lib
-    # write_servable_manifest: "derived state belongs with the deriver").
+    # The servable manifest lives in mesh state, not the store.
     manifest = sb.mesh_root / "state" / "servable.json"
     servable = False
     if manifest.is_file():
@@ -571,15 +488,8 @@ def m3_fold_projects(sb):
                detail + f" rc={r.returncode} {r.stdout[-300:]}{r.stderr[-300:]}")
         return False
 
-    # The property is PROJECTION — the fold rebuilding the store from the
-    # event log — and until 2026-09-19 nothing here made the fold do any of
-    # it: M1 had already written the file, so dropping `--project` entirely
-    # left M3 green (SEED-080 review finding 8, executed as
-    # m3_does_not_require_projection). Delete the body and make the fold put
-    # it back from the log. fold.py's contract is explicit about this: without
-    # --project it says "WOULD project (run with --project)", with it, it
-    # creates. So the store is a PROJECTION, not the source of truth, and
-    # this is the assertion that says so.
+    # Delete the file and require the fold to re-project it from the event
+    # log; M1 already wrote it, so presence alone proves nothing.
     faults.append("deleted the probe's store file to force a re-projection")
     memory.unlink()
     r2 = sb.fold()
@@ -597,9 +507,8 @@ def m3_fold_projects(sb):
 
 # ── M4 ──────────────────────────────────────────────────────────────────────
 def _retrieve_hook_wired(settings_path):
-    """Is THIS install's retrieve.py a real UserPromptSubmit hook in that
-    settings file? Structure, not substring; disableAllHooks disqualifies the
-    whole file, because a hook that is present and disabled does not run."""
+    """Is this install's retrieve.py a parsed UserPromptSubmit hook in that
+    settings file? disableAllHooks disqualifies the whole file."""
     if not settings_path.is_file():
         return False
     try:
@@ -619,23 +528,11 @@ def _retrieve_hook_wired(settings_path):
 
 
 def _command_runs(command, want):
-    """Does this hook command RUN `want`, or merely mention it?
+    """Does this hook command run `want` as its program (not merely mention it)?
 
-    2026-09-19 round 2 (R4). The test was `want in command` — a substring of
-    the command STRING. Reproduced on {{REDACTED}}: all three of these scored
-    as wiring, and none of them delivers a single memory.
-
-        /usr/bin/python3 /opt/other/wrapper.py --about <want>   (an argument)
-        echo <want> >/dev/null                                  (an echo)
-        /usr/bin/python3 <want>.disabled                        (another file)
-
-    The path has to be the PROGRAM: argv0, or the first non-flag argument when
-    argv0 is a python interpreter, skipping leading VAR=val and `env` — the
-    exact shape the installer writes and the memory-write guard already parses.
-    Compared by realpath as well as literally, so a symlinked install still
-    counts. A hook wired through some other wrapper will FAIL this and say so;
-    that is the fail-closed direction, and the remedy it names
-    (`install.py --approve memory-hooks`) is one command.
+    The program is argv0, or the first non-flag argument after a python
+    interpreter, skipping leading VAR=val and `env`. Compared literally and by
+    realpath.
     """
     import shlex
     try:
@@ -675,25 +572,15 @@ def m4_reaches_session(sb, harness):
            "the probe memory was served for a turn that never named it"
            if served else f"not served: {r.stdout[-200:]}{r.stderr[-200:]}")
 
-    # Delivery wiring: scoring the right memory is worthless if nothing calls
-    # the scorer. Per harness, because only Claude Code has a hook event.
+    # Delivery wiring, per harness: only Claude Code has a hook event.
     if harness in (None, "claude"):
-        # THIS install's settings first. Falling straight through to the user
-        # scope made a seed install built on a fleet host pass on the FLEET's
-        # wiring — a green for the wrong reason, which is the failure this
-        # whole contract exists to make impossible.
+        # This install's settings first, then user scope; parsed, not grepped.
         local = WORKSPACE / ".claude" / "settings.json"
         user = Path.home() / ".claude" / "settings.json"
-        # PARSED, not grepped. A substring match on the settings TEXT passed
-        # for a file whose entire `hooks` block had been replaced by a `notes`
-        # field holding the same strings, and for disableAllHooks: true — both
-        # executed in the 2026-09-19 review (no_hooks_green,
-        # disabled_hooks_green). Free text is not wiring.
         hit = next((p for p in (local, user)
                     if _retrieve_hook_wired(p)), None)
         if hit is None:
-            # Nothing names THIS mesh. A hook naming some other install's
-            # retrieve.py does not deliver this install's memory.
+            # Another install's retrieve.py does not count.
             looked = f"{local}, {user}"
             record("M4-wiring", "FAIL",
                    f"no UserPromptSubmit hook in {looked} runs "
@@ -716,20 +603,14 @@ def m5_recall_cites(sb):
         out = r.stdout
         surface = "recall.py"
     else:
-        # Until Step 4b's CLI exists, the recall surface IS retrieve + the
-        # store. Say so in the detail rather than letting the fallback pass
-        # as if the CLI were proven.
+        # Fallback recall surface when recall.py is absent; named in detail.
         r = run([sys.executable, str(HERE / "retrieve.py")], env=sb.env,
                 stdin=json.dumps({"prompt": PROBE_TURN}))
         out = r.stdout
         surface = "retrieve.py (no recall.py CLI yet — Step 4b)"
     hit = PROBE_SLUG in out
-    # A citation is "where this came from", IN THE OUTPUT and resolvable by
-    # the reader. Until 2026-09-19 this accepted a bare slug in stdout plus
-    # the existence of a file the reader was never told about — so a surface
-    # that cited nothing at all passed (SEED-080 review finding 8, executed as
-    # weak_delivery_and_citation_assertions). Either the wiki-link form
-    # recall.py emits, or the store path itself, counts.
+    # A citation must appear in the output and resolve: the wiki-link form or
+    # the store path.
     body = sb.store / f"{PROBE_SLUG}.md"
     citation = next((c for c in (f"[[{PROBE_SLUG}]]", str(body), body.name)
                      if c in out), None)
@@ -743,9 +624,7 @@ def m5_recall_cites(sb):
 
 # ── M6 ──────────────────────────────────────────────────────────────────────
 def _crashed(proc):
-    """Did this instrument fall over rather than report? A traceback is a
-    broken instrument, and a broken instrument is a FAIL — never a pass that
-    happens to be non-zero."""
+    """Did this instrument crash rather than report?"""
     err = (proc.stderr or "") + (proc.stdout or "")
     return ("Traceback (most recent call last)" in err
             or "ImportError" in err or "ModuleNotFoundError" in err
@@ -753,16 +632,10 @@ def _crashed(proc):
 
 
 def m6_reports_breakage(sb):
-    """Fault injection: the instruments must FAIL on a broken channel. An
-    instrument that stays green on a dark corpus is the failure it was built
-    to catch."""
+    """Fault injection: the instruments must fail on a broken channel."""
     manifest = sb.mesh_root / "state" / "servable.json"
     saved = manifest.read_text(encoding="utf-8") if manifest.is_file() else None
-    # HEALTHY FIRST. `returncode != 0` alone scored ANY crash as a successful
-    # fault report: make both instruments raise ImportError and both negative
-    # checks passed (SEED-080 review finding 8, executed as
-    # unrelated_crash_passes_m6). An instrument that cannot run is not an
-    # instrument that detected something.
+    # Healthy baseline first, so a crash cannot pass as a fault report.
     base = run([sys.executable, str(HERE / "canary.py")], env=sb.env)
     if base.returncode != 0 or _crashed(base):
         record("M6-dark-corpus", "FAIL",
@@ -788,15 +661,9 @@ def m6_reports_breakage(sb):
                 manifest.write_text(saved, encoding="utf-8")
                 faults.append("restored the servable manifest")
 
-    # The fold cannot certify its own liveness (PRINCIPLES 21): something
-    # outside its failure domain has to watch the timer, and be watched in
-    # turn. Two shapes are legitimate — a seed install schedules fold_watch.py
-    # as mesh_watch under its own scheduler; the fleet registers the fold's
-    # systemd timer with the freshness checker directly.
-    # THIS install's scheduler, not the fleet's. contract_test.py running from
-    # inside a seed install used to read WORKSPACE — which on a fleet host is
-    # the fleet's own freshness.json — so a fresh install with nothing
-    # scheduled at all passed on the fleet's observer (codex, 2026-09-19).
+    # Something outside the fold must watch it: either the scheduler runs
+    # fold_watch.py, or freshness.json registers the fold timer/mesh_watch.
+    # Inside a seed install, check that install's observer, not the workspace's.
     observer_root = HERE.parent if (HERE.parent / ".cc-seed").is_dir() else WORKSPACE
     freshness = observer_root / "observability" / "freshness.json"
     sched = observer_root / "scheduler" / "manifest.yml"
@@ -813,8 +680,7 @@ def m6_reports_breakage(sb):
            "; ".join(watchers) + f" [{observer_root}]" if watchers
            else f"nothing outside the fold watches it ({freshness}, {sched})")
 
-    # And the watcher has to be able to FAIL — a green watcher that cannot go
-    # red is a decoration. Drive it against an impossible freshness window.
+    # The watcher must be able to go red: backdate the fold state and check.
     watch = HERE / "fold_watch.py"
     state = sorted((sb.mesh_root / "state").glob("*.json"))
     if not watch.is_file():
@@ -854,15 +720,10 @@ def m6_reports_breakage(sb):
 
 # ── harnesses ───────────────────────────────────────────────────────────────
 def harness_spec(name):
-    """The non-interactive one-shot shape for a harness, or None.
+    """The non-interactive one-shot argv for a harness, or None.
 
-    Only shapes read out of the installed CLI's own --help are here
-    (2026-09-18: `claude -p`, `codex exec`, `grok -p/--single`). A guessed
-    flag that silently opened a REPL and timed out would report FAIL for the
-    harness when the truth is "this file does not know how to drive it" — the
-    instrument lying about its subject. Tool permission is granted as
-    narrowly as each CLI allows, never blanket bypass: this runs on the
-    operator's own machine.
+    Only verified CLI shapes are listed; tool permission is as narrow as each
+    CLI allows.
     """
     if not name or not shutil.which(name):
         return None
@@ -898,9 +759,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
     ALL = ["M1", "M2", "M3", "M4", "M5", "M6"]
     want = {m.upper() for m in (args.only or ALL)}
-    # `--only M7` used to run NOTHING and exit 0 — and `--json` then wrote
-    # `green: true` over an empty result set, which contract_evidence happily
-    # recorded and verified (2026-09-19 review, finding 3b).
+    # Reject unknown properties so an empty run cannot be reported green.
     unknown = sorted(want - set(ALL))
     if unknown:
         print(f"no such property: {', '.join(unknown)} — known: {', '.join(ALL)}",
@@ -908,8 +767,7 @@ def main(argv=None):
         return 2
 
     started = time.time()
-    # R2: the FIRST thing measured, before any property runs — whether the
-    # bytes about to be exercised are the bytes this install wrote.
+    # Measure package integrity before any property runs.
     live_sha = m0_package_integrity()
     print(f"contract_test — memory-mesh, {WORKSPACE}"
           + (f", harness={args.harness}" if args.harness else ""))
@@ -958,12 +816,8 @@ def main(argv=None):
             "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "workspace": str(WORKSPACE),
             "tested_root": tested_root,
-            # R2: `tested_sha` is now a MEASUREMENT of the installed tree these
-            # properties ran against, taken at test time. `tested_package_sha`
-            # is the receipt's claim about the dist it came from — the binding
-            # contract_evidence.record() checks against the dist being
-            # published. Two different facts; they used to be one, and the one
-            # was the claim.
+            # tested_sha: measured hash of the installed tree.
+            # tested_package_sha: the receipt's claimed dist sha.
             "tested_sha": live_sha,
             "tested_package_sha": package_sha,
             "selected": sorted(want),
@@ -973,8 +827,7 @@ def main(argv=None):
                         for n, s, d in results],
             "faults": faults,
         }, indent=2) + "\n", encoding="utf-8")
-    # A SKIP is an unmet proof obligation: it does not fail the run, but it
-    # can never make it green either (see --json `green`).
+    # A SKIP does not fail the run, but it never makes it green.
     return 1 if fails else 0
 
 

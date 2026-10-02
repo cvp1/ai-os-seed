@@ -1,22 +1,11 @@
-"""Credential loading for the CC projects (stdlib-only).
-
-Single source of truth for the ``env-var-fallback -> expanduser -> read().strip()``
-pattern that was copy-pasted across ~8 scripts (solar-health, battery-health,
-solar-direct, unifi-health, smarthub-usage, uptime-kuma, ...).
-"""
+"""Credential loading (stdlib-only): env var, else a file under ~/.key, stripped."""
 import json
 import os
 import sys
 
-# ~/.key is fscrypt-encrypted (see keyvault/). When locked (e.g. just after a
-# reboot, before anyone ran `keyvault/unlock.sh`) the directory exists but its
-# plaintext entries are inaccessible. This canary is a plaintext-named marker
-# written inside the encrypted dir at migration time: readable only while the
-# vault is unlocked, so its absence is a reliable "vault is locked" signal.
+# ~/.key is fscrypt-encrypted; the canary is readable only while it is unlocked.
 KEY_DIR = os.path.expanduser("~/.key")
 VAULT_CANARY = os.path.join(KEY_DIR, ".vault_unlocked")
-# Computed, not hardcoded: this file lives at <repo-root>/_lib/secrets.py on
-# every install, whatever the repo is checked out as or named.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UNLOCK_SH = os.path.join(_REPO_ROOT, "keyvault", "unlock.sh")
 
@@ -30,15 +19,8 @@ class SecretShielded(SecretError):
 
 
 # --- session shield ----------------------------------------------------------
-# When $EGRESS_SHIELD=1, any credential that an egress-proxy route already
-# injects is REFUSED here — callers must go through the proxy socket instead, so
-# the value never enters the process (and never the transcript). This is opt-in
-# and OFF by default: cron jobs and jailed workers don't set it, so their
-# behaviour is byte-identical. The interactive Claude Code session sets it.
-#
-# It is not containment — the session keeps full network access and could still
-# read ~/.key directly. It removes the *ordinary* path by which a credential
-# reaches a prompt-injectable context. See egress-proxy/SPEC-session-shield.md.
+# With $EGRESS_SHIELD=1, credentials an egress-proxy route injects are refused
+# here; callers must use the proxy socket. Opt-in, off by default.
 SHIELD_ENV = "EGRESS_SHIELD"
 ROUTES_JSON = os.environ.get(
     "EGRESS_ROUTES",
@@ -52,21 +34,10 @@ def shield_active():
 
 
 def _shield_map():
-    """{identifier -> route key} for every credential an egress route injects.
+    """Map {file path or env-var name -> route key} from routes.json inject blocks.
 
-    Identifiers are BOTH the expanded ~/.key file path and the env-var name, so
-    a caller is shielded however it asks. Built from routes.json's inject blocks
-    — the route table stays the single source of truth, and a route added there
-    is shielded here without a second edit.
-
-    When several routes carry the SAME credential (``ha`` reads and ``ha-write``
-    writes with one token), the FIRST one in routes.json wins the hint. Order the
-    table read-route-first so the message names the route a caller most likely
-    wants; either way the refusal is identical, only the suggestion differs.
-
-    Raises SecretShielded if the route table can't be read: shield mode was
-    explicitly asked for, and if we can't tell which credentials are routed the
-    safe answer is to refuse loudly, not to hand the value over.
+    The first route listed wins when several share a credential. Raises
+    SecretShielded if the route table can't be read (fails closed).
     """
     try:
         mtime = os.path.getmtime(ROUTES_JSON)
@@ -117,16 +88,13 @@ def _shielded_route(env_name, path):
 def vault_locked():
     """True if ~/.key is an encrypted vault that is currently locked.
 
-    Returns False when the vault is unlocked, or when fscrypt was never set up
-    (plain ~/.key with no canary that still holds real files) — in that case the
-    normal not-found path handles a genuine missing secret.
+    False when unlocked or when ~/.key is a plain (non-fscrypt) directory.
     """
     if not os.path.isdir(KEY_DIR):
         return False
     if os.path.exists(VAULT_CANARY):
         return False  # unlocked
-    # No canary. Only call it "locked" if the dir looks encrypted (has entries
-    # but none are readable plaintext) — avoids false alarms on a pre-fscrypt box.
+    # No canary: locked only if entries exist but none are readable files.
     try:
         entries = os.listdir(KEY_DIR)
     except OSError:
@@ -138,22 +106,11 @@ def vault_locked():
 
 def load_secret(env_name, path, what="secret", required=True, exit_on_error=True,
                 allow_raw=False):
-    """Return a credential string (or ``None``).
+    """Return a credential from $env_name, else the file at ``path`` (or ``None``).
 
-    Resolution order:
-      1. environment variable ``env_name`` (if set and non-empty), stripped;
-      2. the file at ``path`` (``~`` expanded), stripped.
-
-    On a miss when ``required`` (the default): ``sys.exit()`` with a one-line
-    message, matching the CLI scripts' fail-fast behaviour. Pass
-    ``exit_on_error=False`` to raise :class:`SecretError` instead, or
-    ``required=False`` to return ``None``.
-
-    ``allow_raw=True`` opts a caller out of the session shield (see
-    :data:`SHIELD_ENV`). Use it only where the raw value is genuinely required
-    and no egress route can carry it — the proxy itself, and SMTP senders (the
-    proxy is HTTP-only). Every such call site is a deliberate, greppable
-    exception; prefer the route.
+    On a miss when ``required``: ``sys.exit()`` with a message, or raise
+    :class:`SecretError` if ``exit_on_error=False``. ``allow_raw=True`` bypasses
+    the session shield; use it only where no egress route can carry the value.
     """
     if not allow_raw and shield_active():
         route = _shielded_route(env_name, path)     # may raise (fails closed)

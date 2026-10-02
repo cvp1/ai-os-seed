@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""Repo-hygiene guard (Story 008): keep the "everything committed + pushed" state
-that Stories 005–007 established from silently decaying.
+"""Repo-hygiene guard: report git repos under the workspace root that are not
+committed and pushed.
 
-Sweeps every top-level git repo under ~/{{REDACTED}} and reports, edge-triggered:
-  * missing remote            — a durability hole (flagged immediately; rare + bad)
-  * ahead of upstream > N days — unpushed work, aged by the OLDEST unpushed commit's
-                                 committer date (fresh work-in-flight stays quiet)
-  * dirty tracked files > N days — uncommitted edits, aged by the NEWEST dirty file's
-                                 mtime (actively-edited trees stay quiet)
-Plus the Story-006 class: any cron-wrapper / sasha-config exec target that
-`git ls-files` doesn't know (untracked code prod runs).
-
-No network: "ahead" is measured against the local upstream ref (@{u}), no fetch —
-so it's bounded to a few seconds over ~40 repos. Prints ONLY problems and exits 1
-when any exist (found-work ≠ crash; mirrors freshness.py / 2026-07-06 Story 008).
+Reports: missing remote; unpushed commits older than N days; dirty tracked files
+untouched for N days; files gutted vs HEAD; and untracked scheduled exec targets.
+No network ("ahead" uses the local @{u}). Prints only problems; exits 1 if any.
 
     repo_hygiene.py            # human report (default N=7 days)
     repo_hygiene.py --days 14
@@ -28,24 +19,15 @@ import sys
 import time
 from pathlib import Path
 
-# CC_HYGIENE_ROOT lets a non-Craig install (cc-seed) point this at its own
-# workspace root instead of ~/{{REDACTED}} — unset default preserves this
-# host's exact behavior. Without the override, a root that doesn't exist
-# (any fresh seed install before the env var is set) degrades to "no repos
-# found" rather than crashing _repos()'s unconditional iterdir().
+# Workspace root; override with CC_HYGIENE_ROOT or --root. A missing root
+# yields no repos rather than an error.
 CC = Path(os.path.expanduser(os.environ.get("CC_HYGIENE_ROOT", "~/{{REDACTED}}")))
 DEFAULT_DAYS = 7
 
-# --- Catastrophic content loss (added 2026-07-27) ----------------------------
-# Written after PRINCIPLES.md — all 16 first principles — sat at 0 bytes for
-# roughly five hours and NOTHING noticed. The `dirty` check below could not have
-# caught it: it waits 7 days and then reports a COUNT ("3 dirty tracked files"),
-# so a doctrine file emptied by a stray `> $UNSET_VAR` reads exactly like a
-# work-in-progress edit. Content LOSS is a different class from content CHANGE
-# and pages immediately, with the file named.
+# --- Content loss: emptied/gutted tracked files page immediately ------------
 GUTTED_MIN_BYTES = 400   # under this, "90% smaller" is noise, not destruction
 GUTTED_KEEP_FRAC = 0.10  # keeping <=10% of the committed bytes = gutted
-GUTTED_MAX_FILES = 300   # bound the per-repo work (Principle 8)
+GUTTED_MAX_FILES = 300   # bound the per-repo work
 SASHA_CONFIG = Path(os.path.expanduser("~/.config/sasha/config.json"))
 CRON_SHIM_SCRIPTS = Path(os.path.expanduser("~/.{{REDACTED}}/scripts"))
 
@@ -57,9 +39,8 @@ def _git(repo: Path, *args) -> str:
 
 
 def _porcelain_paths(repo: Path) -> list:
-    """Dirty tracked paths from `git status --porcelain -uno`. Parsed from RAW
-    output (never .strip()'d — that would eat the leading status-column space of
-    the first line and mangle `line[3:]`). Handles the `R old -> new` rename form."""
+    """Dirty tracked paths from `git status --porcelain -uno`. Output is parsed
+    unstripped so `line[3:]` stays aligned; renames yield the destination."""
     r = subprocess.run(
         ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=no"],
         capture_output=True, text=True, timeout=15)
@@ -75,16 +56,8 @@ def _porcelain_paths(repo: Path) -> list:
 
 
 def _head_blob_sizes(repo: Path) -> dict:
-    """{path: byte size} for every regular-file blob at HEAD, from ONE
-    `git ls-tree -r -l -z HEAD` call. Symlinks (mode 120000) and submodules
-    (type commit) are skipped. Empty on unborn HEAD — no comparison, no finding.
-
-    v2 (2026-07-27, same day as v1): the guard originally walked `git status`'s
-    dirty list. Grok's eval pass called the hole and a live control CONFIRMED it:
-    the incident's own destroying command printed a CLEAN status, and a file
-    truncated under `update-index --assume-unchanged` was invisible to v1. A
-    guard against silent destruction cannot take git's word for which files
-    changed — HEAD is the ground truth, so enumerate HEAD and stat the tree."""
+    """{path: byte size} for every regular-file blob at HEAD (symlinks and
+    submodules skipped); empty on an unborn HEAD."""
     r = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-l", "-z", "HEAD"],
                        capture_output=True, text=True, timeout=30)
     if r.returncode != 0:
@@ -103,21 +76,13 @@ def _head_blob_sizes(repo: Path) -> dict:
 
 
 def _gutted(repo: Path) -> list:
-    """Tracked files whose working copy has lost nearly all of its committed
-    content, measured HEAD-vs-disk for EVERY tracked file — deliberately NOT via
-    `git status`, which the incident proved can report clean over destruction.
-    Two shapes, both flagged with NO grace period:
+    """Tracked files that lost nearly all committed content, compared HEAD vs
+    disk (not via `git status`, which can miss it).
 
-      * emptied  — 0 bytes where HEAD had content. This is never a deliberate
-                   edit; it is a failed write or a redirect onto the wrong path.
-      * gutted   — kept <=10% of a >=400-byte file. Rewrites shrink; they don't
-                   evaporate.
+      * emptied  — 0 bytes where HEAD had content.
+      * gutted   — kept <=10% of a >=400-byte file.
 
-    SCOPE BOUNDARY — a tracked file *missing* from the working tree is out of
-    scope: usually a deliberate delete, and the `dirty` check ages it out. NOTE
-    the known residual: a delete that ALSO fools `git status` evades both checks.
-    Accepted for now — a missing file is at least loud the moment anything
-    imports it, where a 0-byte file imports cleanly and lies.
+    Missing files are out of scope; the `dirty` check covers deletes.
     """
     out = []
     heads = _head_blob_sizes(repo)
@@ -146,9 +111,7 @@ def _repos() -> list:
     if (CC / ".git").is_dir():
         repos.append(CC)
     for child in sorted(CC.iterdir()):
-        # A symlinked dir is an import shim onto a real repo (google_connector
-        # -> google-connector/, 2026-09-16), not a second repo: following it
-        # reported every finding twice under two names.
+        # A symlinked dir is a shim onto a real repo, not a second repo.
         if child.is_symlink():
             continue
         if child.is_dir() and (child / ".git").is_dir():
@@ -164,10 +127,7 @@ def sweep_repos(days: int, now: float) -> list:
 
         dirty_paths = _porcelain_paths(repo)
 
-        # Content loss pages IMMEDIATELY — no `days` grace — and is checked
-        # FIRST, before the no-remote early-exit below: a repo with no remote is
-        # the LAST place you want content destruction to go unreported. NOT fed
-        # from dirty_paths: the incident's status output was clean (v2).
+        # Content loss: no grace period, checked before the no-remote exit.
         for path, head, live, why in _gutted(repo):
             problems.append({"repo": name, "kind": "gutted",
                              "detail": f"{path}: {why} "
@@ -292,7 +252,7 @@ def main() -> int:
             return 0
         return 1 if probs else 0
     if not probs:
-        return 0  # silent success — freshness/{{REDACTED}} send no ping
+        return 0  # silent success
     if args.findings_exit0:
         print(f"FINDINGS: {len(probs)} repo(s)/target(s) need attention")
     for p in probs:
@@ -302,9 +262,7 @@ def main() -> int:
 
 
 def _selftest() -> int:
-    """Behaviour, not source shape: build a scratch CC tree and assert what
-    _repos() enumerates. A symlinked dir onto a repo (an import shim) must not
-    appear as a second repo — it doubled every finding on 2026-09-16."""
+    """Check on a scratch tree that _repos() skips a symlinked shim dir."""
     global CC
     import subprocess
     import tempfile

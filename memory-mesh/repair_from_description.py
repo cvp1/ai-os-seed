@@ -1,28 +1,10 @@
 #!/usr/bin/env python3
-"""repair_from_description — heal event/file drift at the SOURCE the file holds.
+"""repair_from_description: re-emit drifted lesson events using the store file's `description:`.
 
-The 2026-07-27 backfill composed event content from the legacy index line, an
-already-truncated derivative, while the lossless `description:` sat in the same
-file. The result is 60-odd rows whose event is a STUMP of their own file
-(projection_drift calls these file-richer), plus a handful the head-strip left
-disagreeing outright (disjoint). This tool re-emits those events with the
-description as content, so the event — which SPEC v4 makes the fact's home —
-finally says what the file always said.
-
-Three refusals, because a repair that quietly degrades is the bug it repairs:
-
-* content that `admission_reject` refuses (over the index ceiling, or trailing
-  off) is REPORTED, never truncated. A rule that does not fit must be rewritten
-  by a human at the source; machine-cutting it is how the stumps happened.
-* the render is simulated before anything is emitted, and a repair that would
-  EVICT an index row or change residency membership is refused as a set. Rows
-  grow when a stump is healed, and growth inside a byte-budgeted tier is
-  zero-sum ([[promotion-into-a-fixed-budget-evicts]]).
-* only LESSON events are superseded. `--supersedes-live-on` is kind-blind and
-  swept two of Craig's pins on 2026-07-31; the supersede list here is built by
-  filtering on kind, and pins are left standing.
-
-Dry-run by default. Stdlib + emit.py; targets /usr/bin/python3.
+Refuses (and reports) content the admission or fact-shape gates reject; simulates
+the render and refuses a set that would evict a row, change residency or breach
+the loader ceiling (--fit keeps the largest safe subset); supersedes only lesson
+events, never pins. Dry run by default.
 
     repair_from_description.py --disjoint          # what the head-strip left
     repair_from_description.py --file-richer       # the legacy stumps
@@ -42,7 +24,7 @@ DESC = re.compile(r"^description:\s*(.*)$", re.M)
 
 
 def file_description(store, subject):
-    """The store file's one-line essence, collapsed — or None."""
+    """Return the store file's `description:` collapsed to one line, or None."""
     f = store / (subject.split("/", 1)[1] + ".md")
     if not f.exists():
         return None
@@ -96,16 +78,12 @@ def main():
         if desc == ev["content"]:
             nochange.append(subj)
             continue
-        # Both funnel refusals, pre-screened so a refusal is REPORTED (this
-        # tool's contract) rather than surfacing as a FAIL line from emit.py
-        # after the batch has started. The fact-shape gate (2026-09-16) does
-        # not exempt on `home`, so neither does this — pointing is not pasting.
+        # Pre-screen emit's refusals so they are reported before the batch starts.
         why = M.admission_reject(desc) or M.fact_refusal(desc)
         if why:
             refused.append((subj, why))
             continue
-        # Kind-filtered: a pin on this subject is Craig's word and outranks a
-        # mechanical repair, so it is never superseded (2026-07-31 incident).
+        # Supersede lesson events only; pins stay.
         ids = [i for i in M.unsuperseded_ids(subj, events)
                if by_id[i]["kind"] == "lesson"]
         todo.append((subj, ev, ids, desc))
@@ -128,11 +106,7 @@ def main():
 
     deferred = []
     if args.fit and todo and not safe(todo):
-        # Cheapest growth first: this is the frontier of what the budget can
-        # absorb without spending residency, and the ORDER is what makes the
-        # result deterministic rather than dependent on the drift set's order.
-        # Not "best" — cheapest. What it leaves behind is named below, because
-        # a silent cap reads as full coverage ([[bound-every-loop-and-output]]).
+        # Greedily keep cheapest growth first (deterministic); report the rest.
         ranked = sorted(todo, key=lambda t: len(t[3]) - len(t[1]["content"]))
         kept = []
         for cand in ranked:

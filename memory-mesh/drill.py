@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""memory-mesh drills — the SPEC's proof obligations, run against a REAL
-three-node mesh built in a temp dir (three clones, git transport, the same
-emit/fold code paths — only the ssh hop is replaced by local paths, which
-exercises identical git mechanics via file:// remotes).
+"""memory-mesh drills — the SPEC's proof obligations, run against a real
+three-node mesh in a temp dir (three clones wired as local-path remotes, the
+same emit/fold code paths).
 
     drill.py            # run all
     drill.py 1 5        # run selected
@@ -18,12 +17,7 @@ from pathlib import Path
 
 CODE = Path(__file__).resolve().parent
 FAILS = []
-# A skipped drill is an UNMET PROOF OBLIGATION, not a pass. Drills 6 and 11 —
-# the two that prove signature authority, i.e. that an agent cannot sign as
-# Craig — return early when signing or ssh-agent is unavailable. They did so
-# silently, and main() then printed "all selected drills pass": on a host with a
-# broken signing environment the suite reported green precisely where its most
-# security-relevant proof had not run. Found by an outside review, 2026-07-31.
+# A skipped drill is an unmet proof obligation, not a pass.
 SKIPS = []
 
 
@@ -56,11 +50,8 @@ class Mesh:
     def __init__(self, root):
         self.root = Path(root)
         self.dirs = {}
-        # The mesh bootstraps from ONE seed clone — a shared root commit is
-        # what makes "unrelated histories" a meaningful alarm (a peer whose
-        # history shares no ancestor is a wiped/recreated repo, and the fold
-        # must REFUSE it, not quietly adopt it). First drill run proved git
-        # enforces this for us: independent inits refused to merge.
+        # Bootstrap from one seed clone: a shared root commit makes
+        # "unrelated histories" a meaningful alarm.
         seed = self.root / "_seed"
         seed.mkdir(parents=True)
         run(["git", "init", "-q", str(seed)])
@@ -68,8 +59,7 @@ class Mesh:
         run(["git", "-C", str(seed), "config", "user.name", "seed"])
         (seed / "events").mkdir()
         (seed / "events" / ".keep").write_text("")
-        # Derived state stays out of history (single-writer invariant —
-        # only events/ is shared truth).
+        # Derived state stays out of history; only events/ is shared.
         (seed / ".gitignore").write_text("views/\nstate/\nview.version\n")
         run(["git", "-C", str(seed), "add", "-A"])
         run(["git", "-C", str(seed), "commit", "-qm", "mesh seed"])
@@ -85,9 +75,8 @@ class Mesh:
                 if p != h:
                     run(["git", "-C", str(self.dirs[h]), "remote", "add", p,
                          str(self.dirs[p])])
-        # Per-drill mesh.toml is not consulted: peers come from remotes; we
-        # monkey-patch via env-driven peers file instead — simplest: fold
-        # discovers peers from `git remote`, drill mode.
+        # Placeholder mesh.toml; in drill mode the fold discovers peers from
+        # `git remote`.
         self.toml = self.root / "mesh-drill.toml"
         self.toml.write_text("\n".join(
             f'[[hosts]]\nname = "{h}"\nssh = "unused-{h}"\nrepo = "unused"\n'
@@ -105,9 +94,8 @@ class Mesh:
         return e
 
     def make_signing_key(self):
-        """Throwaway passphrase-less key + registry — the REAL key is
-        passphrase-protected on purpose (that passphrase is why an agent can
-        never sign), so drills cannot use it."""
+        """Create a throwaway passphrase-less signing key and allowed-signers
+        registry (the real key is passphrase-protected)."""
         key = self.root / "drillkey"
         if key.exists():
             return          # idempotent: more than one drill needs the fixture
@@ -176,10 +164,8 @@ def drill_2(m):
 
 def drill_3(m):
     print("drill 3 — kill test: duplicate emit is deduped by id")
-    # Same host+session+ts+content → same id. Force identical ts via env? The
-    # id is content-derived; emit twice quickly with identical args and check
-    # the fold serves ONE. (If ts differs across the second boundary, ids
-    # differ — retry once on the rare boundary hit.)
+    # Same host+session+ts+content gives the same id; retry once if the two
+    # emits straddle a second boundary.
     for attempt in range(2):
         m.emit("hostc", "--kind", "lesson", "--subject", "lesson/dup-test",
                "--content", "duplicate emission test")
@@ -220,8 +206,7 @@ def drill_5(m):
     print("drill 5 — replay determinism: identical view.version everywhere")
     m.fold_all()
     versions = {h: m.version(h) for h in m.HOSTS}
-    # hosta rewrote history in drill 4, so b and c legitimately differ from a
-    # if run after; on a fresh mesh all three must match.
+    # After drill 4 hosta may legitimately differ; on a fresh mesh all match.
     vals = set(versions.values())
     check("all hosts computed the same folded state", len(vals) == 1,
           str(versions))
@@ -267,14 +252,8 @@ def drill_6(m):
 
 def drill_11(m):
     print("drill 11 — an ssh-agent cannot mint the operator's signature")
-    # The seam this drill exists for: every OTHER drill fixture uses a
-    # passphrase-less throwaway key (see make_signing_key), which can never
-    # exercise the agent path — so for the whole life of the v1.4 "time-boxed
-    # authority" design, mesh_lib signed through ssh-agent while this suite's
-    # own fixture comment asserted "an agent can never sign". The tests could
-    # not see the drift because the fixture removed the property under test.
-    # This drill restores it: a passphrase-protected key, held in a real
-    # agent, must NOT be signable without a human.
+    # A passphrase-protected key held in a real ssh-agent must not be
+    # signable without a human (other drills use a passphrase-less key).
     import shutil
     if not shutil.which("ssh-agent"):
         skip("drill 11 agent-held key needs a human", "no ssh-agent on this host")
@@ -310,15 +289,12 @@ def drill_11(m):
         skip("drill 11 agent-held key needs a human",
              f"could not load the probe key into an agent ({out})")
         return
-    # The control that matters: with the socket stripped, signing must fail
-    # even though the agent is running and holds the key.
+    # With the socket stripped, signing must fail even with the key loaded.
     check("agent is running and holds a passphrase-protected key", True, out)
     check("with SSH_AUTH_SOCK stripped, unattended signing is REFUSED",
           vals.get("stripped") != "0", out)
-    # And mesh_lib must be the thing doing the stripping, not the caller.
-    # Assert against EXECUTABLE code only — docstring and comments here talk
-    # about ssh-agent at length (explaining why it is refused), so a
-    # text-search over the whole function would fail on its own rationale.
+    # mesh_lib itself must strip the socket; inspect executable code only
+    # (its docstring discusses ssh-agent).
     import ast
     tree = ast.parse((CODE / "mesh_lib.py").read_text())
     fn = next(n for n in ast.walk(tree)
@@ -367,20 +343,14 @@ def drill_7(m):
 
 def drill_8(m):
     print("drill 8 — N concurrent writers on ONE host do not lose a commit")
-    # SPEC invariant 1 calls events/<host>.ndjson single-writer, meaning one
-    # writer per HOST. Several agents in one shell are several writers to one
-    # file. Measured 2026-07-28 BEFORE repo_lock(): 5 concurrent emits landed
-    # 5 intact lines but only 3 commits — two lost index.lock. Nothing was lost
-    # only because a later commit happened to sweep the earlier lines up, which
-    # does not cover the last writer. An uncommitted event never folds:
-    # read_all_events() reads committed state only.
+    # Several agents on one host are several writers to one event file; every
+    # event must be committed, since the fold reads committed state only.
     import concurrent.futures as cf
     N = 8
     host = m.HOSTS[0]
 
     def one(i):
-        # check_rc=False: a lost commit must be OBSERVED and asserted on, not
-        # raised as a harness error that hides which writers failed.
+        # check_rc=False so failures are asserted on per writer.
         return run([sys.executable, str(CODE / "emit.py"), "--no-nudge",
                     "--session", f"drill-conc-{i}",
                     "--kind", "lesson", "--subject", f"lesson/conc-{i}",
@@ -406,7 +376,7 @@ def drill_8(m):
             bad += 1
     check("no torn/interleaved line", bad == 0, f"{bad} unparseable")
 
-    # The real assertion: every event is COMMITTED, not merely on disk.
+    # Every event must be committed, not merely on disk.
     committed = m.git(host, "show", f"HEAD:events/{host}.ndjson").stdout
     missing = [i for i in range(N) if f"concurrent writer {i}" not in committed]
     check("every concurrent event reached HEAD", not missing, f"missing {missing}")
@@ -417,13 +387,8 @@ def drill_8(m):
 
 
 def drill_9(m):
-    """The delivery gate: the harness index NEVER publishes over the loader's
+    """The delivery gate: the harness index never publishes over the loader's
     ceilings, and the on-demand tier never goes silent to make room.
-
-    Regression drill for 2026-07-29: the writer bounded a SECTION and then
-    appended an unmetered appendix, shipping 25,973 B against a 24,986 B
-    ceiling every 5 minutes while reporting success. The promise "we bound our
-    output" was asserted by nothing, so it was free to become false.
     """
     print("drill 9 — the harness index cannot be published over the ceiling")
     import mesh_lib as M
@@ -455,10 +420,8 @@ def drill_9(m):
     check("report.ok is never true for a breaching artifact",
           not (rep["ok"] and M.delivery_breach(text)), str(rep))
 
-    # 0. THE DRILL ITSELF must not be able to write the operator's brain.
-    #    store_dir() derives from where the code lives, not from MESH_ROOT, so
-    #    before the sandbox guard a drill fold published its test fixtures as
-    #    the live always-on MEMORY.md until the next real fold repaired it.
+    # 0. The drill itself must not write the live store (store_dir() derives
+    #    from where the code lives, not MESH_ROOT).
     real = M.Path.home() / ".claude/projects"
     before = None
     for p in real.glob("*/memory/MEMORY.md"):
@@ -477,10 +440,8 @@ def drill_9(m):
           sum(M.line_bytes(x) for x in r) <= 4000,
           str(sum(M.line_bytes(x) for x in r)))
 
-    # 6. The alarm discriminates: trimming the SLUG LIST is healthy degradation
-    #    and must stay quiet (it re-trims on every added memory), while dropping
-    #    an always-on INDEX ROW must fire. A pager that cannot fire, and one
-    #    that fires every run, fail the same way.
+    # 6. Trimming the slug list stays quiet; dropping an always-on index row
+    #    must alarm.
     _, quiet = M.fit_harness_memory(head, rows(20), [f"slug-{i}" for i in range(4000)])
     check("slug-list trimming alone does not raise an alarm",
           quiet["rows"] == quiet["rows_total"] and quiet["slugs"] < quiet["slugs_total"],
@@ -493,12 +454,6 @@ def drill_9(m):
 def drill_10(m):
     """Lineage quarantine: an untrusted-lineage fact is never served, cannot
     disturb a served one, and only the operator's key promotes it.
-
-    Regression drill for 2026-07-30: `contains-untrusted` was enforced at write
-    time and IGNORED at fold time for the whole life of the feature. SPEC.md and
-    the write-guard hook both documented a QUARANTINE.md that did not exist, and
-    the first untrusted fact ever written went straight into the always-on index.
-    The gate was prose on the half nobody tested.
     """
     print("drill 10 — untrusted lineage is quarantined, not served")
     m.make_signing_key()
@@ -536,17 +491,15 @@ def drill_10(m):
     check("both untrusted facts ARE in the quarantine set",
           len(f["quar"]) == 2 and any("UNTRUSTED" in q for q in f["quar"])
           and any("FRESH" in q for q in f["quar"]), str(f["quar"]))
-    # The security property: an untrusted claim must not be able to park real
-    # doctrine. If it could, one crafted page would silence any fact by
-    # disagreeing with it — poisoning by denial of service.
+    # An untrusted claim must not be able to park (silence) a trusted fact.
     check("an untrusted claim cannot park the subject it contradicts",
           "lesson/quar-probe" not in f["parked"], str(f["parked"]))
     check("the contradiction still raises an alarm",
           any("QUARANTINED" in a and "disagrees" in a for a in f["alarms"]),
           str(f["alarms"]))
 
-    # The rendered views: held out of INDEX, present in QUARANTINE, and the
-    # promotion command is stated where the operator will read it.
+    # Rendered views: held out of INDEX, present in QUARANTINE with the
+    # promotion command.
     idx = (m.dirs["hosta"] / "views" / "operator" / "INDEX.md").read_text()
     quar_f = m.dirs["hosta"] / "views" / "operator" / "QUARANTINE.md"
     check("QUARANTINE.md is materialized", quar_f.exists(), str(quar_f))
@@ -558,9 +511,7 @@ def drill_10(m):
     check("QUARANTINE.md states the promotion command",
           "--promote" in qtext, qtext[:200])
 
-    # Promotion requires the key. sign.py is the only caller, and in the drill it
-    # runs against a THROWAWAY key precisely because the real one is
-    # passphrase-gated — which is what makes "an agent cannot promote" true.
+    # Promotion requires the signing key (a throwaway key in the drill).
     fresh = next(q for q in f["quar"] if "FRESH" in q).split("|")[0]
     (Path(m.env("hosta")["MESH_STORE_DIR"]) / "quar-fresh.md").write_text(
         "a FRESH untrusted lesson, no rival claim")
@@ -599,15 +550,8 @@ def drill_10(m):
 
 def drill_12(m):
     """The pin overlay: an ALREADY-WRITTEN memory can be made resident without
-    rewriting it, a pin that protects nothing says so, and the naive fix stays
-    proven-broken.
-
-    Built 2026-07-31. Residency is decided by score_for_index, whose first key
-    is `pin` — a flag that could only ever be set at emit. So the hard prompt-
-    only boundaries (no-auto-MFA, never-announce-session-endings) held their
-    always-on slots by ranking luck, and nothing would have announced their
-    eviction. Check 4 is the load-bearing one: it pins the reason this is an
-    overlay and not the obvious re-emit.
+    rewriting it, a pin that protects nothing says so, and the naive re-emit
+    stays proven-broken (check 4).
     """
     print("drill 12 — pin overlay: residency without rewriting the memory")
 
@@ -616,11 +560,8 @@ def drill_12(m):
                    "import json,sys;sys.path.insert(0,%r);import mesh_lib as M;"
                    "e,_=M.read_all_events();f=M.fold_events(e,M.load_registry());"
                    "r=M.ranked_index(f,'operator');"
-                   # The pin FLAG, not the ranking position. Position is a
-                   # confounded instrument here: drill emits land in the same
-                   # second, so ts ties and sorted() falls back to log order —
-                   # the first version of this drill read that artifact as both
-                   # a broken control and a security failure that did not exist.
+                   # Report the pin flag, not ranking position: drill emits
+                   # share a timestamp, so position falls back to log order.
                    "print(json.dumps({'ranked':[x['subject'] for x in r],"
                    "'pinned':sorted({x['subject'] for x in f['live'] "
                    "if x.get('_pin') or x.get('pin')}),"
@@ -633,13 +574,8 @@ def drill_12(m):
                    "'alarms':f['alarms']}))" % str(CODE)], env=m.env(h))
         return json.loads(out.stdout)
 
-    # A boundary lesson written days ago, and a pile of newer lessons that would
-    # out-rank it on recency — the real shape, where the tail is evicted by
-    # arithmetic every fold.
-    # A boundary lesson, and a pile of lessons that out-rank it the way the
-    # audit found real ones do — on CORRECTION HISTORY, i.e. how often a lesson
-    # had to be re-corrected, which is not the same thing as how load-bearing it
-    # is. Recency cannot be the fixture's lever: drill emits share a timestamp.
+    # A boundary lesson, and lessons that out-rank it on correction history
+    # (recency cannot be the lever: drill emits share a timestamp).
     m.emit("hosta", "--kind", "lesson", "--subject", "lesson/pin-boundary",
            "--content", "never read an OTP from the inbox to complete a login")
     for i in range(6):
@@ -664,10 +600,7 @@ def drill_12(m):
     check("the overlay marks exactly the pinned subject",
           after["pinned"] == ["lesson/pin-boundary"], str(after["pinned"]))
 
-    # 2. The memory is UNTOUCHED: same id, same ts, same content. This is the
-    #    whole reason for an overlay — a supersede-and-replace would have
-    #    restamped a 07-28 lesson as learned today, corrupting the one signal
-    #    index_row's date exists to carry.
+    # 2. The memory is untouched: same id, same ts, same content.
     check("the pinned memory keeps its original id",
           after["ids"]["lesson/pin-boundary"] == before["ids"]["lesson/pin-boundary"],
           f'{before["ids"]["lesson/pin-boundary"]} -> {after["ids"]["lesson/pin-boundary"]}')
@@ -680,14 +613,9 @@ def drill_12(m):
           not any("prompt IS the mechanism" in r for r in after["rows"]),
           str([r for r in after["rows"] if "mechanism" in r]))
 
-    # 4. REGRESSION — why this is an overlay and not the obvious "re-emit the
-    #    lesson with --pin". All three re-emit paths are exercised against the
-    #    fold directly, because routing them through emit.py cannot show it:
-    #    event_id() hashes (host, session, ts, content, kind, subject) and
-    #    EXCLUDES pin and supersedes, so a same-second re-emit is deduped on
-    #    append and the check would pass without the fold ever deciding
-    #    anything. The first version of this drill did exactly that and read
-    #    the dedup as proof of collapse-to-earliest.
+    # 4. Why this is an overlay and not "re-emit with --pin". The three
+    #    re-emit paths go straight to the fold: through emit.py a same-second
+    #    re-emit is deduped on append (event_id excludes pin/supersedes).
     reemit = run([sys.executable, "-c", """
 import sys, json; sys.path.insert(0, %r)
 import mesh_lib as M
@@ -724,12 +652,7 @@ print(json.dumps({
     check("re-emit with DIFFERING content PARKS the subject — the boundary "
           "would leave the served index entirely", r["c_parked"], str(r))
 
-    # And the overlay does none of those three things — proven by the id/ts
-    # checks above, which is what makes this the mechanism rather than a taste
-    # preference over the re-emit.
-
-    # 5. A pin naming a subject nobody serves must alarm, not fail silent. A pin
-    #    that protects nothing is indistinguishable from one that works.
+    # 5. A pin naming a subject nobody serves must alarm.
     m.emit("hosta", "--kind", "pin", "--subject", "lesson/pin-typoo",
            "--content", "pin against a subject that does not exist")
     m.fold_all()
@@ -755,9 +678,7 @@ print(json.dumps({
           any(s.startswith("lesson/pin-boundary|") for s in unpinned["live"]),
           str([s for s in unpinned["live"] if "pin-boundary" in s]))
 
-    # 7. An untrusted-lineage pin cannot buy residency. Pinning does not make
-    #    content trusted, and it must not be a side door around the quarantine:
-    #    otherwise one crafted page could hold a permanent always-on slot.
+    # 7. An untrusted-lineage pin cannot buy residency.
     m.emit("hostb", "--kind", "lesson", "--subject", "lesson/pin-untrusted",
            "--content", "a lesson distilled from an ingested page")
     m.emit("hostb", "--kind", "pin", "--subject", "lesson/pin-untrusted",
@@ -767,19 +688,12 @@ print(json.dumps({
     unt = fold_of("hostb")
     check("an untrusted-lineage pin does not take effect",
           "lesson/pin-untrusted" not in unt["pinned"], str(unt["pinned"]))
-    # Exact, not `<=`. A subset assertion passes on the empty set and would also
-    # have passed if pin-boundary were still pinned after its retract — it locks
-    # nothing. Everything pinned in this drill has been retracted or refused by
-    # now, so the expected set is empty and saying so is the whole check.
+    # Exact equality: every pin so far was retracted or refused.
     check("the pin overlay marks exactly the expected set, no more",
           unt["pinned"] == [], str(unt["pinned"]))
 
-    # 8. THE CAP IS A GATE, NOT AN ALARM. Pins are uncontested residency and an
-    #    agent can emit one, so the first version's alarm-only bound left an
-    #    unmetered write path into the file every session loads. Flood the tier
-    #    and assert that excess pins are REFUSED, that the refusal is loud, and
-    #    — the security property — that the flood does not displace a boundary
-    #    that was already resident.
+    # 8. The pin cap is a gate: excess pins are refused loudly, and a flood
+    #    does not displace an incumbent pin.
     m.emit("hosta", "--kind", "lesson", "--subject", "lesson/pin-incumbent",
            "--content", "the boundary that was here first and must stay")
     m.emit("hosta", "--kind", "pin", "--subject", "lesson/pin-incumbent",
@@ -819,10 +733,7 @@ print(json.dumps({
 def drill_13(m):
     """SPEC v4 — residency, projection, and the confidentiality boundary.
 
-    Every check here pairs a REFUSAL with the write that must still succeed:
-    a gate that refuses everything passes a one-sided test while breaking the
-    system, and 'no bad thing happened' is only evidence once the instrument
-    is shown able to let the good thing through.
+    Each refusal is paired with a positive control that must still succeed.
     """
     print("\n== drill 13: SPEC v4 residency + projection ==")
     sys.path.insert(0, str(CODE))
@@ -858,7 +769,7 @@ def drill_13(m):
     check("13.5 POSITIVE CONTROL: a 140-char hook is accepted",
           r.returncode == 0, (r.stdout + r.stderr)[:120])
 
-    # --- A2: a family-audience body must never enter the replicated log
+    # --- a family-audience body must never enter the replicated log
     r = m.emit("hosta", "--kind", "lesson", "--subject", "lesson/privatetest",
                "--content", "c", "--audience", "family", "--body", "SECRETBODY",
                "--hook", "h", check_rc=False)
@@ -869,9 +780,8 @@ def drill_13(m):
     check("13.7 and the secret is byte-level absent from the log",
           "SECRETBODY" not in blob)
 
-    # --- ghost hole. Tested against the DECISION function with a real temp
-    # store: routing this through emit.py would exercise a gate the sandbox
-    # guard has switched off, and pass while proving nothing.
+    # --- ghost hole. Tested against the decision function with a temp store;
+    # through emit.py the sandbox guard switches this gate off.
     gstore = m.root / "store13g"
     gstore.mkdir()
     check("13.8 body-less lesson with no store file is refused (ghost)",
@@ -906,11 +816,8 @@ def drill_13(m):
     check("13.11 grandfathered event with no file IS reconstructed",
           (store / "grand.md").exists()
           and M.RECONSTRUCTED_MARK in (store / "grand.md").read_text())
-    # OVERWRITE is the destructive branch, so it needs authority. An unsigned
-    # event must NOT be able to replace a memory's body: that would make "the
-    # event is canonical" a forge primitive (append a lesson on a victim slug,
-    # supersede the priors, wait for --project). Found by Grok's review of the
-    # implementation, 2026-07-31.
+    # Overwrite needs authority: an unsigned event must not replace a
+    # memory's body.
     (store / "withbody.md").write_text("HAND-WRITTEN, NOT THE EVENT")
     out = M.project_store(fake, store, apply=True)
     check("13.12 UNSIGNED divergent event does NOT overwrite the file",
@@ -918,13 +825,7 @@ def drill_13(m):
     check("13.13 and the refusal ALARMS with both resolutions named",
           any("LEFT ALONE" in a and "adopt" in a for a in out["alarms"]),
           str(out["alarms"])[:160])
-    # 13.13a — the advice must name a command that EXISTS and ACCEPTS this
-    # case. From 2026-07-31 to 2026-08-01 the alarm told the operator to run
-    # `adopt <slug>`, which refuses any slug whose event already carries a
-    # body — i.e. every divergence it was printed for. Four alarms repeated
-    # every fold with a resolution that could not work, while the only other
-    # path (sign the event) would have overwritten a correction with the stale
-    # text it corrected. An alarm whose remedy is untested is a rumour.
+    # 13.13a — every flag the alarm prescribes must exist in `adopt --help`.
     _sp = subprocess
     _mw = CODE / "memory_write.py"
     _advice = next((a for a in out["alarms"] if "LEFT ALONE" in a), "")
@@ -942,8 +843,7 @@ def drill_13(m):
     check("13.13c and the repair is alarmed, not silent",
           any("diverged" in a for a in out["alarms"]))
     withbody["_signed"] = False
-    # A2 at the projector: a family-audience body must never reach the
-    # operator store even if such an event somehow exists in the log.
+    # A family-audience body must never be projected, even if in the log.
     leak = dict(withbody, subject="lesson/leaky", audience="family",
                 body="PRIVATE")
     out = M.project_store({"live": [leak]}, store, apply=True)
@@ -966,10 +866,8 @@ def drill_13(m):
 
 
 def drill_14(m):
-    """The residency gate and the admission gate — both halves, both directions.
-
-    A gate is only evidence when it is shown REFUSING the bad case AND passing
-    the good one; each check here is paired for that reason.
+    """The residency gate and the admission gate, each refusal paired with a
+    passing case.
     """
     print("\n== drill 14: residency gate + admission gate ==")
     sys.path.insert(0, str(CODE))
@@ -1019,9 +917,7 @@ def drill_14(m):
     check("14.15 non-lesson kinds are NOT gated (state/correct flow free)",
           (lambda: (M.make_event("assert", "s/t", "x" * 300, session="s",
                                  home="FLEET.md") and True))() is True)
-    # --- the fact-shape gate, moved to the funnel 2026-09-16: until then only
-    #     memory_write's door ran it, so a body could carry a fact-copy in
-    #     through emit with a home attached (the 2026-09-13 viewer-egress event)
+    # --- the fact-shape gate at the funnel (applies to bodies, home or not)
     check("14.23 a lesson BODY carrying an IP is REFUSED at the funnel, home or not",
           _mk("clean content", home="corral/browser_ui.py",
               body="exits 146.70.174.187 then 146.70.174.180") == "refused")
@@ -1066,10 +962,8 @@ def drill_14(m):
     check("14.21 a missing file is the ghost repair's problem, not drift",
           "lesson/ghost" not in sum(d.values(), []))
 
-    # --- the claim made to the operator 2026-07-31 and then corrected: verify
-    # the CORRECTED version stays true. project_store must never replace an
-    # existing file from a grandfathered (body-less) event — that file may be
-    # the only lossless copy ([[assert-every-promise-not-the-convenient-one]]).
+    # --- project_store must never replace an existing file from a
+    # grandfathered (body-less) event; that file may be the only full copy.
     before = (droot / "richer.md").read_text()
     M.project_store({"live": [{"kind": "lesson", "subject": "lesson/richer",
                                "content": "Richer: Short stump…", "id": "x",
@@ -1079,23 +973,10 @@ def drill_14(m):
 
 
 def drill_15(m):
-    """The DELIVERY seam: what retrieval actually serves.
+    """The delivery seam: nothing the fold retired reaches a turn via retrieve.py.
 
-    Every other drill stops at the fold's verdict. This one runs the production
-    consumer, because the verdict being right is not the property that matters —
-    the property is that nothing the fold retired reaches a turn.
-
-    That gap was not hypothetical. Until 2026-07-31 `retrieve.py` globbed the
-    store and consulted no lifecycle state at all: quarantined untrusted-lineage
-    facts and superseded doctrine both rode in labelled "STANDING RULES", and a
-    live session was served a quarantined subject while reviewing this very
-    system. Every drill passed throughout, because `grep -c retrieve drill.py`
-    was 0 — the suite proved the fold and never proved the delivery.
-
-    Deliberately NOT using Mesh.env: those subprocesses get a temp MESH_ROOT so
-    `harness_store()` returns None and the real store is unreachable by
-    construction. That sandbox guard is correct, and it is also exactly why this
-    seam was untestable. So the store is passed in directly instead.
+    Does not use Mesh.env (whose sandbox guard makes the store unreachable);
+    the store and manifest are passed in directly.
     """
     print("drill 15 — retrieval serves ONLY what the fold still stands behind")
     sys.path.insert(0, str(CODE))
@@ -1104,8 +985,7 @@ def drill_15(m):
     droot = Path(m.root) / "store15"
     droot.mkdir(exist_ok=True)
     body = ("---\nname: {n}\ndescription: {d}\n---\n\n{d}\n")
-    # Same distinctive term in all four, so scoring cannot be what separates
-    # them — only the manifest can. Without this the test could pass by luck.
+    # Same term in all four, so only the manifest can separate them.
     TERM = "zorbfeed"
     for name, desc in [
             ("live-rule", f"{TERM} handling is governed by this live rule"),
@@ -1114,10 +994,8 @@ def drill_15(m):
             ("parked-rule", f"{TERM} handling, contradicted and parked")]:
         (droot / f"{name}.md").write_text(body.format(n=name, d=desc))
 
-    # The manifest the fold would publish: only the live subject survives.
-    # Passed EXPLICITLY: `servable()` must not fall back to the host's real
-    # manifest, or 15.6 would pass for the wrong reason (this query matches
-    # nothing in the real corpus either, so "empty" would prove nothing).
+    # The manifest the fold would publish (only the live subject); passed
+    # explicitly so servable() never falls back to the real one.
     man = droot / "servable.json"
     man.write_text(json.dumps(
         {"version": 1, "view_version": "drill", "generated": "2026-07-31T00:00:00Z",
@@ -1135,23 +1013,18 @@ def drill_15(m):
     check("15.4 a PARKED rule is never served", "parked-rule" not in slugs,
           f"got {slugs}")
 
-    # Held-out docs must not reach the SCORER either: idf is computed over the
-    # corpus, so a doc that is merely dropped at render time still perturbs
-    # ranking and can displace a legitimate hit without ever appearing.
+    # Held-out docs must not reach the scorer either (they would perturb idf).
     docs = R.corpus(droot, R.servable(path=man))
     check("15.5 held-out docs are absent from the scored corpus",
           {d[0] for d in docs} == {"live-rule"}, f"got {[d[0] for d in docs]}")
 
-    # No manifest => the fold's verdict is UNKNOWN. Serving unfiltered is the
-    # defect this drill exists to prevent, so the closed direction is the safe
-    # one here — unlike the module's outer exception handler, which fails open.
+    # No manifest means the fold's verdict is unknown: fail closed.
     man.unlink()
     check("15.6 a MISSING manifest suppresses recall (fails closed)",
           R.retrieve(f"how should I handle {TERM} today", store=droot, k=5,
                      manifest=man) == [])
 
-    # And the suppression must be legible: a silently-empty channel and a
-    # deliberately-withheld one must not look identical.
+    # Suppression must be distinguishable from an empty result.
     check("15.7 suppression is advertised, not silent",
           R.servable(path=man) is None)
 
@@ -1166,8 +1039,7 @@ def main():
         print(f"\nDRILLS FAILED: {len(FAILS)} — " + ", ".join(FAILS))
         return 1
     if SKIPS:
-        # NOT a pass. An unattempted proof is an open obligation, and saying so
-        # is the whole difference between "verified" and "nothing went wrong".
+        # Skipped drills are not a pass.
         print(f"\nDRILLS INCOMPLETE: {len(SKIPS)} proof obligation(s) not "
               "attempted on this host —")
         for s in SKIPS:

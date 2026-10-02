@@ -9,12 +9,7 @@ import learning
 import effectiveness
 
 class FoldWatchPeerLivenessTests(unittest.TestCase):
-    """SEED-080 review finding 6: fold.py wrote bare git SHAs into
-    last-seen.json and fold_watch did `float(ts)` on them. The ValueError fell
-    through a bare `continue`, dropping the peer from consideration entirely --
-    and the function then announced "N peer(s) seen recently" about peers whose
-    age it had never established. A 24h-old file naming an offline peer
-    returned OK."""
+    """fold_watch.check_peers must report peer age correctly, including legacy bare-SHA entries."""
 
     def _check(self, data, max_age=1800):
         import json
@@ -40,7 +35,7 @@ class FoldWatchPeerLivenessTests(unittest.TestCase):
         self.assertIn("peer", detail)
 
     def test_legacy_bare_sha_is_unknown_age_not_ok(self):
-        # The exact pre-fix shape. It must NEVER read as "seen recently".
+        # A legacy bare SHA must never read as "seen recently".
         name, status, detail = self._check({"peer": "8f2c1d9e" * 5})
         self.assertEqual(name, "peers")
         self.assertEqual(status, "UNKNOWN")
@@ -107,12 +102,10 @@ class MeshCoreTests(unittest.TestCase):
             self.assertIn("effectiveness: window=7", rendered)
 
     def test_fact_shape_gate_at_the_funnel(self):
-        """ONE discriminator (mesh_lib.FACT_SHAPES), applied by make_event to
-        every text field of a lesson. Until 2026-09-16 no producer examined
-        the body at all, and emit's content-only copy exempted on --home."""
+        """make_event applies mesh_lib.FACT_SHAPES to every text field of a lesson."""
         def mk(content="a clean rule", **kw):
             return mesh_lib.make_event("lesson", "lesson/t", content, session="s", **kw)
-        # the 2026-09-13 shape exactly: clean content, home set, IPs in the body
+        # clean content, home set, IPs in the body
         with self.assertRaises(ValueError) as cm:
             mk(home="corral/browser_ui.py",
                body="three exits: 146.70.174.187 then 146.70.174.180")
@@ -128,7 +121,7 @@ class MeshCoreTests(unittest.TestCase):
         # the two carve-outs, both per-call arguments
         mk(body="Envoy is at 192.0.2.158 — see FLEET.md", pointer=True)
         mk(body="legacy text with 198.51.100.1 inside", carry_forward=True)
-        # the all-sources CIDR idiom is not a host (observed false positive 2026-09-16)
+        # the all-sources CIDR idiom is not a host
         mk(body="never widen the source gate to 0.0.0.0/0")
         # non-lesson kinds flow free, as before
         mesh_lib.make_event("assert", "endpoint/envoy", "192.0.2.158",
@@ -147,13 +140,7 @@ class MeshCoreTests(unittest.TestCase):
         self.assertIn(why, str(cm.exception))
 
     def test_residency_promote_flags_rows_with_no_body(self):
-        """The promote display must name rows that would publish bodyless.
-
-        Regression for 2026-09-17: a 36-row residency promote went live while
-        every one of those bodies was still unprojected on this host, and the
-        confirmation showed only the row diff — so the operator approved an
-        index pointing at files that did not exist.
-        """
+        """The promote display must name rows that would publish without a body file."""
         import fold
         diff = ("# STAGED always-on residency change\n"
                 "  + lesson/has-body\n"
@@ -176,8 +163,7 @@ if __name__ == "__main__": unittest.main()
 
 
 class SignedPromotionProjectionTests(unittest.TestCase):
-    """2026-09-27: a signed promotion tip (kind `correct`, body_sha256, no body)
-    must project the hash-matching earlier body on a peer — and nothing else."""
+    """A signed promotion tip (body_sha256, no body) projects only the hash-matching earlier body."""
 
     BODY = ("---\nname: x-fact\ndescription: d\nlineage: contains-untrusted\n"
             "metadata:\n  node_type: memory\n---\n\nthe real body\n")
@@ -219,9 +205,8 @@ class SignedPromotionProjectionTests(unittest.TestCase):
             self.assertEqual((store / "x-fact.md").read_text(), "hand-kept\n")
 
     def test_unsigned_tip_never_launders_an_untrusted_body(self):
-        # Before the chain walk this projected nothing; now the body is
-        # recovered, but an unsigned operator-direct tip cannot vouch for an
-        # untrusted carrier — the file lands contains-untrusted (quarantined).
+        # An unsigned tip cannot vouch for an untrusted carrier: the file
+        # lands contains-untrusted.
         out, text = self._run({"_signed": False})
         self.assertEqual(out["created"], ["x-fact"])
         self.assertIn("lineage: contains-untrusted\n", text)
@@ -236,9 +221,8 @@ class SignedPromotionProjectionTests(unittest.TestCase):
             return out, (f.read_text() if f.exists() else None)
 
     def test_bodyless_declaration_over_a_signed_promotion_projects_signed_bytes(self):
-        # The dominant real case (69 subjects): lesson -> signed promote ->
-        # unsigned residency `correct` with no body. The signature two hops
-        # back is still the authority.
+        # lesson -> signed promote -> unsigned bodyless `correct`: the
+        # signature two hops back is still the authority.
         lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
                   "audience": "operator", "body": self.BODY,
                   "lineage": "contains-untrusted"}
@@ -297,7 +281,7 @@ class SignedPromotionProjectionTests(unittest.TestCase):
 
 
 class BodyHashAgreementTests(unittest.TestCase):
-    """2026-09-27: sign.py carries the body it binds; the two must agree."""
+    """An event's body and body_sha256 must agree."""
 
     def _ev(self, body, sha):
         return {"id": "x", "ts": "t", "host": "h", "session": "s", "kind": "correct",
@@ -317,7 +301,7 @@ class BodyHashAgreementTests(unittest.TestCase):
 
 
 class TierOverlayTests(unittest.TestCase):
-    """2026-09-27: the on-demand tier replicates as `tier` events."""
+    """The on-demand tier replicates as `tier` events."""
 
     def _ev(self, i, subj, tier, sup=None, kind="tier"):
         return {"id": i, "ts": "2026-09-27T00:00:0%sZ" % i[-1], "host": "h",
@@ -365,12 +349,7 @@ class TierOverlayTests(unittest.TestCase):
 
 
 class SeedWithoutInfluxTests(unittest.TestCase):
-    """Bug bash 2026-09-27 #15: effectiveness.py and index_growth.py imported
-    `_lib.influx` at module top, and the seed's `_lib/` does not ship it — so
-    `import effectiveness` (line 9 here) killed the whole shipped core suite
-    with an ImportError. Build that tree for real (this package + a `_lib`
-    with no influx.py) and prove both modules import and that their write
-    path says, on stderr, that it skipped — not crash, not silently pass."""
+    """effectiveness and index_growth import and skip loudly when `_lib.influx` is absent."""
 
     DRIVER = r'''
 import sys

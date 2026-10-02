@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
-"""Stop hook: nudge /capture at the end of a SUBSTANTIVE, un-captured session.
+"""Stop hook: nudge /capture at the end of a substantive, un-captured session.
 
-Phase 2 of the write-back loop (see auto-memory `capture-skill`). The behavioral
-norm (offer /capture) is the primary trigger; this hook is the backstop for the
-sessions where real work happened and capture would otherwise be forgotten.
-
-Contract (Claude Code Stop hook): reads a JSON event on stdin
-(session_id, transcript_path, stop_hook_active). To make the model act before
-stopping, print {"decision":"block","reason":...} and exit 0. To allow the stop,
-exit 0 with no output.
-
-Design rules:
-  - FAIL-OPEN: any error → silent exit 0. Never break or nag-on-error.
-  - NEVER LOOP: if stop_hook_active is already set, stay silent.
-  - CONSERVATIVE GATE: only fire when >=3 file mutations happened AND no capture
-    signal is present. Pure-discussion decisions are left to the norm, not this.
-  - OPT-OUT: a marker at ~/.claude/.capture-skip/<session_id> silences it (touch
-    it when Craig says "skip capture this session").
+Reads the Stop event JSON on stdin; prints {"decision":"block",...} to nudge,
+otherwise exits 0 silently. Fires only with >=3 file mutations and no capture
+signal; never loops; fails open. A marker at ~/.claude/.capture-skip/<session_id>
+silences it (also written after firing once).
 """
 import json
 import os
@@ -26,11 +14,7 @@ MUTATION_TOOLS = {"Edit", "Write", "NotebookEdit"}
 SUBSTANTIVE_MUTATIONS = 3
 # Path fragments whose mutation means "capture already happened this session".
 CAPTURE_PATH_HINTS = ("/memory/", "06 logs/decisions", "skills/capture")
-# Capture also happens in two shapes that carry no file_path at all:
-#   - `/capture` typed as a slash command -> a <command-name> USER entry
-#   - memory writes routed through memory_write.py -> a Bash command
-# Missing these is why the nudge fired five times in an already-captured
-# session on 2026-07-26.
+# Capture signals with no file_path: the /capture slash command, memory_write.py via Bash.
 CAPTURE_TEXT_HINTS = ("<command-name>/capture</command-name>",
                       "<command-name>capture</command-name>",
                       "memory_write.py")
@@ -100,8 +84,7 @@ def main():
             "If nothing is genuinely durable, say so in one line and stop "
             "(this won't fire again this session)."
         ).format(mutations)
-        # Make "won't fire again this session" true: stop_hook_active only
-        # covers one stop cycle, so latch on disk before blocking.
+        # Latch on disk: stop_hook_active only covers one stop cycle.
         if session_id:
             try:
                 os.makedirs(os.path.dirname(skip), exist_ok=True)

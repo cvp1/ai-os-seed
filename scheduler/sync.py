@@ -1,27 +1,14 @@
 #!/usr/bin/env python3
-"""Reconcile the real OS scheduler (crontab on Linux, launchd on macOS) to
-match scheduler/manifest.yml — the portable re-target of CC's own
-cron/sync.sh (manifest-as-source-of-truth + drift-check) at plain
-crontab/launchd instead of the {{REDACTED}} gateway (SEED-014).
+"""Reconcile the OS scheduler (crontab on Linux, launchd on macOS) to
+match scheduler/manifest.yml.
 
     scheduler/sync.py            install/reconcile every manifest.yml job (idempotent)
     scheduler/sync.py --check    report drift only, change nothing; exit 1 on drift
 
-Exit 0 = in sync (or successfully reconciled); exit 1 = drift found in
---check mode; exit 2 = usage/manifest error. Never touches a job it doesn't
-own — everything this script writes lives inside a clearly marked managed
-block (crontab) or a `dev.cc-seed.*` plist (launchd), so a recipient's own
-existing crontab entries or launchd agents are left alone.
-
-Two kinds of finding, not one (SEED-075). DRIFT is "the installed scheduler
-no longer matches the manifest." RISK/WARN are supervision findings about the
-manifest's own commands — a scratch path that can vanish, a target that isn't
-on disk, an unfilled placeholder, or a job that doesn't route through
-log_run.py and so would fail invisibly. `--check` reports both and exits 1;
-install refuses on RISK and proceeds with a warning on WARN.
-
-Stdlib + PyYAML (matches build_seed.py's own build-time-only dependency;
-the manifest format, not a shipped runtime dependency of the jobs it runs).
+Exit 0 = in sync or reconciled; 1 = drift/findings in --check mode;
+2 = usage/manifest error. Only touches its own managed crontab block or
+`dev.cc-seed.*` plists. DRIFT = installed scheduler differs from the manifest;
+RISK/WARN = problems in the manifest's commands (install refuses on RISK).
 """
 import argparse
 import platform
@@ -31,9 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# PyYAML is not in a stdlib-only runtime (macOS /usr/bin/python3 has none):
-# fall back to a deliberately narrow parser of the manifest's documented
-# subset. Found and fixed on a real install ({{REDACTED}}), upstreamed 2026-09-26.
+# Without PyYAML, fall back to a narrow parser of the manifest's documented subset.
 try:
     import yaml
 except ModuleNotFoundError:
@@ -41,9 +26,7 @@ except ModuleNotFoundError:
 
 HERE = Path(__file__).resolve().parent
 MANIFEST = HERE / "manifest.yml"
-# The installed --target root: the scheduler ships to <target>/scheduler/,
-# so the root is this file's grandparent. Used by the supervision checks to
-# decide whether a job's command points inside the install or out of it.
+# Install root (<target>/scheduler/ -> <target>); supervision checks test paths against it.
 SEED_ROOT = HERE.parent
 
 CRON_BEGIN = "# BEGIN cc-seed managed jobs (scheduler/sync.py — do not hand-edit this block)"
@@ -60,18 +43,11 @@ WEEKLY_FIELD_RE = re.compile(r"^(\d{1,2}) (\d{1,2}) \* \* (\d)$")
 
 
 class ScheduleError(Exception):
-    """A job's cron expression doesn't translate to this platform's
-    scheduler — refused rather than silently mis-scheduled."""
+    """A job's cron expression doesn't translate to this platform's scheduler."""
 
 
 def _parse_manifest_fallback(text):
-    """Parse the small, documented manifest subset when PyYAML is absent.
-
-    The scheduler manifest intentionally uses only a top-level ``jobs`` list,
-    scalar values, and folded commands.  Keeping this parser deliberately
-    narrow makes the shipped scheduler usable with the stdlib-only runtime
-    while rejecting a format it cannot faithfully interpret.
-    """
+    """Parse the manifest subset (top-level jobs list, scalars, folded commands) without PyYAML; reject anything else."""
     jobs = []
     current = None
     folded_key = None
@@ -110,57 +86,29 @@ def _parse_manifest_fallback(text):
     return {"jobs": jobs}
 
 
-# --- supervision checks (SEED-075) ------------------------------------------
+# --- supervision checks ----------------------------------------------------
 #
-# The drift checks below answer "does the installed scheduler match the
-# manifest?" They already catch a THIRD party rewriting an installed entry —
-# the rewritten line stops matching and reports as content drift.
-#
-# What nothing caught was a poisoned MANIFEST. On 2026-08-09 an agent working
-# in a /tmp sandbox rewrote two of the source fleet's production jobs to point
-# into that sandbox; the sandbox was then deleted and both jobs died for ~27
-# hours. Reconciling a manifest whose commands name a scratch directory
-# installs that fault rather than reporting it, so the manifest is the seam
-# these checks sit at — they fire at install time, while the sandbox still
-# exists, which is *before* the job dies.
-#
-# The worse half of that incident was not the dead job. The rewritten entries
-# also lost their log_run.py wrapper, so failures stopped being RECORDED: the
-# freshness monitor could only ever render STALE, never FAILING, with no exit
-# code and no cause. A supervised job that can be edited to become
-# unsupervised was never supervised — hence UNSUPERVISED is its own finding
-# and not a footnote on the path check.
+# Inspect the manifest's commands before install: scratch paths, missing
+# targets, unfilled placeholders, and jobs not wrapped by log_run.py (whose
+# failures would never be recorded).
 
 BLOCK = "RISK"          # refuse to install; fails --check
 WARN = "WARN"           # report and proceed; fails --check
 
 LOG_RUN_MARKER = "observability/log_run.py"
 PLACEHOLDER_RE = re.compile(r"<[A-Z][A-Z0-9_]*>")
-# Scratch roots a live job must never depend on. Deliberately a small,
-# explicit list: this is the incident's exact shape and it has effectively no
-# false positives, which is what lets it BLOCK rather than merely warn.
+# Scratch roots a live job must never depend on; kept small so it can BLOCK.
 EPHEMERAL_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/",
                    "/private/tmp/", "/private/var/folders/")
-# Interpreters and system tools live outside the target root by design, so
-# they are exempt from the outside-the-root check — but NOT from the
-# does-it-exist check, which still catches a typo'd interpreter.
+# Exempt from the outside-root check, but still existence-checked.
 SYSTEM_PREFIXES = ("/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/",
                    "/opt/", "/etc/")
-# User-level interpreter homes: the seed's own docs put its tools under a
-# venv (~/.venvs/aios-seed — freshness/repo_hygiene need Python 3.10+, which
-# macOS /usr/bin/python3 is not). Warning on the interpreter the seed told the
-# operator to use made every macOS install's --check fail. Same exemption as
-# SYSTEM_PREFIXES: outside the root by design, still existence-checked.
+# User-level interpreter homes (e.g. ~/.venvs/aios-seed); same exemption as SYSTEM_PREFIXES.
 USER_INTERPRETER_PREFIXES = tuple(str(Path.home() / d) + "/" for d in (".venvs", ".local/bin"))
 
 
 def _command_paths(command):
-    """Absolute filesystem paths named anywhere in a command line.
-
-    shlex so a quoted path with spaces survives; a fallback split so a command
-    with unbalanced quotes is still inspected rather than skipped silently —
-    refusing to look is how a malformed entry would slip past every check.
-    """
+    """Absolute filesystem paths named anywhere in a command line (falls back to split on bad quoting)."""
     try:
         tokens = shlex.split(command)
     except ValueError:
@@ -206,12 +154,7 @@ def command_problems(job, root=None):
                           f"no cause"))
 
     for p in _command_paths(command):
-        # Ephemeral AND outside the install. An operator who installs the seed
-        # under /tmp has made that choice for the whole tree, and flagging the
-        # install's own files would make the check unusable there; the fault
-        # this catches is a job reaching OUT of the install into a scratch dir
-        # — which is exactly the shape of the 2026-08-09 incident, where units
-        # under ~/.config pointed into a /tmp sandbox.
+        # Ephemeral AND outside the install (an install under /tmp is allowed).
         if p.startswith(EPHEMERAL_ROOTS) and not _inside(p, root):
             out.append((BLOCK, f"{name}: command targets an ephemeral path "
                                f"{p} — a scratch/sandbox directory outside "
@@ -223,7 +166,7 @@ def command_problems(job, root=None):
         if p.startswith(SYSTEM_PREFIXES + USER_INTERPRETER_PREFIXES) or _inside(p, root):
             continue
         if acked:
-            continue  # the job carries outside_root_ok: <reason> — the operator's call, on the record
+            continue  # job carries outside_root_ok: <reason>
         out.append((WARN, f"{name}: command targets {p}, outside the "
                           f"installed target root {root} (if deliberate, add "
                           f"outside_root_ok: <why> to the job)"))
@@ -337,9 +280,7 @@ def _schedule_to_launchd(schedule, name):
         minute, hour = int(m.group(1)), int(m.group(2))
         return "calendar", {"Minute": minute, "Hour": hour}
 
-    # 'M * * * *' — hourly at a fixed minute. launchd runs a
-    # StartCalendarInterval dict with every field omitted as a wildcard, so a
-    # Minute-only dict fires once an hour at M, exactly like cron.
+    # 'M * * * *': a Minute-only StartCalendarInterval fires hourly at M.
     m = HOURLY_FIELD_RE.match(schedule)
     if m:
         return "calendar", {"Minute": int(m.group(1))}
@@ -354,8 +295,7 @@ def _schedule_to_launchd(schedule, name):
 def _render_plist(job):
     kind, val = _schedule_to_launchd(job["schedule"], job["name"])
     label = f"{LAUNCHD_PREFIX}{job['name']}"
-    # /bin/sh -c wraps the command so the manifest's plain shell command line
-    # (pipes, --job flags, etc.) doesn't need ProgramArguments array-splitting.
+    # /bin/sh -c so the command line needs no ProgramArguments splitting.
     body = (
         f'  <key>Label</key>\n  <string>{label}</string>\n'
         f'  <key>ProgramArguments</key>\n'
@@ -458,12 +398,8 @@ def main():
             print("scheduler/sync.py --check: in sync.")
         return 1 if (drift or problems) else 0
 
-    # Refuse to INSTALL a manifest that names a scratch path, an unfilled
-    # placeholder or a missing target: reconciling it would schedule the fault
-    # instead of reporting it. A missing log_run.py wrapper only warns — the
-    # manifest documents unwrapped jobs as legal ("still runs; just never
-    # appears in runs.db"), so blocking on it would refuse something the
-    # product tells the operator they may do.
+    # Refuse to install on RISK findings; a missing log_run.py wrapper only warns
+    # because unwrapped jobs are documented as legal.
     if blocking:
         for msg in blocking:
             print(f"scheduler/sync.py: {BLOCK}: {msg}", file=sys.stderr)

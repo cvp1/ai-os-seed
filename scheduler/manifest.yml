@@ -1,25 +1,19 @@
-# scheduler/manifest.yml — the scheduler's source of truth (SEED-014).
+# scheduler/manifest.yml — the scheduler's source of truth.
 #
-# One entry per scheduled job. `scheduler/sync.sh` reads this file and
-# reconciles the REAL scheduler (crontab on Linux, launchd on macOS) to
-# match it. Add, edit, or remove an entry here, then run `sync.sh` — never
-# hand-edit crontab or a launchd .plist directly; `sync.sh --check` will
-# catch and report that drift, never silently fix it.
+# One entry per scheduled job. `scheduler/sync.sh` reconciles the real
+# scheduler (crontab on Linux, launchd on macOS) to match this file. Edit
+# here, then run `sync.sh`; never hand-edit crontab or a launchd .plist.
+# `sync.sh --check` reports drift without fixing it.
 #
 # Fields:
-#   name      unique job id — also the --job key log_run.py records into
-#             runs.db and the key freshness.json's "jobs" map looks up.
-#   schedule  a standard 5-field cron expression (minute hour dom month
-#             dow). Translated automatically to the macOS launchd
-#             equivalent; only two shapes translate today — "*/N * * * *"
-#             (every N minutes, N a divisor of 60) and a fixed "M H * * *"
-#             or "M H * * D" (daily/weekly at one time). Anything else is
-#             refused at sync time with a clear message rather than
-#             silently mis-scheduled.
-#   command   the FULL command line, already wrapped through
-#             observability/log_run.py (see the example below) — sync.sh
-#             does not add this wrapping for you. An unwrapped job still
-#             runs; it just never appears in runs.db or freshness.
+#   name      unique job id; also the --job key log_run.py records and the
+#             key freshness.json's "jobs" map looks up.
+#   schedule  5-field cron expression. Only "*/N * * * *" (N divides 60),
+#             "M H * * *" and "M H * * D" translate to launchd; anything
+#             else is refused at sync time.
+#   command   the full command line, already wrapped through
+#             observability/log_run.py (see below). An unwrapped job still
+#             runs but never appears in runs.db or freshness.
 #
 # Example — uncomment and fix SEED_ROOT to try the seed's own demo job:
 #
@@ -30,11 +24,8 @@
 #       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job hello_fleet --
 #       /usr/bin/python3 <SEED_ROOT>/demo/hello_fleet.py
 #
-# A second example — your first REAL (non-demo) job: the weekly derived
-# view (views/weekly.py, SEED-054). Scheduled off the hour/day-boundary on
-# purpose (Monday 05:45, not 06:00) — a habit worth keeping once you have
-# more than one weekly job: everything firing on the dot piles up and any
-# one delay cascades into the next.
+# A second example — the weekly derived view (views/weekly.py). Scheduled
+# off the hour (Monday 05:45) so jobs don't all fire at once.
 #
 # jobs:
 #   - name: weekly_view

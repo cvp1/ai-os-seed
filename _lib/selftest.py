@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Stdlib-only self-test for _lib. No network, no secrets touched.
+"""Self-test for _lib: one logic check per module, and every module must import
+under `python3 -I -S` (stdlib-only). No network, no secrets.
 
-Run: /usr/bin/python3 _lib/selftest.py
-Exits 0 on success, non-zero with the failing checks listed.
-
-Two jobs: (1) each shipped module imports and passes one pure-logic check;
-(2) the load-bearing invariant that _lib is stdlib-only holds — every
-module must import under `python3 -I -S` (no site-packages, no user site).
+Run: /usr/bin/python3 _lib/selftest.py  (non-zero exit lists failed checks)
 """
 import os
 import subprocess

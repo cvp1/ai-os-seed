@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""recall — "what do I know about X?", answered with citations, from any harness.
+"""recall: answer "what do I know about X?" with citations, from any harness.
 
-SEED-080 Step 4b. Recall existed twice: as prose in `recall/SKILL.md` that
-only a skill-loading harness could follow, and as `corral/aios_memory.py`, a
-separate grep over Markdown that never consulted the fold's verdict — so a
-codex or grok pane asking `/recall` got a different answer than a Claude
-session, from a different corpus, with quarantined and superseded subjects
-eligible in one and not the other. Capability belongs in the repo with a
-`python -m`-shaped entry point; the harness gets a thin shim (PRINCIPLES 16).
-
-The memory tier is served through the SAME path the per-turn channel uses —
-`retrieve.corpus` filtered by the fold's `_servable.json` manifest, scored by
-`retrieve.score` — so recall and retrieval can never disagree about what is
-servable. Extra Markdown roots (a notes vault, an install's own notes) are
-searched alongside and cited separately; they carry no lifecycle verdict, so
-they are labelled as what they are.
-
-Read-only. It writes nothing, and it never invents a hit: a source that is
-absent is dropped and named in the Gaps footer, because "no matches" and "I
-did not look there" are different answers.
+The memory tier uses retrieve.corpus/score filtered by the fold's servable
+manifest; extra Markdown roots are searched and cited separately. Read-only;
+absent sources are named in the Gaps footer.
 
     recall.py "wombat telemetry"
     recall.py "where did we leave off" --root ~/notes --limit 5
@@ -37,8 +22,7 @@ sys.path.insert(0, str(HERE))
 import mesh_lib as M  # noqa: E402
 import retrieve as R  # noqa: E402
 
-# Bounds up front (PRINCIPLES 8): a recall that walks an unbounded vault on a
-# busy host is a hang wearing a search's clothes.
+# Bounds on files walked and bytes read per file.
 MAX_FILES_PER_ROOT = 4000
 MAX_FILE_BYTES = 200_000
 SNIPPET = 240
@@ -50,9 +34,7 @@ def _terms(query):
 
 
 def memory_hits(query, limit, store=None, manifest=None):
-    """The mesh tier — same corpus, same verdict, same scorer as the per-turn
-    channel. Returns [] with a stated reason rather than a guess when the fold
-    has published no manifest."""
+    """Return (hits, reason) from the servable memory tier; reason is set when nothing can be served."""
     store = store or M.harness_store() or M.store_dir()
     allow = R.servable(path=manifest)
     if allow is None:
@@ -85,8 +67,7 @@ def _snippet(path, query):
             continue
         body.append(s)
     joined = " ".join(body)
-    # Centre the snippet on the first term that actually occurs, so the reader
-    # sees WHY this was a hit rather than the note's opening pleasantries.
+    # Centre the snippet on the first matching term.
     low = joined.lower()
     at = min((low.find(t) for t in terms if low.find(t) >= 0), default=0)
     start = max(0, at - SNIPPET // 3)
@@ -95,10 +76,7 @@ def _snippet(path, query):
 
 
 def root_hits(query, roots, limit):
-    """Plain keyword scoring over extra Markdown roots (a vault, an install's
-    own notes). These carry NO lifecycle verdict — nothing supersedes or
-    quarantines a vault page — so they are cited by path and labelled by root,
-    never merged into the memory tier."""
+    """Keyword-score Markdown files under extra roots; cited by path and labelled by root."""
     terms = _terms(query)
     out = []
     if not terms:
@@ -136,7 +114,7 @@ def root_hits(query, roots, limit):
 
 
 def recall(query, roots=(), limit=8, with_memory=True):
-    """One pack, quota'd per source so a large vault cannot drown the store."""
+    """Combine memory and root hits, normalized per source, into one result pack."""
     notes = []
     mem, why = ([], None) if not with_memory else memory_hits(query, limit)
     if why:
@@ -145,8 +123,7 @@ def recall(query, roots=(), limit=8, with_memory=True):
     searched = (["memory"] if with_memory else []) + [
         str(Path(r).expanduser()) for r in roots if Path(r).expanduser().is_dir()]
     missing = [str(r) for r in roots if not Path(r).expanduser().is_dir()]
-    # Normalize within each source before interleaving: raw scores are not
-    # comparable across a tf-idf cosine and a term count.
+    # Normalize per source: tf-idf and term-count scores are not comparable.
     pack = []
     for group in (mem, others):
         top = max((h["score"] for h in group), default=0) or 1

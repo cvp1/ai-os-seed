@@ -1,13 +1,8 @@
--- Observability: one row per scheduled/cron run across the CC monorepo.
--- Written by log_run.py (which wraps each cron job), queried by report.py,
--- freshness.py, and the status-site dashboard.
+-- Observability store: one row per scheduled run, written by log_run.py and
+-- read by report.py and freshness.py.
 --
--- Rollback-journal (DELETE) mode, NOT WAL: the status-site container mounts this
--- DB read-only, and a read-only consumer of a WAL database needs to write the
--- -wal/-shm side-files (impossible on a :ro mount). DELETE keeps the main file
--- always-current and readable stand-alone. Writes here are tiny and infrequent
--- (push_solar every 5 min, rest daily/weekly), so losing WAL concurrency costs
--- nothing; the 30s busy_timeout in db.py covers the rare overlap.
+-- DELETE journal mode, not WAL: read-only consumers of a WAL DB must write
+-- side-files, which a read-only mount forbids.
 PRAGMA journal_mode = DELETE;
 PRAGMA synchronous  = FULL;
 
@@ -24,21 +19,15 @@ CREATE TABLE IF NOT EXISTS runs (
   stderr_bytes INTEGER,                  -- size of child stderr
   summary      TEXT,                     -- first non-empty stdout line (truncated)
   error_tail   TEXT,                     -- tail of stderr when the run failed (truncated)
-  -- Cost tracking. Populated when a job emits usage to $CC_OBS_TOKENS_FILE
-  -- (see log_run.py / README "Cost tracking"). NULL for jobs that spend no tokens.
+  -- Token/cost usage, populated from $CC_OBS_TOKENS_FILE; NULL if unused.
   tokens_in    INTEGER,                  -- summed input tokens across the run's LLM calls (incl. cache)
   tokens_out   INTEGER,                  -- summed output tokens
   cost_usd     REAL,                     -- summed USD cost
-  -- Of tokens_in, how many were cache READS (already-cached prompt prefix billed
-  -- at ~1/10 the input rate). cache_read/tokens_in is the cache-hit ratio — a
-  -- falling ratio flags a prompt-caching regression. NULL for pre-column rows.
+  -- Of tokens_in, how many were cache reads (cache_read/tokens_in = hit ratio).
   cache_read_tokens INTEGER,
-  -- Of tokens_in, how many were cache WRITES (creation, billed ~1.25x input).
-  -- With cache_read + cache_creation, tokens_in fully decomposes into
-  -- input/cache-write/cache-read — enough to RE-PRICE a run under any price table.
+  -- Of tokens_in, how many were cache writes; lets a run be re-priced later.
   cache_creation_tokens INTEGER,
-  -- Model id (e.g. claude-sonnet-4-6) the run's LLM calls used, or "mixed".
-  -- Lets pricing.py re-derive cost per model when rates change. NULL = unknown.
+  -- Model id the run's LLM calls used, "mixed", or NULL if unknown.
   model TEXT
 );
 
@@ -46,10 +35,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_started     ON runs(started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_ok          ON runs(ok);
 
--- Per-call audit for the credential-shielding egress proxy (egress-proxy/). One
--- row per proxied request so egress is observable alongside job runs. Metadata
--- only — never the request path/query, never an injected credential. Written
--- best-effort by egress-proxy/proxy.py (a locked/busy DB logs nothing).
+-- One row per request through the egress proxy. Metadata only: never the
+-- path/query or a credential. Written best-effort.
 CREATE TABLE IF NOT EXISTS egress (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   ts            TEXT    NOT NULL,   -- ISO-8601 UTC
@@ -63,11 +50,8 @@ CREATE TABLE IF NOT EXISTS egress (
 CREATE INDEX IF NOT EXISTS idx_egress_ts    ON egress(ts);
 CREATE INDEX IF NOT EXISTS idx_egress_route ON egress(route);
 
--- Per-worker outcome for a parallel-omnigent fleet sweep (egress-proxy/fleet.py).
--- One row per worker per sweep: the coordinator fans N least-privilege jails out
--- concurrently and records each one's result here. Metadata only — never the
--- worker's output, never a secret. Written best-effort (a locked/busy DB logs
--- nothing). Workers of one sweep share a run_id.
+-- One row per worker per parallel sweep; workers of one sweep share a run_id.
+-- Metadata only: never worker output or a secret. Written best-effort.
 CREATE TABLE IF NOT EXISTS fleet (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   ts          TEXT    NOT NULL,   -- ISO-8601 UTC, sweep start

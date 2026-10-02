@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""declare — set a subject's SPEC-v4 residency tier (Craig's declaration).
+"""declare — set a subject's residency tier by emitting a superseding event.
 
-    declare.py --residency state  home/fleet-md ssh-route/{{REDACTED}} ...
-    declare.py --residency doctrine lesson/sms-stop-must-be-advertised ...
+    declare.py --residency state  home/fleet-md ...
     declare.py --residency state --from-file batch.txt --commit
 
-Residency is a human declaration, so this tool only carries one Craig has
-already made; it invents nothing. It emits a fresh event on each subject that
-SUPERSEDES the live ones, carrying the same kind/content plus the tier — so the
-declaration is auditable, replayable, and reversible by another declaration,
-exactly like every other belief change in the mesh.
-
-Lesson subjects carry their store body into the event (SPEC v4: the event is
-the fact), which also satisfies the ghost gate. Pointer subjects
-(`home/...`, `ssh-route/...`) have no store file and carry content only.
-
-Dry-run by default. Stdlib + emit.py; targets /usr/bin/python3.
+Lesson subjects carry their store body into the event. Dry-run by default.
 """
 import argparse
 import subprocess
@@ -59,12 +48,7 @@ def main():
         if not ids:
             skipped.append((subj, "no live event on this subject"))
             continue
-        # The tip is the newest FACT event, never a pin — and pins are never
-        # superseded by a declaration. Found live 2026-08-13: on 5 pinned
-        # subjects ids[-1] was the pin, so this tool re-emitted a PIN as the
-        # fact and superseded the real lesson — the served row vanished and
-        # the fold alarmed "PIN protects nothing". A pin is an overlay on the
-        # subject, not its content; residency work must leave it standing.
+        # The tip is the newest fact event; pins are overlays and stay live.
         fact_ids = [i for i in ids if live[i]["kind"] != "pin"]
         if not fact_ids:
             skipped.append((subj, "only pin events live on this subject"))
@@ -76,18 +60,11 @@ def main():
             f = store / f"{subj.split('/', 1)[1]}.md"
             if f.exists():
                 body = f.read_text(encoding="utf-8")
-                # An oversized body cannot ride the event (MAX_EVENT_BYTES:
-                # "split it or point at a doc"). The store FILE satisfies the
-                # ghost gate by itself, so point at the doc: declare hook-only
-                # and leave the body in its home. Found 2026-08-13: the batch
-                # skipped `local-llm-harness-over-model` (store file > 8 KB).
+                # Oversized bodies stay in the store file; declare hook-only.
                 if len(body.encode("utf-8")) + 1500 > M.MAX_EVENT_BYTES:
                     body = None
         if body is None and subj.startswith("lesson/"):
-            # No local file (a peer — the 69 declarations on {{REDACTED}} on
-            # 2026-09-17 went out bodyless this way and stranded their bytes
-            # one hop back). Re-carry the chain's body so this tip is not the
-            # event that hides it (docs/DESIGN-signed-bodies.md §2.2).
+            # No local store file: re-carry the body from the event chain.
             chained = M.chain_body(tip, events)
             if chained and len(chained.encode("utf-8")) + 1500 <= M.MAX_EVENT_BYTES:
                 body = chained
@@ -96,13 +73,8 @@ def main():
                   f"(supersedes {len(ids)}, body={'yes' if body else 'no'})")
             done.append(subj)
             continue
-        # --carry-forward: a declaration re-emits the tip's content VERBATIM —
-        # exactly the legacy-stump/over-length escape that flag documents.
-        # Without it any subject whose live content predates the admission
-        # gate can never be declared (found 2026-08-13: batch declare skipped
-        # `inferred-writes-propose-only-boundary`, whose content the gate
-        # refused as "trails off mid-sentence" — a stump this tool did not
-        # mint and must not be blocked by).
+        # --carry-forward: re-emit the tip's content verbatim, bypassing the
+        # admission gate for content this tool did not author.
         cmd = [sys.executable, str(HERE / "emit.py"), "--no-nudge",
                "--carry-forward",
                "--kind", tip["kind"], "--subject", subj,
@@ -112,9 +84,7 @@ def main():
                "--lineage", tip.get("lineage", "operator-direct"),
                "--audience", tip.get("audience", "operator"),
                "--supersedes", ",".join(ids)]
-        # `home` is required on an assert (one home per fact) — carry the tip's
-        # forward rather than dropping it, or the re-emit fails validation for
-        # a reason that has nothing to do with residency.
+        # `home` is required on an assert; carry the tip's forward.
         if tip.get("home"):
             cmd += ["--home", tip["home"]]
         if tip.get("polarity") and tip["polarity"] != "n/a":

@@ -2,24 +2,11 @@
 """Close the Monday loop: turn measurable scheduler<->freshness drift into
 staged, hash-bound proposals the human applies via install.py.
 
-friction-miner candidates are ideas — they need a human to design the fix.
-This tool handles the drift class that is fully mechanical: a job
-scheduled in scheduler/manifest.yml with no cadence entry in
-observability/freshness.json is invisible to the freshness monitor, and the
-repair (add an entry with max_age derived from its cron schedule) requires
-no judgment. It writes the repair as a proposal file into
-.cc-seed/staged/proposals/ and STOPS — the covenant from PROPOSALS.md: the
-agent's role ends at the proposal file; only a human running install.py
---apply-proposal(s) moves bytes.
+Finds jobs in scheduler/manifest.yml with no observability/freshness.json
+entry and stages an additive proposal under .cc-seed/staged/proposals/.
+Unscheduled freshness entries are reported, never removed. Silent when clean.
 
-Additive only, on purpose: freshness entries whose job is no longer
-scheduled (e.g. the opt-in demo) are REPORTED, never removed — removal is a
-judgment call, and this tool stages only what needs none.
-
-Edge-trigger: no drift, no output, no files.
-
-Written on a real install ({{REDACTED}}, 2026-09-02) and upstreamed into the seed
-2026-09-27; --root defaults to the install this file sits in.
+    stage_drift.py [--root INSTALL_ROOT]
 """
 import argparse
 import hashlib
@@ -37,9 +24,7 @@ def _sha256(text: str) -> str:
 
 
 def read_manifest_jobs(manifest_text: str):
-    """(name, schedule) pairs from the light manifest structure this seed
-    uses — a `- name:` line followed by a `schedule:` line. Comment lines
-    are skipped, matching install.py's own exact-match discipline."""
+    """(name, schedule) pairs from `- name:` / `schedule:` lines, skipping comments."""
     jobs, name = [], None
     for raw in manifest_text.splitlines():
         line = raw.strip()
@@ -54,11 +39,7 @@ def read_manifest_jobs(manifest_text: str):
 
 
 def max_age_for(schedule: str):
-    """Cadence = real interval plus slack for a missed beat (the convention
-    freshness.json's own _comment states). Only the cron shapes this
-    manifest actually uses are derived; anything else returns None and the
-    job is reported for a human to register by hand — a wrong cadence is
-    worse than a missing one flagged loudly."""
+    """max_age = interval plus slack; None for unsupported cron shapes (left for a human)."""
     fields = schedule.split()
     if len(fields) != 5:
         return None
@@ -119,11 +100,8 @@ def main():
     staged_dir = root / ".cc-seed" / "staged" / "proposals"
     staged_dir.mkdir(parents=True, exist_ok=True)
 
-    # One dated slug per staging day — but a slug already in the receipt's
-    # applied_proposals is burned forever (install.py refuses reuse so a
-    # slug's audit history is never overwritten; found live 2026-09-02 when
-    # the second run of the day collided with the morning's applied slug).
-    # Suffix -2, -3, ... until free in BOTH the receipt and the staged dir.
+    # Dated slug; install.py refuses reuse of an applied slug, so suffix -2, -3, ...
+    # until free in both the receipt and the staged dir.
     applied = set()
     receipt_path = root / ".cc-seed" / "receipt.json"
     if receipt_path.exists():

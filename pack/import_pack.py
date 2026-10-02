@@ -4,42 +4,15 @@
     import_pack.py --pack <path> --inspect
     import_pack.py --pack <path> --verify [--target <ROOT>]
 
-Stdlib only, standalone — this file ships inside cc-seed/dist/ and runs on
-install targets that do NOT have the cc-pack workspace repo. It carries its
-own manifest-reading and SHA256SUMS-checking logic rather than importing
-cc-pack/pack_lib.py; that is a DECLARED DUPLICATE, the same split as
-session_brief.py's parse_brief vs _lib/frontmatter.py (see that file's
-docstring). cc-pack/selftest.py runs shared hostile fixtures against both
-this file and pack_lib.py so a drift between the two is caught rather than
-discovered later.
+Stdlib-only and standalone; mirrors cc-pack/pack_lib.py's verify logic (keep
+the two in sync). <path> is a pack directory or a .tar; a tar is read from its
+member table, never extracted. Both verbs are read-only; the write path is
+`install.py --approve import-pack --from-pack <dir>`, which runs --verify first.
 
-<path> may be a pack DIRECTORY or a .tar file. --inspect never extracts a
-tar to disk (Principle 17: approving a pack has to be possible from what
---inspect shows, without unpacking it first) — it reads pack.json and
-SHA256SUMS straight out of the tar's member table.
-
-Both verbs here are read-only — an agent may run them freely. The write path
-(P3, 2026-08-08) is a human running:
-    install.py --target <ROOT> --approve import-pack --from-pack <pack-dir>
-install.py shells out to THIS file's --verify before moving any byte, then
-applies every part to an out-of-repo delivery root
-($XDG_STATE_HOME/cc-pack/<slug of ROOT>/) — never into --target's own git
-tree. See install.py's own module docstring and cc-pack/README.md Status for
-what P3 does and does not cover (a DIRECTORY pack only; a .tar pack must be
-extracted first).
-
-VERIFY'S INTEGRITY CHECK IS SEPARATE FROM SIGNATURE VERIFICATION (2026-08-09:
-signing landed — pack.json.sig, ssh-keygen -Y, namespace "cc-pack"). --verify
-prints a "signature: <state>" line (one of unsigned/invalid/unknown-signer/
-verification-error/verified) when --allowed-signers is given, but its EXIT
-CODE stays governed by integrity alone, unchanged from before — this file
-CLASSIFIES a signature, it does not enforce a policy on it. install.py's
-caller is what enforces "require verified for replica by default, unsigned
-only via --allow-unsigned" by parsing that line. See pack_lib.py's own
-POSTURE comment for the full why. NO PROBING for --allowed-signers here,
-ever — this file ships to hosts without the cc-pack workspace repo, so a
-fuzzy default location would repeat the exact silent-fork failure class
-mesh_lib.py's own signer-registry probe comment describes.
+--verify's exit code reflects integrity only. With --allowed-signers it also
+prints "signature: <state>" (unsigned/invalid/unknown-signer/
+verification-error/verified) for the caller to enforce. --allowed-signers is
+never guessed.
 """
 import argparse
 import hashlib
@@ -61,19 +34,13 @@ SIG_NAME = "pack.json.sig"
 SUMS_NAME = "SHA256SUMS"
 _RESERVED_TOP = {MANIFEST_NAME, SIG_NAME, SUMS_NAME}
 
-# Unattended-verify DoS bounds — same values as pack_lib.py, kept in sync by
-# hand (declared duplicate).
+# Size bounds; must match pack_lib.py.
 MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 MAX_SUMS_BYTES = 16 * 1024 * 1024
 MAX_MEMBER_BYTES = 256 * 1024 * 1024
 
-# Layer 3 of the audience gate (declared duplicate) — this file has no
-# handler registry to consult (it ships without cc-pack/parts/), so the
-# type -> allowed-audiences mapping is a STATIC TABLE that must be updated
-# by hand every time cc-pack/parts/<type>.py ships a new handler or changes
-# its AUDIENCES. cc-pack/selftest.py's cross-fixture check is what catches
-# a forgotten update — treat a failure there as this table being stale, not
-# as a false alarm.
+# Part type -> allowed audiences. Static copy of cc-pack/parts/*.py AUDIENCES;
+# update by hand when a handler is added or changed.
 PART_AUDIENCES = {
     "briefs": frozenset({"replica"}),
     "doctrine": frozenset({"replica", "shareable"}),
@@ -97,16 +64,13 @@ PART_SCHEMAS = {
     "usage-ledgers": 1,
 }
 
-# \A/\Z, not ^/$ — see pack_lib.py's identical fix, same reasoning
-# (declared duplicate, 2026-08-08 P3 review finding).
+# \A/\Z, not ^/$: `$` would accept a trailing newline.
 _SAFE_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def is_safe_relpath(rel):
-    """Declared duplicate of pack_lib.is_safe_relpath — see that function's
-    docstring for why this check must run BEFORE any path join, never after
-    (Path.__truediv__ silently discards the left side on an absolute right
-    side; confirmed live 2026-08-08, the tri-model review's top finding)."""
+    """True if rel is a safe relative posix path. Check before any path join:
+    joining an absolute path discards the left side."""
     if not rel or not isinstance(rel, str):
         return False
     if "\x00" in rel or "\\" in rel:
@@ -123,12 +87,7 @@ def is_safe_component(name):
 
 
 def _safe_display(s, maxlen=200):
-    """Sanitize an untrusted manifest string before it reaches a terminal.
-    --inspect IS the approval surface (Principle 17) — a hostile tag,
-    filename, or origin value containing control/escape characters could
-    otherwise hide lines, forge a fake 'VERIFIED', or emit terminal escape
-    sequences (2026-08-08 review). Anything with a control character prints
-    as its repr() instead of raw; everything is length-capped."""
+    """Make an untrusted string terminal-safe: length-capped, repr() if it has control chars."""
     s = str(s)
     if len(s) > maxlen:
         s = s[:maxlen] + "…[truncated]"
@@ -248,10 +207,7 @@ class PackSource:
         return sum(p.stat().st_size for p in self.path.rglob("*") if p.is_file())
 
     def list_files(self):
-        """Every physical file present, as pack-relative posix paths, minus
-        the three reserved top-level names. The other half of the bijection
-        verify_pack needs — files present but never declared in SHA256SUMS
-        were invisible to the original version (2026-08-08 review)."""
+        """Every physical file as a pack-relative posix path, excluding reserved top-level names."""
         if self.is_tar:
             out = set()
             prefix = self.root + "/"
@@ -291,7 +247,7 @@ def read_manifest(src):
 
 
 def _expected_member_set(manifest, problems):
-    """Declared duplicate of pack_lib._expected_member_set."""
+    """Pack-relative paths the manifest's parts declare; appends problems found."""
     expected = set()
     parts = manifest.get("parts")
     if not isinstance(parts, list):
@@ -321,9 +277,7 @@ def _expected_member_set(manifest, problems):
 
 
 def verify_pack(src):
-    """Same checks as cc-pack/pack_lib.py's verify_pack — declared duplicate,
-    see module docstring. Returns (ok, problems); reports every mismatch
-    found, not just the first."""
+    """Integrity-check a pack (mirrors pack_lib.verify_pack). Returns (ok, problems)."""
     problems = []
     if not src.exists(MANIFEST_NAME):
         return False, [f"no {MANIFEST_NAME}"]
@@ -429,30 +383,14 @@ def verify_pack(src):
     return (len(problems) == 0), problems
 
 
-# --- signing verify (P6c, 2026-08-09) — DECLARED DUPLICATE of
-# pack_lib.verify_pack_sig, adapted to PackSource so it works uniformly for
-# a directory OR a tar pack (pack_lib's own version only handles a real
-# on-disk directory, since it's the build-side tool). Kept in sync BY HAND;
-# cc-pack/selftest.py's cross-fixture tests run the same hostile fixtures
-# against both this copy and pack_lib.py's and fail loud on drift — same
-# split as verify_pack() above.
-#
-# NO PROBING HERE, EVER (2026-08-09 review, Grok #5/GPT #4 CRITICAL): unlike
-# pack_lib.py's build-side default_allowed_signers_probe() (a dev-checkout
-# convenience), THIS file ships to install targets that never have the
-# cc-pack workspace repo — it must receive --allowed-signers explicitly and
-# refuse to guess a location. Guessing here is exactly the failure mode
-# that already forked mesh fold state fleet-wide once (mesh_lib.py's own
-# "a host that can't find this file treats every signature as unverified"
-# comment) — a fuzzy fallback baked into a file with no fixed install
-# location would make that worse, not safer.
+# --- signature verification (mirrors pack_lib.verify_pack_sig, works on dir or tar).
+# --allowed-signers must be given explicitly; never guess a default location.
 SIG_NAMESPACE = "cc-pack"
 SIG_STATES = ("unsigned", "invalid", "unknown-signer", "verification-error", "verified")
 
 
 def _ssh_keygen_path():
-    """Declared duplicate of pack_lib._ssh_keygen_path — same FIDO/sk- key
-    override cc-handoff/sign_task.py uses on macOS Homebrew installs."""
+    """Prefer Homebrew's ssh-keygen (FIDO/sk- key support on macOS), else PATH."""
     for candidate in ("/opt/homebrew/bin/ssh-keygen",):
         if Path(candidate).exists():
             return candidate
@@ -460,18 +398,11 @@ def _ssh_keygen_path():
 
 
 def verify_pack_sig(src, allowed_signers):
-    """Returns (state, principal_or_None, detail_or_None), state one of
-    SIG_STATES. CLASSIFIES ONLY — install.py's caller enforces policy (see
-    pack_lib.py's POSTURE comment for the full rationale, unchanged here).
+    """Classify pack.json.sig; returns (state, principal_or_None, detail_or_None).
 
-    Same ordered algorithm as pack_lib.verify_pack_sig, live-verified
-    against this host's actual ssh-keygen -Y behavior: check existence of
-    the signature and the registry EXPLICITLY and separately before ever
-    asking ssh-keygen anything (a naive find-principals-first approach
-    cannot distinguish 'unregistered key' from 'missing registry' — both
-    produced byte-identical output in testing), then check-novalidate
-    (crypto validity, independent of trust) before find-principals/verify
-    (trust)."""
+    Checks the signature and registry exist first (ssh-keygen can't tell those
+    cases apart), then check-novalidate, then find-principals + verify. The
+    caller enforces policy."""
     if not src.exists(SIG_NAME):
         return "unsigned", None, "no pack.json.sig present"
     if allowed_signers is None:
@@ -507,14 +438,7 @@ def verify_pack_sig(src, allowed_signers):
             capture_output=True, text=True, timeout=20)
         if r.returncode != 0 or not r.stdout.strip():
             return "unknown-signer", None, "signature key is not present in allowed_signers"
-        # find-principals can return MULTIPLE lines when the same key is
-        # registered under more than one principal/options entry — declared
-        # duplicate of pack_lib.py's identical fix (2026-08-09
-        # post-implementation review, all three models independently: taking
-        # only the first line could reject an otherwise-authorized key whose
-        # first-listed principal carries a narrower namespace restriction
-        # than a later-listed one for the same key). Try each candidate in
-        # order; accept the first that verifies.
+        # A key may map to several principals; accept the first that verifies.
         candidates = [ln for ln in r.stdout.strip().splitlines() if ln.strip()]
         last_detail = None
         for principal in candidates:
@@ -602,11 +526,7 @@ def cmd_verify(args):
             print("FAILED:")
             for p in problems:
                 print(f"  - {_safe_display(p, maxlen=500)}")
-        # Signature CLASSIFICATION only — this does not change the exit
-        # code, which stays governed by integrity (verify_pack) alone, same
-        # as it always has. install.py's caller is what enforces a policy
-        # (require verified for replica by default, etc.) by parsing this
-        # exact "signature: <state>" line; classify here, enforce there.
+        # Classification only; exit code reflects integrity. Callers parse this exact line.
         sig_state, sig_principal, sig_detail = verify_pack_sig(src, args.allowed_signers)
         principal_note = f" principal={_safe_display(sig_principal)}" if sig_principal else ""
         print(f"signature: {sig_state}{principal_note}")

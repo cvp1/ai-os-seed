@@ -1,32 +1,18 @@
 #!/usr/bin/env python3
-"""allowlist — per-job MCP tool allowlists, deny-by-default (Story 031).
+"""allowlist — per-job MCP server allowlists, deny-by-default.
 
-A headless job (`claude -p` cron) should see ONLY the MCP servers its task needs;
-a job that needs no tools gets none. This is the deny-by-default half of the
-supply-chain guard: it shrinks the lethal-trifecta surface (untrusted content +
-secrets + egress) per job, so a poisoned tool a job never loads can't fire.
-
-The MECHANISM lives here; ENFORCEMENT is Story 018's shared headless runner,
-which turns `servers_for(job)` into `--strict-mcp-config` + a scoped
-`--mcp-config`. Until 018 wires it, this is inert, safe data: the map is the
-per-job vet ledger.
-
-Deny-by-default: a job NOT in the map gets `[]` — no MCP servers. Add a job here
-only after deciding, deliberately, exactly which servers its task requires.
+A headless job loads only the MCP servers listed for it; an unlisted job gets
+none. servers_for(job) feeds `--strict-mcp-config` + a scoped `--mcp-config`.
 
 CLI:  allowlist.py <job>       print the allowed servers for a job (one per line)
       allowlist.py --selftest
 """
 import sys
 
-# job name -> the MCP server names it may load. Empty list / absent = no tools.
-# Seeded conservatively; grow it as headless jobs that genuinely need a tool are
-# vetted (the entry IS the vet record). Server names match ~/.claude.json keys.
+# job name -> MCP server names it may load (names match ~/.claude.json keys).
+# Absent or empty = no tools. Each entry is the vet record for that job.
 _ALLOW = {
-    # tool-less jobs (the majority) need no entry — they get [] by default.
-    # examples of the shape, uncomment + verify before relying on them:
-    # "triage":       ["google-connector"],   # read Gmail only
-    # "ranch_what_if": ["ranch-twin"],         # the twin, nothing else
+    # e.g. "triage": ["google-connector"],
 }
 
 
@@ -36,9 +22,7 @@ def servers_for(job):
 
 
 def strict_mcp_args(job, config_path):
-    """Flags a headless runner (Story 018) passes to `claude -p` to pin the MCP
-    surface to exactly this job's allowlist. `--strict-mcp-config` means ONLY the
-    given config's servers load — nothing from user/global scope leaks in."""
+    """`claude -p` flags that pin the MCP surface to exactly this job's allowlist."""
     allowed = servers_for(job)
     if not allowed:
         # a job with no allowlisted servers runs with NO MCP at all

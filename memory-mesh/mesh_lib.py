@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """memory-mesh shared core — config, event IO, identity, registry, fold logic.
 
-Everything deterministic lives here so emit.py / fold.py / replay.py stay thin
-CLIs and the selftest can exercise the real logic. NO model calls anywhere in
-this file, ever (SPEC invariant 5): same logs in, same views out, on every
-host, under any LLM vendor.
+Deterministic only (no model calls): same logs in, same views out on every host.
 
 Layout (events repo, default ~/memory-events — separate from this code repo):
-    events/<host>.ndjson      single-writer append-only log (SPEC invariant 1)
+    events/<host>.ndjson      single-writer append-only log
     _archive/                 rotated segments (still fetched — same repo)
     views/<audience>/         materialized: INDEX.md, CONFLICTS.md, DENIALS.md
     state/                    last-seen refs (FF guard), alert edge state
@@ -32,10 +29,7 @@ MESH_ROOT = Path(os.environ.get("MESH_ROOT", os.path.expanduser("~/memory-events
 
 
 def _host():
-    """Fleet slug, not hostname. Resolution: env → persisted host file →
-    hostname. This box is the cautionary tale: hostname 'imac', fleet slug
-    '{{REDACTED}}' — the identity fork that once cost a nine-day silent
-    heartbeat gap. install.sh persists the slug once; nothing guesses."""
+    """Fleet slug, not hostname: env → persisted host file → hostname."""
     if os.environ.get("MESH_HOST"):
         return os.environ["MESH_HOST"]
     f = Path(os.path.expanduser("~/.config/memory-mesh/host"))
@@ -48,84 +42,43 @@ HOST = _host()
 
 KINDS = {"assert", "correct", "lesson", "denial", "retract",
          "propose-correct", "update-pointer", "pin", "tier"}
-# Index tier of a subject, replicated as an event (2026-09-27, Craig: "do the
-# recommended for 2"). Before this, `_index-exclude.txt` was a per-host file
-# and two hosts' always-on sets diverged by 38 rows with nothing to reconcile
-# them. A `tier` event is an OVERLAY like `pin`: it names a subject, never
-# renders, and a newer tier event supersedes the older one.
+# Index tier of a subject, replicated as an event. A `tier` event is an overlay
+# like `pin`: it names a subject, never renders; the newest one wins.
 TIERS = {"ondemand", "always"}
 POLARITIES = {"exists", "absent", "n/a"}
 LINEAGES = {"operator-direct", "contains-untrusted"}
-# The two promotion classes an untrusted-lineage fact can reach (Craig,
-# 2026-08-12: "there is key signed and verbally signed"). NOT lineages —
-# lineage is where the content CAME FROM and never changes; promotion is
-# whether the operator has vouched for it, and how strongly.
+# Promotion classes for an untrusted-lineage fact. Not lineages: lineage is the
+# source and never changes; promotion is whether the owner vouched for it.
 PROMOTION_KEY = "key-signed"        # cryptographic, agent-impossible by construction
-PROMOTION_VERBAL = "verbally-signed"  # Craig reasoned it through and said yes, in session
+PROMOTION_VERBAL = "verbally-signed"  # owner approved it in session
 MIN_APPROVAL_WORDS = 8              # an attestation shorter than this quotes nothing
 AUDIENCES = {"operator", "family", "shared"}
 CONFIDENCES = {"operator-stated", "verified-live", "inferred"}
 
-# --- residency (SPEC v4) -----------------------------------------------------
-# WHICH TIER a memory occupies, DECLARED at write time by the human at the
-# /improve gate — never derived from a score. This replaces the v3 ranking as
-# the residency authority because the ranking could not carry the load:
-# measured 2026-07-31, `score_for_index`'s correction term fired on 2 of 142
-# rows and its breadth term on ZERO, so 122 of 142 rows shared one sort key and
-# ordering collapsed to `ts`. Stable doctrine was evicted by whatever was
-# written most recently, which no amount of curation could fix.
-#
-#   pinned   — Craig-signed. Hard floor, existing PIN_DELIVERY_SHARE hard cap.
-#   doctrine — behavioural rules that must be resident to fire. Leaves the
-#              always-on tier ONLY by a human event (supersede / demote),
-#              never by ranking.
-#   state    — project/reference/pointer facts and notices. NEVER always-on;
-#              /recall reaches them. A notice is state + `expires`, not a
-#              fourth class (every class is a migration, a conflict rule, a
-#              drill case and a wrong-tag target — Grok round 1).
+# --- residency ---------------------------------------------------------------
+# Which tier a memory occupies, declared at write time — never derived from a score.
+#   pinned   — owner-signed; capped by PIN_DELIVERY_SHARE.
+#   doctrine — behavioural rules that must be resident; leaves always-on only
+#              by a human event (supersede / demote).
+#   state    — project/reference/pointer facts and notices; never always-on.
+#              A notice is state + `expires`.
 RESIDENCIES = {"pinned", "doctrine", "state"}
-# Unset means "not yet declared" — the migration retag has not reached this
-# memory. The renderer treats undeclared rows exactly as v3 did, so the field
-# is inert until Craig declares it (see fit_harness_memory).
+# Unset = not yet declared; the renderer treats it with legacy ranking.
 RESIDENCY_UNSET = None
-# Only an operator-SIGNED event may carry doctrine/pinned across the mesh; an
-# unsigned event from any host caps here. This is what makes cross-host
-# residency conflict impossible by construction rather than by a merge rule:
-# a peer that re-derives a fact and calls it doctrine cannot outrank the
-# signed tip, and two hosts can never hold two residencies for one slug.
+# Unsigned events cap at this residency; only a signed event may carry
+# doctrine/pinned, so peers cannot outrank the signed tip.
 MAX_UNSIGNED_RESIDENCY = "state"
-# The served index line. Craig approves this string at the /improve gate, and
-# it is what every session reads — so it is bounded by REWRITE at the door, not
-# by truncation at render. The old path collected an approved `--hook`, threw
-# it away, and rendered `content[:200]` instead: a machine-cut rule whose
-# qualifier ("...only when X") could land past the cut.
+# Max length of the served index line; enforced by rewrite at the door, never
+# by truncation at render.
 HOOK_MAX_CHARS = 140
-# Which audiences may carry a body IN THE EVENT. Bodies replicate to every peer
-# through the shared git transport, so this is a confidentiality boundary, not
-# a preference (SPEC v4 A2). family/host-private memories emit hook-only.
+# Audiences whose events may carry a body. Bodies replicate to every peer, so
+# this is a confidentiality boundary; other audiences emit hook-only.
 BODY_AUDIENCES = {"operator", "shared"}
-# --- Fact-shape gate (2026-07-27, "one home per fact") -----------------------
-# Infrastructure facts (hosts, routes, endpoints, install state) have exactly
-# one home — FLEET.md, a CLAUDE.md, an OPS.md, the code — and memory POINTS at
-# it. A restated fact in memory is a drift liability: on 2026-07-27 a memory
-# asserting "no SSH key to .21 (Permission denied), verified" landed the same
-# afternoon Craig corrected the opposite in a sibling session.
-#
-# Until 2026-09-16 this lived ONLY in memory_write.py, over only what that door
-# wrote. emit.py carried its own two-pattern copy that looked at `--content`
-# alone and waved anything through on `--home`. So a lesson body carrying four
-# measured exit IPs entered through emit on 2026-09-13 with a home attached,
-# and no sanctioned door could later promote it into its store file, because
-# the stricter door refused text it had never been shown. The discriminator
-# now has ONE home, here, and make_event — the funnel every producer already
-# passes through — applies it to every text field of a lesson. memory_write
-# keeps a mirror and warns the moment it drifts (the HOOK_MAX_CHARS pattern).
-#
-# Surgical on purpose: an IPv4 literal is the strongest fact signal with
-# near-zero overlap with behavioral lessons; per fix-the-discriminator, widen
-# only on an observed miss, never speculatively. `0.0.0.0` is excluded by the
-# same rule in the other direction — it is the "all sources" CIDR idiom, not a
-# host, and it was an observed FALSE positive on 2026-09-16.
+# --- fact-shape gate -----------------------------------------------------------
+# Infrastructure facts (hosts, endpoints, reachability) have one home elsewhere;
+# memory points at it. make_event applies this to every text field of a lesson;
+# memory_write.py keeps a mirror. Widen only on an observed miss. `0.0.0.0` is
+# excluded: it is the "all sources" idiom, not a host.
 FACT_SHAPES = [
     (re.compile(r"\b(?!0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
      "an IPv4 address"),
@@ -152,11 +105,7 @@ def fact_shape(*texts):
 def fact_refusal(content, hook=None, body=None):
     """Why this lesson text may not enter the log, or None if it may.
 
-    The funnel (make_event) RAISES on this. The batch producers that mint
-    lesson content from legacy text — backfill.py, repair_from_description.py —
-    REPORT it in their refused list instead of dying mid-batch. Same
-    discriminator, same words, one home. Pairs with admission_reject(): that
-    one bounds the index line, this one keeps facts out of every field.
+    make_event raises on it; batch producers report it instead.
     """
     hit = fact_shape(content, hook, body)
     if not hit:
@@ -170,73 +119,31 @@ def fact_refusal(content, hook=None, body=None):
 # Audience visibility: which event audiences each view folds in.
 VIEW_INCLUDES = {"operator": {"operator", "shared"}, "family": {"family", "shared"}}
 
-INDEX_BUDGET = 20_480          # bytes, per SPEC — the MESH's own views only.
-                               # NOT an authority over the harness MEMORY.md:
-                               # that artifact answers to the loader's ceilings
-                               # below, measured on the COMPOSED file.
+INDEX_BUDGET = 20_480          # bytes; the mesh's own views only, not MEMORY.md
 
-# --- the consumer's law (the delivery ceilings) ------------------------------
-# The agent harness injects the WHOLE of MEMORY.md into every session and
-# SILENTLY TRUNCATES past EITHER of these (bytes observed live 2026-06-16 at
-# 27.1 KB -> "only part loaded"; the line axis is the harness's documented
-# "first 200 lines OR first 25 KB, whichever comes first").
-#
-# These are the ONLY numbers the delivery gate may use, and they are measured
-# on the fully assembled file — never on a section. A bound that measures a
-# subsection is not Principle 8; it is Principle 8's costume. Reviewed
-# 2026-07-29 (reviews/2026-07-29-grok-index-budget-review.md): the previous
-# design capped the index rows at INDEX_BUDGET and then appended an unmetered
-# on-demand appendix, so the "bounded" writer shipped 25,973 B every 5 minutes
-# and every session lost the tail. 24_986 - 20_480 left 4,506 B of residual for
-# the rest of the file; the appendix alone was 6,078 B. The cushion was already
-# false when the constant was picked, because nobody measured the composition.
+# --- delivery ceilings ----------------------------------------------------------
+# The harness loads MEMORY.md and silently truncates past either ceiling.
+# Measured on the fully assembled file, never on a section.
 LOADER_BYTE_CEILING = 24_986
-# The on-demand slug appendix's OWN budget, inside the ceiling above. Declared
-# 2026-08-01: MEMORY.md's objective is a SMALLER file, not a fixed-size one
-# allocated differently, so bytes freed by re-homing a fact must leave the file
-# instead of being respent on slug names. See
-# `decisions/index-byte-objective-2026-08-01.md`. Raising this is a real
-# decision — it spends always-on context on advertisement, and the measurement
-# in fit_harness_memory says advertisement is not what drives retrieval.
-#
-# 0 since 2026-08-13 (Craig's go, memory-mesh tri-model review): the named
-# appendix is pure advertisement — fit_harness_memory's own measurement (65%
-# of served slugs never named; the estate's most-served slug absent; 17 named
-# slugs never served) plus a full session observed at zero appendix uses. The
-# existence STUB stays (it is the always-on trace that the second tier exists,
-# [[no-data-must-not-render-as-positive-data]]); only the names go. /recall
-# and retrieve.py are unaffected — being named here was never reachability.
+# Byte budget for the on-demand slug appendix. 0 = only the existence stub
+# renders, no slug names; /recall and retrieve.py are unaffected.
 APPENDIX_BYTES = 0
 LOADER_LINE_CEILING = 200
-# Share of the DELIVERED file (not the loader ceiling — the delivered file is
-# what a session actually gets) that the pinned tier may hold. Unsigned pins
-# past this are REFUSED by fold_events, oldest-admitted-first.
-#
-# This is a POLICY limit, not a measured one, and saying otherwise was the
-# thing Grok caught: the first version called 0.5 "a regime boundary rather
-# than a threshold anyone had to measure or invent", which is a tuned constant
-# wearing a costume. There is no measured cliff in loader behaviour at half the
-# file. What IS measured (2026-07-31, 16 pins live): the pinned tier renders
-# 3,047 B, or 12.6% of DELIVERY_BYTES — so the cap sits at ~4x today's usage
-# and refusing at it costs nothing now. The number to revisit is this headroom,
-# and the alarm names the byte figure so drift is visible rather than inferred.
+# Policy cap: share of DELIVERY_BYTES the pinned tier may hold. Unsigned pins
+# past it are refused by fold_events.
 PIN_DELIVERY_SHARE = 0.5
-# What we publish to: headroom below the ceiling, so a memory written mid-session
-# cannot cross the cliff before the next fold re-renders.
+# Publish target, with headroom below the loader ceilings.
 DELIVERY_BYTES = 24_200
 DELIVERY_LINES = 190
 
-MAX_EVENT_BYTES = 8_192        # bound every loop and output (Principle 8)
+MAX_EVENT_BYTES = 8_192
 MAX_LINE_SUSPECT_SKEW = 300    # seconds into the future before ts is SUSPECT
 
 
 # ── config ────────────────────────────────────────────────────────────────────
 def _load_toml(path):
-    """tomllib on 3.11+; a 20-line fallback for older interpreters ({{REDACTED}}
-    ships system Python 3.9). The fallback handles exactly the two shapes our
-    files use — [[array-of-tables]] and flat `key = "value"` — nothing more,
-    ON PURPOSE: if a config grows past that, this parser fails loudly instead
-    of half-reading it."""
+    """Parse TOML: tomllib on 3.11+, else a minimal fallback that handles only
+    [[array-of-tables]] and flat string keys and fails loudly on anything else."""
     text = Path(path).read_text()
     try:
         import tomllib
@@ -266,10 +173,7 @@ def _load_toml(path):
 
 
 def peers():
-    """[(host, ssh_alias)] for every mesh host that isn't us — from mesh.toml.
-    An absent/empty [[hosts]] list is SOLO MODE, not an error: the mesh is
-    fully functional on one machine (no nudges, no --sync) until peers are
-    enrolled (seed recipients start here — cc-seed ENROLL.md)."""
+    """[(host, ssh_alias)] for every other mesh host in mesh.toml; empty = solo mode."""
     cfg = _load_toml(CODE_DIR / "mesh.toml")
     return [(h["name"], h["ssh"]) for h in (cfg.get("hosts") or [])
             if h["name"] != HOST]
@@ -277,36 +181,21 @@ def peers():
 
 # ── event identity & IO ───────────────────────────────────────────────────────
 def event_id(host, session, ts, content, kind="", subject=""):
-    """Content-derived id = idempotent producer (SPEC: Kafka-gap table row 2).
-    A retried append produces the same id; the fold dedups.
+    """Content-derived id, so a retried append yields the same id and the fold dedups.
 
-    v1.2 (Grok post-impl review): kind + subject joined the basis — without
-    them an assert and a retract carrying the same content in the same second
-    collided, and the fold silently ate the second as a 'retry'. Safe change:
-    ids are STORED in events, never recomputed at fold, so existing
-    supersedes references are unaffected; only new events derive this way."""
+    Ids are stored in events, never recomputed at fold."""
     raw = "|".join((host, session, ts, kind, subject, content))
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# B3 (continuous-verification audit, 2026-08-06, Grok-reviewed —
-# memory-mesh/reviews/2026-08-06-grok-b3-plan-review.md): a signed promotion
-# used to bind a short --content description string, not the store file's
-# actual bytes -- so has_signed_promotion() (cc-skills/improve/
-# memory_write.py) could not tell a promoted memory's real content from a
-# later overwrite. This binds the signature to the file.
+# Binds a signed promotion to the store file's bytes (minus its lineage line).
 _FM_LINEAGE_STRIP = re.compile(r"^lineage:[ \t]*.*$\n?", re.M)
 
 
 def content_fingerprint(text):
-    """sha256 of a memory file's text with its `lineage:` frontmatter line
-    stripped — invariant under retag's ONE sanctioned mutation
-    (memory_write.py's set_lineage(), which byte-preserves everything else),
-    sensitive to any other change (body, description, any other frontmatter
-    field). Mirrors memory_write.py's own `_FM_LINEAGE` regex deliberately —
-    same duplicate-with-an-equality-comment posture as HOOK_MAX_CHARS below,
-    because this file predates the mesh being mandatory and callers must
-    keep working with mesh_lib absent."""
+    """sha256 of a memory file's text with its `lineage:` frontmatter line stripped.
+
+    Mirrors memory_write.py's `_FM_LINEAGE` regex; keep them in sync."""
     return hashlib.sha256(_FM_LINEAGE_STRIP.sub("", text).encode()).hexdigest()
 
 
@@ -316,34 +205,14 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
                carry_forward=False, body_sha256=None, verbal_approval=None,
                pointer=False, tier=None):
-    # THE PRODUCER GATE (2026-07-31). Every event path funnels through here, so
-    # this is the one place a stump can be refused before it becomes doctrine —
-    # backfill.py was gated first and the same week five more stumps arrived
-    # through emit (the retag verb re-emitting legacy content), proving that
-    # gating one producer is gating none of them
-    # ([[trust-gates-cover-all-read-channels]], pointed at writes).
-    #
-    # `carry_forward=True` is the retag/supersede carve-out: lineage work must
-    # re-emit an OLD event's content verbatim, and refusing that would make the
-    # 62 legacy stumps un-retaggable — perpetuating an existing stump adds no
-    # new loss, only MINTING one does. A per-call argument on purpose, the
-    # _lib/mail.py authorized=True pattern: no env var a caller can flip once
-    # and forget.
+    # Producer gate: every event path funnels through here.
+    # carry_forward=True lets retag/supersede re-emit old content verbatim.
     if kind == "lesson" and not carry_forward:
         why = admission_reject(content)
         if why:
             raise ValueError(f"make_event refused {subject}: {why}")
-        # The fact-shape gate, at the funnel, over EVERY text field. Until
-        # 2026-09-16 only memory_write's door ran it, and only over what it
-        # wrote; emit.py's own copy checked `content` alone and exempted on
-        # `home`, so a body full of measured IPs entered on 2026-09-13 with a
-        # home pointer attached. A home justifies POINTING at a fact, not
-        # pasting it — there is no exemption here for having one.
-        #
-        # `pointer=True` is the reference-memory carve-out memory_write grants
-        # to `--type reference` (a memory whose whole job is to point at a
-        # fact's home). Carried as a per-call argument like carry_forward: the
-        # door that knows the memory's type asserts it, and nothing else can.
+        # Fact-shape gate over every text field; a `home` grants no exemption.
+        # pointer=True exempts reference memories.
         if not pointer:
             why = fact_refusal(content, hook, body)
             if why:
@@ -358,40 +227,19 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
         ev["pin"] = True
     if tier is not None:
         ev["tier"] = tier
-    # SPEC v4 fields are OMITTED when unset rather than written as null: every
-    # byte here is replicated forever, and an absent key reads the same as a
-    # null to `.get()` while costing nothing. Grandfathered events simply lack
-    # them, which is exactly how `event_carries_body` tells old from new.
+    # Optional fields are omitted when unset, not written as null.
     if residency is not None:
         ev["residency"] = residency
     if hook is not None:
         ev["hook"] = hook
     if body is not None:
         ev["body"] = body
-    # B3 (2026-08-06): the fingerprint of the store file this signature
-    # actually vouches for. A plain dict key like every other optional field
-    # here — covered automatically by canonical_bytes()'s signature scope
-    # (excludes only sig/signer/underscore-prefixed keys), so the hash is
-    # part of what Craig's signature attests to, not a side-channel a
-    # forger could swap after the fact. Grandfathered events (signed before
-    # this existed) simply lack it — has_signed_promotion() treats absence
-    # as "no content binding on record", not as a failure.
+    # Fingerprint of the store file the signature vouches for; covered by
+    # canonical_bytes(). Absent on older events.
     if body_sha256 is not None:
         ev["body_sha256"] = body_sha256
-    # VERBAL APPROVAL (2026-08-12, Craig's ruling — decisions/verbal-approval-
-    # promotes-untrusted-memory-2026-08-12.md). The SECOND promotion class:
-    # "there is key signed and verbally signed", his words. `lineage` keeps
-    # describing the SOURCE (untrusted content is still untrusted; approval
-    # does not launder where it came from), so promotion is an ORTHOGONAL
-    # axis rather than a third lineage value.
-    #
-    # Deliberately NOT a security control, and it must not be described as
-    # one: an agent can pass any string here, exactly as an agent can pass
-    # carry_forward=True above. What it buys is AUDITABILITY — Craig's words
-    # are recorded verbatim, so the question "did you actually approve this?"
-    # has an answer to check. A plain dict key, so canonical_bytes() covers
-    # it: if such an event is ever key-signed later, the signature attests to
-    # the attestation too, and it cannot be swapped after the fact.
+    # Verbal approval: an auditable record of the owner's words, not a
+    # security control (any caller can pass a string). Lineage is unchanged.
     if verbal_approval is not None:
         ev["verbal_approval"] = verbal_approval
     if expires is not None:
@@ -420,10 +268,7 @@ def validate_event(ev):
         p.append(f"bad audience {ev.get('audience')!r}")
     if ev.get("confidence") not in CONFIDENCES:
         p.append(f"bad confidence {ev.get('confidence')!r}")
-    # A verbal approval must actually carry Craig's words. An empty or
-    # placeholder attestation would serve an untrusted-lineage fact while
-    # recording nothing anyone could later check — worse than no attestation,
-    # because it LOOKS like provenance.
+    # A verbal approval must carry quotable words and a timestamp.
     va = ev.get("verbal_approval")
     if va is not None:
         if not isinstance(va, dict):
@@ -436,8 +281,7 @@ def validate_event(ev):
             if not va.get("ts"):
                 p.append("verbal_approval.ts missing — an approval with no "
                          "date cannot be placed in a session")
-    # A body and the hash that binds it must agree (2026-09-27, sign.py now
-    # carries both): a mismatch is a forged or corrupted carrier, never served.
+    # Body and body_sha256 must agree; a mismatch is never served.
     if (ev.get("body") and ev.get("body_sha256")
             and content_fingerprint(ev["body"]) != ev["body_sha256"]):
         p.append("body does not match body_sha256")
@@ -448,55 +292,32 @@ def validate_event(ev):
             p.append("a tier event carries no body")
     if ev.get("residency") is not None and ev.get("residency") not in RESIDENCIES:
         p.append(f"bad residency {ev.get('residency')!r}")
-    # A2 at the schema level: an event carrying a body for a non-fleet audience
-    # is INVALID, not merely refused by one producer. This makes the boundary a
-    # property of the event rather than of the door it came through.
+    # A body for a non-body audience makes the event invalid.
     if ev.get("body") and ev.get("audience") not in BODY_AUDIENCES:
         p.append(f"audience {ev.get('audience')!r} may not carry a body")
     if ev.get("kind") == "assert" and not ev.get("home"):
-        # One home per fact: an assertion without a home is a fact-copy trying
-        # to be born. The home pointer is what keeps memory out of the truth
-        # business (FLEET.md seam rule 1).
+        # One home per fact: an assertion must point at its home.
         p.append("assert requires home (one home per fact)")
     return p
 
 
-# ── SPEC v4: residency, bodies, projection ───────────────────────────────────
+# ── residency, bodies, projection ───────────────────────────────────────────
 def effective_residency(ev):
-    """The residency this event may actually claim (SPEC v4 A1).
+    """The residency this event may actually claim.
 
-    The cap is applied HERE, at read time, and never at write time alone. A
-    write-side check only constrains events this host produced through the
-    sanctioned door; the fold also consumes events fetched from peers, replayed
-    from history, and hand-written by anything with a shell. Enforcing at
-    selection means an unsigned event CANNOT be read as doctrine no matter how
-    it entered the log — the same reasoning that put the data-class gate in
-    `route.py` rather than in each caller.
+    Capped at read time so an unsigned event cannot be read as doctrine
+    however it entered the log.
     """
     r = ev.get("residency")
     if r is None:
         return RESIDENCY_UNSET
     if r == "pinned" and not ev.get("_signed"):
-        # `pinned` is the tier that outranks everything and is capped as a
-        # share of the delivered file. It is Craig's signature or nothing,
-        # local or not.
+        # pinned requires a signature, local or not.
         return MAX_UNSIGNED_RESIDENCY
     if r == "doctrine" and not ev.get("_signed") and ev.get("host") != HOST:
-        # REMOTE unsigned doctrine caps at state — that is what makes
-        # cross-host residency conflict impossible (a peer that re-derives a
-        # fact cannot outrank the local declaration, so two hosts can never
-        # hold two residencies for one slug).
-        #
-        # LOCAL unsigned doctrine is allowed, and the distinction is the whole
-        # trust model rather than a convenience: `host` is bound to the log
-        # filename and single-writer-enforced (read_all_events holds out any
-        # mismatch), so host == HOST means the event came through this host's
-        # own sanctioned door under Craig's /improve approval — exactly the
-        # authority that writes the always-on index today. Requiring a
-        # signature here instead would have demanded ~113 passphrase-gated
-        # signings to declare the existing corpus, which is not a security
-        # control anyone completes; it is a control everyone routes around.
-        # Signing remains what makes a doctrine row TRAVEL to peers.
+        # Remote unsigned doctrine caps at state. Local unsigned doctrine is
+        # allowed: `host` is bound to the single-writer log, so it came through
+        # this host's own door. Signing is what lets doctrine travel to peers.
         return MAX_UNSIGNED_RESIDENCY
     return r
 
@@ -511,14 +332,9 @@ RECONSTRUCTED_MARK = "reconstructed_from_event: true"
 
 
 def ghost_refusal_reason(kind, subject, body, store_root):
-    """Why this emit would create a ghost, or None if it is safe.
+    """Why this emit would create a ghost (index row with no reachable body), or None.
 
-    A pure function ON PURPOSE. The live gate resolves `store_root` through
-    harness_store(), whose sandbox guard returns None inside a drill — so a
-    drill that exercised the gate through emit.py would exercise a gate that
-    is switched off, and pass while proving nothing. Splitting the DECISION
-    from the LOOKUP lets the drill test the decision with a real temp store,
-    and the sandbox guard keep doing its job.
+    Pure (store_root passed in) so drills can test it against a temp store.
     """
     if kind != "lesson" or body or store_root is None:
         return None
@@ -534,15 +350,14 @@ def ghost_refusal_reason(kind, subject, body, store_root):
             f"    memory_write.py write --slug {slug} ... --commit")
 
 
-CHAIN_WALK_MAX_HOPS = 64   # bound every loop (Principle 8); a cycle cannot hang the fold
+CHAIN_WALK_MAX_HOPS = 64   # bounds the walk so a cycle cannot hang the fold
 
 
 def _stamp(body, lineage, klass=None, words=None):
-    """Render the projection stamps from the governing verdict, exactly as
-    memory_write.set_lineage + set_promotion write them on the promoting host
-    (`lineage:`, then `promotion:` and, for a verbal promotion, `approved:`).
-    The body's own stamp lines are replaced, never trusted: they are what one
-    host wrote, not part of the fact."""
+    """Rewrite a body's `lineage:`/`promotion:`/`approved:` stamps from the verdict.
+
+    Matches memory_write.set_lineage + set_promotion; the body's own stamps are
+    replaced, never trusted."""
     if not _FM_LINEAGE_STRIP.search(body):
         return body
     stamp = f"lineage: {lineage}\n"
@@ -573,26 +388,15 @@ def _chain(tip, by_id):
 
 
 def chain_body(tip, events):
-    """The body a bodyless lesson tip stands for, or None (2026-09-27).
+    """The stamped body a bodyless lesson tip stands for, or None.
 
-    A `correct` that re-declares residency, or a signed promotion, supersedes
-    a lesson without re-carrying its body — sign.py bound the bytes by hash
-    and declare.py (69 events on {{REDACTED}}, 2026-09-17) carried only content. So
-    a peer projected nothing for 72 + 1 subjects whose bytes were in the log
-    all along, one step back. deee167 looked at a signed TIP only; this walks
-    the chain (docs/DESIGN-signed-bodies.md §2.1):
-
-      1. a VERIFIED signed event in the chain with `body_sha256` is the
-         authority; the bytes come from any event on the subject whose body
-         fingerprints to that hash — the carrier only supplies bytes, so an
-         unsigned carrier cannot change what gets written. No carrier: None
-         (never a stub for a signed subject).
-      2. no signed ancestor: the nearest ancestor carrying a body, stamped
-         with the LEAST trusted lineage of tip and carrier — a trusted tip
-         must not launder an untrusted body (§2.5).
-
-    Only operator/shared audiences may supply a body (A2). Returns the
-    stamped text, or None.
+    Walks the supersede chain:
+      1. A vouching event (verified signature or verbal approval) with
+         `body_sha256` is the authority; bytes come from any event on the
+         subject whose body matches that hash. No match: None.
+      2. Otherwise the nearest ancestor carrying a body, stamped with the
+         least trusted lineage of tip and carrier.
+    Only BODY_AUDIENCES may supply a body.
     """
     by_id = {e["id"]: e for e in (events or ())}
     chain = [tip] + _chain(tip, by_id)
@@ -602,8 +406,7 @@ def chain_body(tip, events):
         return (e.get("subject") == subject and event_carries_body(e)
                 and e.get("audience") in BODY_AUDIENCES)
 
-    # The nearest vouching event: a verified signature (key) or a verbal
-    # approval — the two promotion routes the fold serves (fold_events).
+    # Nearest vouching event: verified signature or verbal approval.
     authority = next((e for e in chain if e.get("body_sha256")
                       and (e.get("_signed") or e.get("verbal_approval"))), None)
     if authority is not None:
@@ -627,36 +430,18 @@ def chain_body(tip, events):
     return _stamp(carrier["body"], "craig-direct" if trusted else "contains-untrusted")
 
 
-# The tip-only predecessor (deee167); kept as a name for callers and tests.
+# Alias kept for callers and tests.
 signed_promotion_body = chain_body
 
 
 def project_store(fold, store, apply=False, events=None):
-    """Materialise/repair store files from the event log (SPEC v4 A1/A3).
+    """Materialise/repair store files from the event log's live tips.
 
-    The tip of a subject's supersede lineage is the fact's one home; store files
-    are disposable projections of it. `fold['live']` already IS the tip set —
-    superseded events are resolved out by fold_events — so tip selection here is
-    a filter, not a second resolution pass that could disagree with the fold.
-
-    Three cases, and the asymmetry between them is the whole safety argument:
-
-    * tip carries a `body`  -> CREATE or OVERWRITE. The event is authoritative,
-      so a divergent file is a hand-edit or tamper: replace it and alarm. The
-      content is not lost — it is in git, and the event says what it should be.
-    * tip is GRANDFATHERED (pre-v4, no body) and NO file exists -> CREATE a
-      stub from the event's `content`, marked reconstructed. This is the ghost
-      repair: measured 2026-07-31, 11 index rows had no file and /recall
-      returned nothing for an exact-title query, while their events carried
-      298-915 chars of real content. Recovering that beats serving a row whose
-      body cannot be reached.
-    * tip is grandfathered and a file EXISTS -> LEAVE IT ALONE. Overwriting a
-      full body with a 200-char event content would destroy the very content
-      the projection exists to protect (Grok round 3, A3).
-
-    The fold NEVER deletes a store file. A file with no event at all is an
-    inverse ghost: reported for `memory_write adopt`, never removed — deletion
-    on a detection heuristic is how a bug becomes data loss.
+    * tip carries a body -> create, or overwrite (only from a signed tip or
+      over a reconstruction stub; otherwise alarm and leave it).
+    * tip has no body and no file exists -> create a stub from `content`.
+    * tip has no body and a file exists -> leave it alone.
+    Never deletes a store file; files with no event are reported as inverse ghosts.
     """
     if store is None:
         return {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
@@ -672,32 +457,19 @@ def project_store(fold, store, apply=False, events=None):
                 continue
         elif e["kind"] != "lesson":
             continue
-        # A body may only be projected for audiences allowed to carry one; a
-        # family-audience event has no body by construction (A2), so this loop
-        # cannot write private content into the operator store.
         slug = e["subject"].split("/", 1)[1]
-        # Path safety: a subject is a controlled-vocabulary slug, but this is
-        # the one place a subject string becomes a FILESYSTEM PATH, and the
-        # registry is not a security boundary. `lesson/../../x` must never
-        # escape the store.
+        # Path safety: the slug becomes a filename and must not escape the store.
         if "/" in slug or "\\" in slug or slug in ("", ".", ".."):
             out["alarms"].append(f"refusing to project unsafe slug {slug!r}")
             continue
         seen.add(slug)
         f = store / f"{slug}.md"
         if promoted is not None and f.exists():
-            # CREATE-ONLY for chain-walked bodies: the signing host stamps
-            # post-promotion frontmatter the carrier event never had, so a
-            # "repair" here would strip it (measured on {{REDACTED}},
-            # 2026-09-27). The missing file is the whole defect being fixed.
+            # Chain-walked bodies are create-only: a repair would strip the
+            # signing host's post-promotion frontmatter.
             continue
         if promoted is not None or event_carries_body(e):
-            # A2 enforced AT THE PROJECTOR, not only at the producer. emit.py
-            # refuses a family-audience body, but the projector consumes events
-            # from peers, replay and anything with a shell — so a hand-crafted
-            # family event carrying a body would otherwise land in the
-            # OPERATOR's store. A confidentiality boundary checked on one side
-            # of the wire is not a boundary.
+            # Audience boundary re-checked here: events may arrive from peers or replay.
             if e.get("audience") not in BODY_AUDIENCES:
                 out["alarms"].append(
                     f"refusing to project a body from audience "
@@ -710,15 +482,8 @@ def project_store(fold, store, apply=False, events=None):
                     f.write_text(want, encoding="utf-8")
                 out["created"].append(slug)
             elif f.read_text(encoding="utf-8") != want:
-                # OVERWRITE IS THE DESTRUCTIVE BRANCH, so it is the one that
-                # needs authority. An unsigned event can be appended by any
-                # peer, any replay, anything with a shell; letting it silently
-                # replace a memory's body would make "the event is canonical"
-                # into a forge primitive — write a lesson event on a victim
-                # slug, supersede the prior ids, and the next --project
-                # rewrites the store. So: repair only from a SIGNED tip, or
-                # when the file on disk is a fold-written reconstruction stub
-                # (upgrading a stub to a real body loses nothing).
+                # Overwrite only from a signed tip or over a reconstruction
+                # stub; an unsigned event must not be able to rewrite a body.
                 stub = RECONSTRUCTED_MARK in f.read_text(encoding="utf-8")
                 if e.get("_signed") or stub:
                     if apply:
@@ -760,12 +525,7 @@ def project_store(fold, store, apply=False, events=None):
         if slug in seen or slug.startswith("_") or f.name in ("MEMORY.md", "QUARANTINE.md"):
             continue
         out["inverse_ghosts"].append(slug)
-    # Inverse ghosts are NOT alarmed while the v4 backfill is still running:
-    # 239 of them is the expected pre-migration state (the whole store predates
-    # the mesh), and an alarm that fires on every fold for a known condition
-    # trains the operator to ignore the channel — which is the same failure as
-    # silently shedding, aimed at attention instead of data. After the backfill
-    # marker exists, a file with no event is a real defect and alarms.
+    # Inverse ghosts alarm only once the backfill-complete marker exists.
     if out["inverse_ghosts"] and (MESH_ROOT / "state" / "v4-backfill-complete").exists():
         out["alarms"].append(
             f"{len(out['inverse_ghosts'])} store file(s) have no event — the "
@@ -776,39 +536,19 @@ def project_store(fold, store, apply=False, events=None):
 
 
 def event_carries_body(ev):
-    """True for a SPEC-v4 lesson event that can drive projection.
-
-    Grandfathered pre-v4 events carry no `body`, and projecting from one would
-    materialise an EMPTY store file over a good one — destroying the very
-    content the projection exists to protect (Grok round 3, A3). Absence of the
-    key is the whole test: v4 events always set it, old ones never can.
-    """
+    """True when the event carries a body and so can drive projection."""
     return bool(ev.get("body"))
 
 
-# ── signatures (v1.3) ────────────────────────────────────────────────────────
-# Reuses the fleet's existing human-signature machinery: ssh-keygen -Y over
-# Ed25519 keys in ~/.key/signing/, verified against cc-handoff/allowed_signers
-# — ONE signer registry for the fleet (one home per fact applies to keys too).
-#
-# The namespace is 'memory-mesh', deliberately NOT cc-handoff's: a signature
-# over a signed task file must never verify as an event signature. Different
-# namespace = different signed blob = no cross-protocol replay.
+# ── signatures ───────────────────────────────────────────────────────────────
+# ssh-keygen -Y over Ed25519 keys, verified against cc-handoff/allowed_signers.
+# A distinct namespace prevents cross-protocol replay of task signatures.
 SIG_NAMESPACE = "memory-mesh"
-# Env overrides exist for DRILLS ONLY: the real key is passphrase-protected in
-# the fscrypt vault, which is the actual gate — an agent cannot sign, by
-# construction, because it cannot supply Craig's passphrase. Drills need a
-# throwaway keypair to exercise the verify path end-to-end.
+# Env overrides below exist for drills only (throwaway keypairs).
 def _signers_file():
-    """One signer registry for the fleet, but its checkout path differs by
-    host ({{REDACTED}}/{{REDACTED}}: ~/{{REDACTED}}/cc-handoff; {{REDACTED}} since the
-    2026-09-26 anchor cutover: <install>/fleet/cc-handoff).
-    A host that can't find it treats every signature as unverified — which
-    silently forked view.version fleet-wide (found 2026-07-28), and again on
-    2026-09-27: {{REDACTED}}'s cutover moved cc-handoff under fleet/, 84 signed
-    events read as unsigned, and signed always-on rows fell out of residency.
-    Probe root-relative homes first (no host literal to scrub), then the
-    legacy ones; env override wins (drills)."""
+    """Locate allowed_signers: env override, then root-relative, then legacy paths.
+
+    If not found, every signature reads as unverified."""
     if os.environ.get("MESH_ALLOWED_SIGNERS"):
         return Path(os.environ["MESH_ALLOWED_SIGNERS"])
     root = Path(__file__).resolve().parent.parent
@@ -824,26 +564,13 @@ def _signers_file():
 
 
 ALLOWED_SIGNERS = _signers_file()
-# Signer identity + key are per-operator (seed recipients set MESH_SIGNER /
-# MESH_SIGNING_KEY; the id must match a line in allowed_signers).
+# Signer identity + key are per-operator; the id must match allowed_signers.
 SIGNER = os.environ.get("MESH_SIGNER", "craig@fleet")
 
 
 def _signing_key():
-    """Phase 1.1 of decisions/sk-migration-paused-at-grace-2026-07-31.md's
-    resume plan (cc-handoff/reviews/2026-07-31-sk-cutover-PLAN.md), done
-    2026-09-04 after a live failure: a Corral click opened a real signing
-    terminal on {{REDACTED}} and it crashed looking for `craig2_ed25519`, which
-    was never copied there (by design -- the pause explicitly did NOT
-    revoke craig2, but also never finished cutting memory-mesh over to the
-    token the way cc-handoff's sign_task.py already was). Same principal
-    (`craig@fleet`) either way -- allowed_signers already carries both
-    pubkeys, so this changes which key a NEW signature uses, never which
-    ones verify. MESH_SIGNING_KEY stays an absolute override (drills set it
-    unconditionally); otherwise probe the sk (YubiKey-resident) handle
-    first, same as _signers_file()'s own probe style, falling back to the
-    file key only while it exists -- exactly the plan's own wording, not a
-    new decision."""
+    """Signing key path: MESH_SIGNING_KEY override, else the hardware (sk) key,
+    else the file key. Affects only which key signs, not which keys verify."""
     override = os.environ.get("MESH_SIGNING_KEY")
     if override:
         return Path(override)
@@ -855,19 +582,13 @@ def _signing_key():
 
 
 SIGNING_KEYS = {SIGNER: _signing_key()}
-# Apple's /usr/bin/ssh-keygen has no FIDO provider; an sk- (YubiKey-resident)
-# key cannot sign through it ("no FIDO SecurityKeyProvider"). Same probe
-# sign_task.py already uses for the same reason -- prefer Homebrew's build
-# when present, harmless on Linux where it never exists and the system
-# binary handles a plain file key fine either way.
+# Prefer Homebrew's ssh-keygen: Apple's build has no FIDO provider for sk- keys.
 SSH_KEYGEN = next((p for p in ("/opt/homebrew/bin/ssh-keygen",)
                    if Path(p).exists()), "ssh-keygen")
 
 
 def canonical_bytes(ev):
-    """The exact bytes a signature covers: the event minus its own signature
-    and minus fold-local underscore fields, keys sorted. Deterministic across
-    hosts and Python versions — a signature made here verifies everywhere."""
+    """Bytes a signature covers: the event minus sig/signer and underscore fields, keys sorted."""
     payload = {k: v for k, v in ev.items()
                if k not in ("sig", "signer") and not k.startswith("_")}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"),
@@ -875,9 +596,7 @@ def canonical_bytes(ev):
 
 
 def verify_sig(ev, allowed=None):
-    """True iff ev carries a signature that verifies for its claimed signer
-    against the registry. Degrades toward safety: a malformed/absent registry
-    or a broken ssh-keygen yields False (unsigned), never a free pass."""
+    """True iff ev's signature verifies for its signer; any failure yields False."""
     allowed = Path(allowed or ALLOWED_SIGNERS)
     if not ev.get("sig") or not ev.get("signer") or not allowed.exists():
         return False
@@ -903,30 +622,8 @@ def verify_sig(ev, allowed=None):
 def sign_event(ev, signer="craig@fleet"):
     """Attach a detached SSH signature over canonical_bytes(ev).
 
-    THE PASSPHRASE IS THE SIGNATURE (v1.5, 2026-07-30). A signature here means
-    "Craig personally attests", and SPEC §3 spends that meaning immediately:
-    a signed event outranks any unsigned one, and "an agent cannot promote"
-    is stated as a property of this key being passphrase-gated. So the
-    passphrase prompt is not friction in front of the mechanism — it IS the
-    mechanism. Nothing an agent can do unattended may produce a signature.
-
-    v1.4 delegated this to ssh-agent (`ssh-add -t 8h`) on the premise that
-    per-event passphrases made signing so painful nothing would ever be
-    signed. That premise was never true of the built system: `sign_event` has
-    exactly ONE caller (sign.py, the operator's own tool), no scheduled job
-    invokes it, and in the mesh's whole life 3 of 157 events are signed — all
-    operator `correct` acts. There was no frequency problem to solve. What
-    the delegation did buy was real: while the agent held the key, ANY local
-    process could mint Craig's authority — in the mesh (forging operator
-    truth, the ASI06 memory-poisoning path this design exists to close) and,
-    because cc-handoff's sign_task.py points at the same key file, on the
-    fleet bus, where it silently authorized a production deploy on 2026-07-30
-    with no human in the loop.
-
-    So: key file only. No agent, ever. If there is no terminal to prompt at,
-    signing FAILS — loudly and by design. An unsigned event is a known,
-    handled state (it simply carries no operator authority); a signature
-    produced without Craig is an unhandled one.
+    Interactive by design: signs from the key file only, never via ssh-agent,
+    so it fails without a human at the terminal (passphrase or PIN+touch).
     """
     key = SIGNING_KEYS.get(signer)
     if key is None:
@@ -934,29 +631,10 @@ def sign_event(ev, signer="craig@fleet"):
     if not key.exists():
         raise RuntimeError(f"no signing material for {signer}: {key} absent — "
                            f"is ~/.key unlocked? (keyvault/unlock.sh)")
-    # SSH_AUTH_SOCK is stripped, not merely unused: ssh-keygen -Y sign will
-    # reach for a loaded agent identity on its own when the private key can't
-    # be read non-interactively. Leaving the socket visible would leave the
-    # agent path open by accident — the exact way v1.4's delegation outlived
-    # the decision to end it.
+    # Strip SSH_AUTH_SOCK so ssh-keygen cannot fall back to an agent identity.
     env = {k: v for k, v in os.environ.items() if k != "SSH_AUTH_SOCK"}
-    # Sign a real TEMP FILE, never stdin ("-"). Found live 2026-09-04, the
-    # first attempt to sign a mesh promotion with the sk- (YubiKey-resident)
-    # key: `ssh-keygen -Y sign -f key -n ns -` with the payload piped via
-    # subprocess.run(input=...) failed with "ssh_askpass: exec(...): No such
-    # file or directory" the moment it needed the hardware touch
-    # confirmation. Signing FROM STDIN reads as a scripted/non-interactive
-    # call to ssh-keygen, which then prefers SSH_ASKPASS (a GUI helper
-    # Homebrew's openssh does not ship) over the real controlling terminal
-    # for that prompt — even though a human (Craig) was sitting right there.
-    # sign_task.py (the fleet-task/charter lane) has signed with this exact
-    # key for weeks by passing a real FILE PATH instead, which ssh-keygen
-    # treats as ordinary interactive use and prompts through the terminal
-    # normally. This mirrors that, byte for byte: temp file in, `<file>.sig`
-    # out, both removed after. The old file-key path (craig2_ed25519, no
-    # touch, only a passphrase) worked via stdin because it never needed
-    # this branch of ssh-keygen's logic — untouched by this change either
-    # way, since the same call now goes through a file for both key types.
+    # Sign a temp file, not stdin: from stdin ssh-keygen uses SSH_ASKPASS
+    # instead of the terminal for the sk- key's touch prompt.
     tmp = tempfile.NamedTemporaryFile(delete=False)
     tmp_path = Path(tmp.name)
     try:
@@ -969,10 +647,10 @@ def sign_event(ev, signer="craig@fleet"):
         if r.returncode != 0:
             raise RuntimeError(
                 "signing failed: " + r.stderr.decode().strip()[:200] +
-                "\nSigning is deliberately interactive — it needs Craig at a "
+                "\nSigning is deliberately interactive — it needs the owner at a "
                 "terminal to enter the key's passphrase or PIN+touch. Do not "
                 "load this key into ssh-agent to work around this: that "
-                "hands every local process Craig's authority (see this "
+                "hands every local process the owner's authority (see this "
                 "function's docstring).")
         if not sig_path.exists():
             raise RuntimeError(
@@ -997,9 +675,8 @@ def load_registry():
 
 def subject_problem(subject, registry):
     """None if the subject parses against the registry, else a reason.
-    Unregistered shapes get PARKED as UNNORMALIZED (not rejected at emit —
-    the producer warns, the fold parks; naming drift must be visible, and a
-    hard emit-reject would just push sessions to lie about the class)."""
+
+    The producer warns and the fold parks; emit does not reject."""
     if not _SUBJECT_RE.match(subject):
         return f"subject {subject!r} not class/entity shaped"
     cls = subject.split("/", 1)[0]
@@ -1009,32 +686,17 @@ def subject_problem(subject, registry):
 
 
 # ── concurrency ──────────────────────────────────────────────────────────────
-# SPEC invariant 1 calls events/<host>.ndjson a SINGLE-WRITER log, and means one
-# writer per HOST — the parallelism the design was built for is across hosts.
-# Several agents in one shell on one host are several writers to one file.
-#
-# Measured 2026-07-28, 5 concurrent emits on {{REDACTED}}: all 5 event lines
-# landed intact (one write() under O_APPEND, events ~800B, far under PIPE_BUF),
-# but 2 of 5 GIT COMMITS failed on index.lock. Nothing was lost only because a
-# later agent's commit swept up the earlier lines — accidental recovery, and it
-# does not cover the LAST writer. An uncommitted event is worse than it looks:
-# read_all_events() loads from head_blob(), i.e. committed state only, so the
-# event never folds into MEMORY.md and never reaches a peer. It sits on disk,
-# inert, until something else happens to commit.
+# One writer per host log, but several local processes may emit concurrently.
+# The lock serializes append+commit; an uncommitted event never folds.
 LOCK_PATH = MESH_ROOT / ".mesh.lock"
 LOCK_WAIT = 30          # seconds to wait for the lock before failing loudly
 
 
 @contextlib.contextmanager
 def repo_lock(timeout=LOCK_WAIT):
-    """Serialize the append+add+commit critical section across processes.
+    """Serialize the whole append+add+commit sequence across processes (flock).
 
-    Held across the WHOLE sequence, not per git call: locking each call
-    individually still lets two agents interleave between add and commit.
-
-    Advisory (flock) — which is sufficient because every writer is our code.
-    Fails loudly on timeout rather than proceeding unserialized: a caller that
-    silently skipped the lock would reintroduce exactly the race this closes.
+    Raises on timeout rather than proceeding unserialized.
     """
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
@@ -1063,13 +725,7 @@ _LOCK_ERR = ("index.lock", "unable to create", "cannot lock ref", "ref lock")
 
 
 def git(*args, cwd=None, check=True, timeout=60, retries=6):
-    """Run git, retrying transient LOCK contention with bounded backoff.
-
-    Defence in depth behind repo_lock(): the fold, home_watch and a human shell
-    also touch this repo and do not take our lock. Only lock-shaped failures
-    retry — a real error (bad ref, conflict) must fail on the first try rather
-    than being sat on for a second.
-    """
+    """Run git, retrying only lock-contention failures with bounded backoff."""
     delay = 0.05
     for attempt in range(retries + 1):
         r = subprocess.run(["git", "-C", str(cwd or MESH_ROOT), *args],
@@ -1088,9 +744,7 @@ def git(*args, cwd=None, check=True, timeout=60, retries=6):
 
 
 def head_blob(path, cwd=None):
-    """Read a file AS COMMITTED (SPEC invariant 3) — the hash chain guards
-    what the fold consumes; the working tree is the surface the 0-byte
-    incident corrupted while reporting clean."""
+    """Read a file as committed at HEAD (not the working tree), or None."""
     r = subprocess.run(["git", "-C", str(cwd or MESH_ROOT), "show", f"HEAD:{path}"],
                        capture_output=True, text=True, timeout=30)
     return r.stdout if r.returncode == 0 else None
@@ -1104,14 +758,7 @@ def committed_log_paths(cwd=None):
 
 
 def append_event_line(line, log=None):
-    """Append one event line to this host's log, healing a torn tail first.
-
-    A crash mid-write can leave a half-line with no trailing newline (drill
-    3's scenario). A blind append would CONCATENATE the next event onto that
-    fragment — destroying a good event to preserve a dead one (found by
-    drill 7 running after drill 3, 2026-07-28). If the last byte isn't \\n,
-    lead with one: the torn fragment stays its own held-out line and the new
-    event lands clean."""
+    """Append one event line to this host's log, first newline-terminating any torn tail."""
     log = log or MESH_ROOT / "events" / f"{HOST}.ndjson"
     log.parent.mkdir(parents=True, exist_ok=True)
     lead = ""
@@ -1126,11 +773,9 @@ def append_event_line(line, log=None):
 
 
 def unsuperseded_ids(subject, events=None):
-    """Ids of every committed event on `subject` not yet superseded (and not
-    denial/retract). Deliberately WIDER than fold['live']: the lesson dedup
-    serves only the latest revision, but a supersede that covered only the
-    latest would resurrect the older revision on the next fold. Shared by
-    emit.py --supersedes-live-on and home_watch.py."""
+    """Ids of every committed, unsuperseded, non-denial/retract event on `subject`.
+
+    Wider than fold['live'] so a supersede also covers older revisions."""
     if events is None:
         events, _ = read_all_events()
     sup = set()
@@ -1145,8 +790,7 @@ def unsuperseded_ids(subject, events=None):
 
 # ── fold core (pure: events in → views out) ──────────────────────────────────
 def read_all_events(cwd=None):
-    """All committed events from all logs. Returns (events, problems).
-    Dedup by id (idempotence); host↔filename validation (invariant 1)."""
+    """All committed events from all logs, deduped by id. Returns (events, problems)."""
     seen, events, problems = set(), [], []
     now = datetime.datetime.now(datetime.timezone.utc)
     for path in committed_log_paths(cwd):
@@ -1169,7 +813,7 @@ def read_all_events(cwd=None):
             if ev["id"] in seen:
                 continue                      # idempotent replay of a retry
             seen.add(ev["id"])
-            ev["_line"] = n                   # per-writer offset (Kafka offset)
+            ev["_line"] = n                   # per-writer offset
             ev["_suspect"] = False
             try:
                 ets = datetime.datetime.fromisoformat(ev["ts"].replace("Z", "+00:00"))
@@ -1183,22 +827,8 @@ def read_all_events(cwd=None):
 
 
 def _contradiction_alarm(subj, evs, suffix=""):
-    """Word a parked contradiction by what ACTUALLY disagrees (2026-09-12).
-
-    Both callers used to hardcode "unsigned event contradicts SIGNED truth",
-    but neither trigger requires the dissenter to be unsigned: the test is
-    "some event here is signed AND the contents differ". On 2026-09-12 that
-    fired on a subject whose two contradicting events were BOTH signed by
-    Craig seven seconds apart — one promote had named an already-superseded
-    event id — and the message sent the diagnosis hunting for an unsigned
-    event that did not exist.
-
-    The two cases want different responses, so they get different words:
-      unsigned vs signed  the poisoned-session tripwire the rule was built for
-      signed vs signed    the operator signed two contradictory claims; no
-                          attacker needed, and the fix is to supersede one
-    Both can hold at once, and then both are said.
-    """
+    """Alarm text for a parked contradiction, naming what actually disagrees:
+    unsigned vs signed, signed vs signed, or both."""
     signed_contents = {e["content"] for e in evs if e.get("_signed")}
     unsigned_contents = {e["content"] for e in evs if not e.get("_signed")}
     parts = []
@@ -1209,76 +839,40 @@ def _contradiction_alarm(subj, evs, suffix=""):
                      f"(operator signed contradictory claims — often a promote "
                      f"naming an already-superseded event id; supersede the "
                      f"stale one to clear)")
-    if not parts:                      # belt and braces: never a bare subject
+    if not parts:
         parts.append("contradictory claims")
     return f"{' AND '.join(parts)} on {subj}{suffix}"
 
 
 def fold_events(events, registry):
-    """The deterministic rule pass. Returns a dict of fold results.
-    Resolution is explicit (supersedes by id) — never temporal (invariant 4)."""
+    """Deterministic rule pass; resolution is by explicit supersedes, never by time."""
     by_id = {e["id"]: e for e in events}
     superseded, dangling = set(), []
     for e in events:
-        # v1.3: supersedes accepts a LIST — a two-sided park took two
-        # resolution events before, which made the common case (both claims
-        # wrong, one correction) awkward enough to discourage resolving.
+        # supersedes may be one id or a list.
         raw = e.get("supersedes")
         for s in ([raw] if isinstance(raw, str) else (raw or [])):
             if s in by_id:
                 superseded.add(s)
             else:
                 dangling.append((e["id"], s))   # compaction-bug tripwire
-    # Signature verification is part of the fold, not the producer: every host
-    # independently re-verifies, so a forged 'sig' string is caught everywhere
-    # rather than trusted because it arrived looking signed.
+    # Every host re-verifies signatures at fold time.
     for e in events:
         e["_signed"] = verify_sig(e) if e.get("sig") else False
         if e.get("sig") and not e["_signed"]:
             e["_badsig"] = True
-    # retract is excluded from serving: its whole job is the supersedes edge
-    # it carries — a retraction that RENDERED would resurrect the content it
-    # exists to remove (caught live on the first real retract, 2026-07-27).
+    # retract only carries a supersedes edge; it never renders.
     live = [e for e in events if e["id"] not in superseded
             and e["kind"] not in ("denial", "propose-correct", "retract")]
 
-    # LINEAGE QUARANTINE (built 2026-07-30) — the second half of the Story 029
-    # gate, which had been shipped write-side only.
-    #
-    # `contains-untrusted` was validated at emit and then IGNORED here, so a
-    # lesson distilled from ingested/untrusted content rendered into the
-    # always-on index exactly like an operator-stated one. Found by reading the
-    # live store: the very first untrusted-lineage event ever written
-    # (lesson/derived-threshold-is-still-invented, 2026-07-30T15:14:30Z) was
-    # sitting in MEMORY.md, load-bearing, while the write-guard hook's docstring
-    # and SPEC.md both claimed such facts "land in QUARANTINE.md, never
-    # MEMORY.md, until Craig promotes them". A control asserted by nothing had
-    # become false without anyone editing it.
-    #
-    # Held out BEFORE the contradiction pass, not after, and that ordering is the
-    # security property: if an untrusted event could park a subject it disagreed
-    # with, a single crafted page would be able to silence real doctrine by
-    # contradicting it — memory poisoning by denial of service rather than by
-    # substitution. It cannot reach the rule pass at all.
-    #
-    # Promotion routes, in DESCENDING strength:
-    #   1. python3 sign.py --promote <id>  — emits a signed `correct` superseding it.
-    #   2. a signature on the event itself — Craig vouching for it in place.
-    #      (1 and 2 = PROMOTION_KEY: the passphrase-gated key, agent-impossible
-    #      by construction.)
-    #   3. python3 sign.py --promote-verbal <id> --approved "<his words>"
-    #      (PROMOTION_VERBAL, added 2026-08-12 on Craig's ruling). This one is
-    #      NOT agent-impossible — an agent can write the attestation. It is an
-    #      AUDIT record, not a cryptographic gate, and the fold stamps it
-    #      distinctly so nothing downstream can mistake it for route 1 or 2.
-    #      Craig owns that trade knowingly: the signing key lives on another
-    #      host behind a passphrase, so the practical effect of key-only
-    #      promotion was a permanent quarantine backlog, not review.
-    #      Rationale + the residual risk: decisions/verbal-approval-promotes-
-    #      untrusted-memory-2026-08-12.md.
-    # An unknown or absent lineage quarantines and alarms: the field is required
-    # at emit, so a live event missing it means the log was written by something
-    # that is not this code, and the safe reading of that is "do not serve".
+    # Lineage quarantine: untrusted-lineage events are held out before the
+    # contradiction pass, so they can never park (silence) trusted doctrine.
+    # Promotion routes, strongest first:
+    #   1. sign.py --promote <id> (signed `correct`), or a signature on the
+    #      event itself — PROMOTION_KEY.
+    #   2. sign.py --promote-verbal <id> --approved "<words>" — PROMOTION_VERBAL,
+    #      an audit record, not a cryptographic gate.
+    # Unknown/absent lineage quarantines and alarms.
     alarms = []
     quarantined, keep = [], []
     for e in live:
@@ -1286,10 +880,7 @@ def fold_events(events, registry):
         if lin == "operator-direct":
             keep.append(e)
         elif lin == "contains-untrusted":
-            # TWO promotion routes since 2026-08-12, stamped so they never
-            # render as each other (see PROMOTION_* above). `_promotion` is a
-            # fold-local underscore field like `_signed`: derived every fold,
-            # never trusted from the log.
+            # `_promotion` is fold-local, derived every fold, never read from the log.
             if e.get("_signed"):
                 e["_promotion"] = PROMOTION_KEY
                 keep.append(e)
@@ -1305,41 +896,13 @@ def fold_events(events, registry):
                 f"{sorted(LINEAGES)} — quarantined, not served")
     live = keep
 
-    # ── PIN OVERLAY (2026-07-31) ─────────────────────────────────────────────
-    # Residency in the always-on tier is decided by score_for_index, whose first
-    # key is `pin`. Until now that flag could only be set AT EMIT (`emit.py
-    # --pin`), which meant an already-written memory could never become pinned:
-    # the store had 2 pins out of 166 events and neither was a hard boundary, so
-    # rules where THE PROMPT IS THE MECHANISM (no-auto-MFA, never-announce-
-    # session-endings) held their always-on slots by luck of ranking. A busy
-    # incident week could evict the OTP rule and nothing would say so.
-    #
-    # The obvious fix — re-emit the lesson with --pin — fails three different
-    # ways depending on how it is spelled. All three measured 2026-07-31 and
-    # frozen in drill 12; none of them is a hypothetical:
-    #   * identical content, no supersede → the dup-lesson rule below collapses
-    #     to the EARLIEST copy and holds the rest out. The pinned twin is
-    #     discarded and the pin silently does nothing.
-    #   * differing content → the subject PARKS. The boundary leaves the served
-    #     index entirely, which for an MFA rule is worse than never pinning it.
-    #   * identical content WITH a supersede — what emit.py actually does, since
-    #     it auto-supersedes lessons — pins successfully and forges the record.
-    #     The replacement carries a new id and today's `ts`, so a 07-28 lesson
-    #     renders as learned today. The date exists so a reader can weigh
-    #     recency ("recalled memories are point-in-time"); overwriting it to buy
-    #     a sort key corrupts the one signal the row exists to carry, and every
-    #     pinned row would claim to be new on the day someone ran the backfill.
-    #
-    # So a pin is an OVERLAY, not a rewrite: a `pin` event names a subject and
-    # never renders. The lesson keeps its own id, content, timestamp and
-    # correction history; only its residency changes. Unpinning needs no new
-    # verb — a `retract` superseding the pin event drops it out of `live` here,
-    # and the overlay is gone on the next fold.
+    # ── pin overlay ──────────────────────────────────────────────────────────
+    # A `pin` event names a subject and never renders; the pinned lesson keeps
+    # its own id, content and ts. Unpin = retract the pin event.
     pins = [e for e in live if e["kind"] == "pin"]
     live = [e for e in live if e["kind"] != "pin"]
-    # Tier overlays (see TIERS). Two live tier events on one subject that
-    # disagree are a race between hosts: alarm and let neither win, so each
-    # host keeps what its file already says — never a silent demotion.
+    # Tier overlays (see TIERS). Disagreeing live tier events on one subject
+    # alarm and neither wins; each host keeps its current file.
     tier_evs = [e for e in live if e["kind"] == "tier"]
     live = [e for e in live if e["kind"] != "tier"]
     tiers, _tier_seen = {}, {}
@@ -1356,7 +919,7 @@ def fold_events(events, registry):
     unnormalized = [e for e in live if subject_problem(e["subject"], registry)]
     normalized = [e for e in live if not subject_problem(e["subject"], registry)]
 
-    # Contradiction rules (SPEC fold step 3) — deterministic, no model.
+    # Contradiction rules — deterministic, no model.
     parked = {}
     by_subject = {}
     for e in normalized:
@@ -1371,11 +934,7 @@ def fold_events(events, registry):
         if len({e["content"] for e in asserts}) > 1:
             parked[subj] = evs
             continue
-        # LIVE as of v1.3 (was dormant while nothing signed): an operator-
-        # signed claim is truth; anything disagreeing with it parks AND
-        # alarms — the poisoned-session tripwire, though as of 2026-09-12 the
-        # message no longer assumes the dissenter is unsigned (it may be a
-        # second signature; see _contradiction_alarm).
+        # A signed claim is truth; anything disagreeing with it parks and alarms.
         signed = [e for e in evs if e.get("_signed")]
         if signed and len({e["content"] for e in evs}) > 1:
             parked[subj] = evs
@@ -1388,12 +947,8 @@ def fold_events(events, registry):
     for eid, missing in dangling:
         alarms.append(f"event {eid} supersedes missing {missing} — compaction bug?")
 
-    # Lessons obey invariant 4 like everything else (Grok review 4, priority
-    # 1 — this replaced a latest-wins temporal pick that contradicted the
-    # constitution): a revision supersedes its predecessors explicitly (the
-    # producer resolves the chain), so >1 live lesson with DIFFERING content
-    # on one subject is a real race → park it. Identical restatements are not
-    # a conflict — collapse to the earliest and hold the copies out.
+    # >1 live lesson with differing content on a subject is a race: park it.
+    # Identical restatements collapse to the earliest.
     dup_lessons = set()
     lessons_by_subject = {}
     for e in normalized:
@@ -1405,15 +960,8 @@ def fold_events(events, registry):
         elif len(evs) > 1:
             dup_lessons |= {e["id"] for e in evs[1:]}
 
-    # The signed-truth tripwire, ACROSS kinds (2026-07-30, found by drill 10).
-    # The in-bucket rule above only ever compared assert/correct events with each
-    # other, and the lesson rule only lessons with lessons — so a signed `correct`
-    # and an unsigned `lesson` telling different stories about the same subject
-    # both served, silently, side by side. In this store that is not an edge case:
-    # 123 of 141 events are lessons, so the tripwire was blind to the dominant
-    # kind, and the promotion path (sign.py emits `correct`) lands exactly there.
-    # Whatever the operator signed is truth; anything live disagreeing with it
-    # parks and alarms, regardless of which kind each one is.
+    # Signed-truth tripwire across kinds: anything live disagreeing with a
+    # signed event on the same subject parks and alarms.
     for subj in sorted({e["subject"] for e in normalized}):
         evs = [e for e in normalized if e["subject"] == subj]
         if not any(e.get("_signed") for e in evs):
@@ -1429,28 +977,9 @@ def fold_events(events, registry):
     servable = [e for e in normalized
                 if e["id"] not in parked_ids and e["id"] not in dup_lessons]
 
-    # Apply the pin overlay (see PIN OVERLAY above) against the FINAL served
-    # set, because that is the only set where "did this pin do anything?" has an
-    # answer. A pin naming a subject nobody serves — a typo, or a lesson that has
-    # since been retracted or parked — is dangling, and dangling MUST alarm: a
-    # pin that silently protects nothing is indistinguishable from a pin that
-    # works, and the whole point of pinning a boundary is that its absence is
-    # never silent. Same reasoning as the dangling-supersedes tripwire above.
-    #
-    # The pinned tier is a HARD CAP, not an alarm (Grok review, 2026-07-31 — the
-    # first version only appended to `alarms`). Pinned rows are UNCONTESTED
-    # residency, an agent can emit a `pin` event, and `pin` outranks `_signed`
-    # in score_for_index — so alarm-only left an unmetered write path into the
-    # one file every session loads, which is the memory-poisoning amplifier
-    # shape ([[improve-loop-poisoning-surface]]) and the same "absence is
-    # silent" failure this overlay was written to kill, moved from eviction to
-    # capture. An alarm nobody reads is not a bound.
-    #
-    # Admission is OLDEST-FIRST, and that ordering is the security property: a
-    # flood of new pins is refused at the door, rather than displacing the
-    # boundaries already resident. Operator-SIGNED pins are admitted before any
-    # cap applies — an agent cannot sign by construction, so Craig can always
-    # pin past the cap and nothing an agent emits can crowd him out.
+    # Apply pins against the final served set; a pin on an unserved subject
+    # alarms as dangling. The pinned tier is a hard cap: signed pins are
+    # admitted first and uncapped, then unsigned pins oldest-first until full.
     by_subject_servable = {}
     for e in servable:
         by_subject_servable.setdefault(e["subject"], []).append(e)
@@ -1474,9 +1003,7 @@ def fold_events(events, registry):
             continue
         spent += cost
         pinned_subjects.add(p["subject"])
-    # Assigned for EVERY servable event, not just the pinned ones: `_pin` is an
-    # overlay on a dict the caller may hold across folds, so a retract has to
-    # clear it rather than leave a stale True behind.
+    # Set on every servable event so a stale True is cleared across folds.
     for e in servable:
         e["_pin"] = e["subject"] in pinned_subjects
     if refused:
@@ -1486,11 +1013,7 @@ def fold_events(events, registry):
             f"{DELIVERY_BYTES} B delivered file). Not applied: "
             + ", ".join(f"{p['id']}/{p['subject']}" for p in refused[:5])
             + ". Retract a pin to make room, or sign these to admit them.")
-    # A quarantined claim cannot park a served subject (see above), but it can
-    # still SAY that it disagrees with one. That is the poisoned-source tripwire:
-    # untrusted content arriving with a different story about a fact we already
-    # serve is the shape MemGhost produces, and it is worth a look even though
-    # nothing was overwritten.
+    # Alarm when a quarantined claim disagrees with served content.
     served_content = {}
     for e in servable:
         served_content.setdefault(e["subject"], set()).add(e["content"])
@@ -1507,21 +1030,16 @@ def fold_events(events, registry):
     return {"live": servable, "parked": parked, "unnormalized": unnormalized,
             "quarantined": quarantined, "denials": denials,
             "proposals": proposals, "alarms": alarms, "total": len(events),
-            # Pin events never render as index rows, so without this projection
-            # the only record of WHY a memory is resident — and the only place
-            # to find the id needed to retract it — is raw log spelunking.
+            # Pin events never render as rows; exposed here for PINS.md.
             "pins": pins, "pins_active": sorted(pinned_subjects),
             "tiers": tiers,
             "pins_refused": refused, "pinned_bytes": spent}
 
 
 def score_for_index(e, correction_counts, session_breadth):
-    """Eviction priority (SPEC): pinned → signed → correction-history →
-    breadth (distinct sessions per subject — raw recall counts are gameable)
-    → recency last. Higher tuple sorts first."""
-    # `pin` is the emit-time flag on the event itself; `_pin` is the overlay a
-    # later `pin` event applies to an already-written memory. Same tier — the
-    # two differ only in when the operator decided, which is not a ranking fact.
+    """Eviction priority, higher first: pinned, signed, correction count,
+    session breadth, recency."""
+    # `pin` (emit-time flag) and `_pin` (overlay) rank the same.
     return (1 if (e.get("pin") or e.get("_pin")) else 0,
             1 if e.get("_signed") else 0,
             correction_counts.get(e["subject"], 0),
@@ -1530,9 +1048,7 @@ def score_for_index(e, correction_counts, session_breadth):
 
 
 def ranked_index(fold, audience):
-    """One audience's live events in eviction-priority order (see
-    score_for_index) — shared by the mesh INDEX view and the harness
-    MEMORY.md renderer so both serve the identical ranking."""
+    """One audience's live events in score_for_index order (INDEX and MEMORY.md share it)."""
     inc = VIEW_INCLUDES[audience]
     vis = [e for e in fold["live"] if e["audience"] in inc]
     correction_counts, session_breadth = {}, {}
@@ -1546,45 +1062,22 @@ def ranked_index(fold, audience):
 
 
 def index_row(e):
-    """One index line: subject, content, optional home pointer, and a date.
-
-    The date is rendered MM-DD, not YYYY-MM-DD. It exists so a reader can weigh
-    recency ("recalled memories are point-in-time — verify before asserting"), and
-    month-day carries that; the year does not, because a doctrine index that
-    reaches back years is a different problem than a stale row. Full precision
-    lives in the event (`ts`) and in the memory's own home file — this is a view,
-    not the fact. Measured 2026-07-29: 6 B x 113 rows, the only byte saving
-    available that costs no coverage, since the subject slug is a load-bearing
-    pointer and row prose is already tight (median content 117 chars).
-    """
+    """One index line: subject, content, optional home pointer, and an MM-DD date."""
     return (f"- [{e['subject']}] {e['content'][:INDEX_CONTENT_CHARS]}"
             f"{' → ' + e['home'] if e.get('home') else ''}"
-            # .get, not [] — `_suspect` is stamped by read_all_events, so a
-            # caller holding events built any other way (fold_events is public
-            # and the pin-dominance bound calls this) would otherwise take a
-            # KeyError from a RENDERER while trying to measure a bound.
+            # .get: `_suspect` is absent on events not from read_all_events.
             f" ({e['ts'][5:10]}{', SUSPECT-ts' if e.get('_suspect') else ''})")
 
 
 def line_bytes(s):
-    """UTF-8 bytes this line costs in a "\\n".join(), newline included.
-
-    len() counts CHARACTERS. Every budget here is in BYTES, and these indexes
-    are full of em-dashes and arrows (3 bytes each), so char-counting silently
-    under-measures — 19,615 chars was 19,895 bytes when this was found.
-    """
+    """UTF-8 bytes this line costs in a newline join, newline included."""
     return len(s.encode("utf-8")) + 1
 
 
 def budgeted_rows(ranked, head_lines, cap=INDEX_BUDGET, line_cap=None):
-    """head_lines + one row per event, hard-capped at `cap` BYTES and, when
-    given, `line_cap` LINES — with the overflow noted (bound every output —
-    Principle 8).
+    """head_lines + one row per event, capped at `cap` bytes and `line_cap` lines.
 
-    The demotion note is RESERVED for up front rather than appended after the
-    break: the old version appended it past the cap check, so the "bounded"
-    section could exceed its own budget by exactly the width of the line that
-    announced the bound.
+    The overflow note's width is reserved up front so it stays within the cap.
     """
     lines = list(head_lines)
     used = sum(line_bytes(l) for l in lines)
@@ -1647,7 +1140,7 @@ def render_views(fold, audience):
             "#",
             "#   key-signed (strongest — an agent cannot produce this):",
             "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>",
-            "#   verbally-signed (Craig reasoned it through and said yes;",
+            "#   verbally-signed (the owner reasoned it through and said yes;",
             "#   an AUDIT record, not a cryptographic gate — buys `served`,",
             "#   never `pinned`/`doctrine`):",
             "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <id> \\",
@@ -1667,11 +1160,7 @@ def render_views(fold, audience):
         quar.append(f"- {e['content'][:400]}")
         quar.append("")
 
-    # PINS.md — the residency audit trail. A pin event never renders as an index
-    # row, so without this the answer to "why is this memory always-on, who
-    # decided, and what id do I retract to undo it?" lives only in the raw
-    # ndjson. That makes the documented unpin path unreachable in practice a few
-    # months out, which is the same as not having one.
+    # PINS.md: which pins are active, refused or dangling, with ids to retract.
     cap = int(DELIVERY_BYTES * PIN_DELIVERY_SHARE)
     active = set(fold.get("pins_active", []))
     refused_ids = {p["id"] for p in fold.get("pins_refused", [])}
@@ -1708,19 +1197,13 @@ def render_views(fold, audience):
             "PINS.md": "\n".join(pinsmd) + "\n"}
 
 
-# ── harness MEMORY.md (cutover phase 7) ──────────────────────────────────────
-# The Claude Code harness force-feeds <store>/MEMORY.md into every session.
-# Post-cutover that file is GENERATED here from the folded corpus. The flip is
-# per-host OPT-IN via a `.mesh-generated` marker in the store: a host whose
-# curated index has not been backfilled into the mesh keeps its hand-built
-# MEMORY.md untouched until it backfills and opts in ({{REDACTED}}/{{REDACTED}}).
+# ── harness MEMORY.md ────────────────────────────────────────────────────────
+# Generated from the folded corpus; per-host opt-in via a `.mesh-generated`
+# marker in the store.
 
 def store_dir():
-    """This workspace's auto-memory store path. The workspace root is
-    wherever memory-mesh/ lives (CODE_DIR's parent) — true for the CC tree
-    and for any seed recipient's chosen root — and the harness keys the
-    store by that path with / → - (e.g. {{HOME}}/{{REDACTED}} →
-    -home-x-Github-CC)."""
+    """This workspace's auto-memory store: ~/.claude/projects/<root with / → ->/memory,
+    where root is CODE_DIR's parent."""
     override = os.environ.get("MESH_STORE_DIR")
     if override and os.environ.get("MESH_DRILL_LOCAL"):
         return Path(override)
@@ -1732,21 +1215,10 @@ DEFAULT_MESH_ROOT = Path(os.path.expanduser("~/memory-events"))
 
 
 def harness_store():
-    """The store, or None if this host hasn't opted into fold-generated
-    MEMORY.md (the .mesh-generated marker is the per-host opt-in).
+    """The store, or None if this host hasn't opted in (.mesh-generated marker).
 
-    SANDBOX GUARD. store_dir() derives from where this CODE lives, not from
-    MESH_ROOT — so a fold run against a throwaway event log (the drills, any
-    replay or sandbox) still resolved to the OPERATOR's real store and
-    published that sandbox's fold as the live always-on memory. Observed
-    2026-07-29: after a drill run, MEMORY.md was 22 events of `conc-0` /
-    `pre-rebase` test fixtures instead of 110 real memories. The 5-minutely
-    fold repairs it, so it never persisted — but any session starting inside
-    that window loaded test fixtures as its standing context, silently.
-
-    A sandbox must never be able to write the operator's brain. If MESH_ROOT
-    has been pointed somewhere other than the real log, this is not the run
-    that owns MEMORY.md.
+    Also None when MESH_ROOT is not the default log, so sandboxes and drills
+    never write the real store.
     """
     if MESH_ROOT.resolve() != DEFAULT_MESH_ROOT.resolve():
         return None
@@ -1773,12 +1245,10 @@ def file_ondemand_slugs(store):
 
 
 def ondemand_slugs(store, fold=None):
-    """Slugs deliberately held OUT of the always-on index.
+    """Slugs held out of the always-on index.
 
-    The file is this host's record; `tier` events are the mesh's (2026-09-27).
-    With a fold, events win per subject: `ondemand` adds, `always` removes.
-    Without one (callers that have not folded) the file alone answers, which
-    is what the fold writes back anyway (project_index_exclude)."""
+    The host file, overlaid by the fold's `tier` events when given:
+    `ondemand` adds, `always` removes."""
     out = file_ondemand_slugs(store)
     for subj, t in ((fold or {}).get("tiers") or {}).items():
         k = _tier_key(subj)
@@ -1816,20 +1286,10 @@ ONDEMAND_HEADING = "## On-demand memories — not always-loaded; /recall reaches
 
 
 def index_excluded(ev, exclude):
-    """Is this event held OUT of the always-on index by the exclude manifest?
+    """Is this event held out of the always-on index by the exclude manifest?
 
-    THE ONE HOME for that question. It was previously implemented twice — once
-    inside `residency_partition` and again inside `render_harness_memory` — as
-    a private `lesson_slug(e) not in exclude`. Two writers of one rule, and on
-    2026-08-01 fixing only the first left `home/*` rows still published: the
-    partition agreed they were demoted while the renderer, which actually
-    decides what lands in MEMORY.md, never asked. One home per fact applies to
-    the code that implements a rule, not just to the facts the rule is about.
-
-    Matches EITHER the bare lesson slug (`one-home-per-fact`) or the full
-    subject (`home/cc-claude-md`). Non-lesson subjects have no bare slug, so
-    without the second form nothing in `_index-exclude.txt` could ever demote
-    them — an always-on row that structurally could not leave the tier.
+    Matches either the bare lesson slug or the full subject. The single
+    implementation of this rule; do not duplicate it.
     """
     subject = ev["subject"]
     slug = subject.split("/", 1)[1] if subject.startswith("lesson/") else None
@@ -1838,11 +1298,7 @@ def index_excluded(ev, exclude):
 
 def delivery_breach(text, byte_cap=LOADER_BYTE_CEILING,
                     line_cap=LOADER_LINE_CEILING):
-    """Reasons `text` violates the CONSUMER's limits; [] means it loads whole.
-
-    Measured on the fully assembled document, in UTF-8 bytes AND lines. This is
-    the one predicate the write gate consults — no section, no proxy.
-    """
+    """Reasons the assembled `text` exceeds the loader's byte/line limits; [] if it fits."""
     nbytes = len(text.encode("utf-8"))
     nlines = len(text.splitlines())
     out = []
@@ -1871,11 +1327,7 @@ def _slug_rows(slugs, width=100):
 def _assemble_harness_memory(head, ranked, n_rows, slugs, n_slugs):
     """One candidate document: `n_rows` index rows and `n_slugs` named slugs.
 
-    The on-demand tier ALWAYS keeps an existence stub. That appendix exists so
-    flipping to a generated index never silently hides the second tier; a fit
-    path that drops it to nothing would re-create the very bug it was added to
-    fix, and would render "no data" as though it were "no such tier"
-    ([[no-data-must-not-render-as-positive-data]]).
+    The on-demand existence stub is always kept.
     """
     lines = list(head)
     lines += [index_row(e) for e in ranked[:n_rows]]
@@ -1897,35 +1349,14 @@ def _assemble_harness_memory(head, ranked, n_rows, slugs, n_slugs):
 
 def fit_harness_memory(head, ranked, slugs, byte_cap=DELIVERY_BYTES,
                        line_cap=DELIVERY_LINES):
-    """Compose the harness index so the FULLY ASSEMBLED file fits the consumer.
+    """Compose the harness index so the fully assembled file fits the caps.
 
-    Degradation order, delivery-preserving:
-      1. header + the on-demand existence stub — never dropped;
-      2. ranked index rows;
-      3. the named slug list, as meat between those poles.
-    Slugs go first because they are pointers /recall reaches by name anyway,
-    while an index row is the only always-on trace of its memory.
-
-    Returns (text, report). The loop is bounded up front (Principle 8): each
-    pass strictly decreases n_slugs or n_rows.
+    Sheds named slugs first, then index rows; header and on-demand stub are
+    never dropped. Returns (text, report). Loops are bounded.
     """
     n_rows, n_slugs = len(ranked), len(slugs)
-    # THE APPENDIX GETS ITS OWN CAP, so freed rule bytes are RECLAIMED rather
-    # than silently respent on slug names (Craig's declaration, 2026-08-01,
-    # `decisions/index-byte-objective-2026-08-01.md`). Without this the loop
-    # below only ever shrinks the appendix under breach, so it grows to fill
-    # whatever the rules give back: the 2026-08-01 re-homing pass dropped 13
-    # rows (-2,329 B of rules) and the file shrank by 315 B, because the
-    # appendix took 2,014 B of it. A ceiling the fitter treats as a target is
-    # not a ceiling.
-    #
-    # Capping is safe because the appendix does NOT gate access. retrieve.py is
-    # a UserPromptSubmit hook that scores the WHOLE corpus and auto-injects;
-    # being named here is advertisement, not reachability. Measured over 1,847
-    # logged turns: 373 distinct slugs served, and 241 of them (65%) are never
-    # named in the appendix — including the most-served slug in the estate
-    # (`soft-failure-exit-zero-with-stderr`, 847 hits). 17 slugs the appendix
-    # does name have never been served at all.
+    # The appendix has its own cap (APPENDIX_BYTES) so freed bytes leave the
+    # file instead of being respent on slug names.
     if n_slugs:
         base = len(_assemble_harness_memory(
             head, ranked, n_rows, slugs, 0).encode("utf-8"))
@@ -1950,8 +1381,7 @@ def fit_harness_memory(head, ranked, slugs, byte_cap=DELIVERY_BYTES,
             n_rows -= 1
         else:
             break
-    # Even the minimum does not fit: publish the safe minimum and say so LOUDLY
-    # rather than a plausible-looking file the loader will amputate.
+    # Even the minimum does not fit: publish it and report failure.
     text = _assemble_harness_memory(head, ranked, 0, slugs, 0)
     return text, {"ok": False, "rows": 0, "rows_total": len(ranked),
                   "slugs": 0, "slugs_total": len(slugs),
@@ -1961,12 +1391,9 @@ def fit_harness_memory(head, ranked, slugs, byte_cap=DELIVERY_BYTES,
 
 
 def residency_partition(fold, store):
-    """Split the operator's live rows by DECLARED residency (SPEC v4).
+    """Split the operator's live rows by declared residency.
 
-    Returns (always_on, on_demand, undeclared, report). During migration most
-    rows are undeclared and keep exactly their v3 treatment — this is what lets
-    the law ship before the retag, and what makes the shadow render a true
-    no-op diff until Craig starts declaring.
+    Returns (always_on, on_demand, undeclared, report).
     """
     def lesson_slug(e):
         return (e["subject"].split("/", 1)[1]
@@ -1979,8 +1406,7 @@ def residency_partition(fold, store):
         if index_excluded(e, exclude):
             continue
         r = effective_residency(e)
-        # Expiry is a RENDER concern only — no fold-generated events, so replay
-        # stays a pure function of human-origin input (Grok round 1, F3).
+        # Expiry is applied at render only; the fold emits no events.
         if e.get("expires") and e["expires"] < today:
             expired.append(e)
             continue
@@ -1996,22 +1422,16 @@ def residency_partition(fold, store):
 
 
 def render_harness_memory_v4(fold, store, live=False):
-    """The SPEC-v4 index: declared residency decides, ranking only orders.
+    """Residency-based index: declared residency decides, ranking only orders.
 
-    Doctrine and pinned rows are rendered in STABLE SLUG ORDER, not by recency.
-    That is the whole point: measured 2026-07-31, `score_for_index` collapsed to
-    `ts` for 122 of 142 rows, so a memory's survival depended on when it was
-    written rather than on what it was for. Stable order is also non-gameable —
-    nothing an agent controls moves a row up.
+    Doctrine and pinned rows render in stable slug order, not by recency.
     """
     always, demand, undeclared, rep = residency_partition(fold, store)
     always_sorted = sorted(always, key=lambda e: (
         0 if (e.get("pin") or e.get("_pin")) else 1,
         0 if e.get("_signed") else 1,
         e["subject"]))
-    # Undeclared rows keep v3 ranking and sit AFTER declared doctrine: during
-    # migration they are the ones that should shed first, because an undeclared
-    # row is one nobody has yet said must be resident.
+    # Undeclared rows keep legacy ranking and sit after doctrine so they shed first.
     ranked = always_sorted + undeclared
     slugs = sorted({e["subject"].split("/", 1)[1] for e in demand
                     if e["subject"].startswith("lesson/")})
@@ -2028,19 +1448,13 @@ def render_harness_memory_v4(fold, store, live=False):
 
 
 def render_harness_memory(fold, store):
-    """The harness-loaded MEMORY.md: the operator INDEX minus on-demand slugs,
-    plus an appendix naming what /recall can reach — sized so the WHOLE file
-    clears the loader's ceilings. Returns (text, report)."""
+    """The harness MEMORY.md: operator index minus on-demand slugs, plus the
+    on-demand appendix, sized to fit the loader ceilings. Returns (text, report)."""
     exclude = ondemand_slugs(store, fold)
     ranked = [e for e in ranked_index(fold, "operator")
               if not index_excluded(e, exclude)]
-    # The on-demand appendix advertises slugs as reachable by /recall. A
-    # quarantined slug advertised there was the standing index pointing every
-    # session at withheld material — and until the same day's recall fix, /recall
-    # then served its body. Advertising a withheld fact is serving it in the weak
-    # sense, so quarantined slugs come out of the appendix. They do NOT vanish:
-    # the count line below and the store's quarantine projection both name them,
-    # which is the difference between withheld and invisible.
+    # Quarantined slugs are not advertised in the appendix; the count line
+    # below still records them.
     quar_slugs = {e["subject"].split("/", 1)[1]
                   for e in fold.get("quarantined", [])
                   if e["subject"].startswith("lesson/")}
@@ -2050,41 +1464,23 @@ def render_harness_memory(fold, store):
         "(overwritten within minutes)",
         f"# fold of {fold['total']} events; {len(fold['parked'])} subject(s) "
         "parked (see ~/memory-events/views/operator/CONFLICTS.md)"]
-    # A withheld fact must not be a silent one. This line is the always-on trace
-    # of the quarantine's existence: without it, "nothing untrusted is pending"
-    # and "the quarantine is not wired" render identically, which is the failure
-    # this whole build was fixing ([[no-data-must-not-render-as-positive-data]]).
-    # Emitted only when the count is nonzero, so steady state costs zero bytes.
+    # Quarantine count line, emitted only when nonzero.
     n_quar = sum(1 for e in fold.get("quarantined", [])
                  if e["audience"] in VIEW_INCLUDES["operator"])
     if n_quar:
         head.append(f"# {n_quar} untrusted-lineage fact(s) QUARANTINED and not "
                     "served — views/operator/QUARANTINE.md; promote: "
                     "sign.py --promote <id> (key) or --promote-verbal <id> "
-                    "--approved \"<Craig's words>\" (verbal, weaker)")
+                    "--approved \"<owner's words>\" (verbal, weaker)")
     head.append("")
     return fit_harness_memory(head, ranked, sorted(exclude))
 
 
 def render_store_quarantine(fold):
-    """The store's quarantine list, as a FOLD PROJECTION (2026-07-30).
+    """The store's QUARANTINE.md, projected from the fold.
 
-    Craig ruled "if I promote it, that must be fact everywhere", and this file is
-    why that was false: `memory_write.py` appended to it, its stated routing owner
-    `consolidate.py` no longer exists, so nothing ever removed an entry. A memory
-    promoted and served in the morning was still listed as quarantined hours later.
-
-    The objection to generating it at all was one-home-per-fact — a second artifact
-    that must agree with the mesh view. Grok 4.5's pass, and then the codebase
-    itself, answered that: the fold ALREADY renders the SERVED set twice, as
-    `views/<aud>/INDEX.md` and as the harness index, from one generator. With a
-    single writer the two cannot disagree, which is the difference between a
-    duplicate and a rendering. Refusing for the withheld set what the code already
-    does for the served set was an inconsistency, not a principle.
-
-    SLUGS AND ONE-LINE HOOKS ONLY — never bodies. This file sits in the store next
-    to the memories themselves and is read by an agent looking for context; the
-    quarantine exists precisely to keep untrusted prose out of that context.
+    Slugs and one-line hooks only, never bodies: untrusted prose stays out of
+    agent context.
     """
     inc = VIEW_INCLUDES["operator"]
     quar = sorted((e for e in fold.get("quarantined", [])
@@ -2098,9 +1494,9 @@ def render_store_quarantine(fold):
         "# HELD OUT of the always-on index and of /recall's pack (recall serves a",
         "# tombstone, never the body). NOT standing policy.",
         "#",
-        "# PROMOTE, key-signed (needs Craig's passphrase-gated key — an agent cannot):",
+        "# PROMOTE, key-signed (needs the owner's passphrase-gated key — an agent cannot):",
         "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <event-id>",
-        "# PROMOTE, verbally-signed (Craig's spoken approval, recorded verbatim.",
+        "# PROMOTE, verbally-signed (the owner's spoken approval, recorded verbatim.",
         "# An agent CAN write this — it is an audit record, not a gate. Serves,",
         "# but never reaches pinned/doctrine):",
         "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <event-id> \\",
@@ -2120,13 +1516,7 @@ def render_store_quarantine(fold):
 
 
 def servable_slugs(fold):
-    """The slugs a delivery channel may serve: live, non-superseded,
-    non-quarantined, non-parked.
-
-    `fold["live"]` is already the tip set — supersedes resolved out, quarantine
-    held out, denial/propose-correct/retract excluded — so this is that set
-    minus parked subjects, expressed in the store's filename vocabulary.
-    """
+    """Lesson slugs a delivery channel may serve: fold['live'] minus parked subjects."""
     parked = set(fold.get("parked") or {})
     out = set()
     for e in fold["live"]:
@@ -2141,33 +1531,14 @@ def servable_slugs(fold):
 
 
 def servable_manifest_path():
-    """Where the delivery manifest lives — mesh state, not the operator's store."""
+    """Path of the delivery manifest (in mesh state, not the memory store)."""
     return MESH_ROOT / "state" / "servable.json"
 
 
 def write_servable_manifest(fold):
-    """Publish the delivery manifest the RETRIEVAL tier filters against.
+    """Publish the servable-slug manifest that retrieve.py filters against.
 
-    Why this exists (2026-07-31, found by an outside review and then verified
-    live): `retrieve.py` globbed the store directly and consulted no lifecycle
-    state whatsoever, so it served QUARANTINED untrusted-lineage facts and
-    SUPERSEDED doctrine as "STANDING RULES" — a memory and its own correction
-    could ride into the same turn as co-equal rules. The always-on tier honored
-    the fold's verdict; the retrieval tier never saw it. Story 029's gate was
-    shipped write-side and index-side and simply had no third half.
-
-    The manifest is PRECOMPUTED here rather than derived at retrieval time on
-    purpose: retrieval runs on every turn, and a fold is git reads plus an
-    ssh-keygen subprocess per signed event — nothing that belongs on the hot
-    path.
-
-    It lives in the mesh's own `state/` (already gitignored, already where
-    retrieve.py writes its injection log), NOT in the operator's memory store.
-    The store is human-owned and write-guarded; a fold that drops derived files
-    into it creates untracked noise the guard then refuses to let anyone clean
-    up. Derived state belongs with the deriver.
-
-    Never raises: a broken state dir must not fail the fold.
+    Precomputed so retrieval stays off the fold's hot path. Never raises.
     """
     try:
         doc = {"version": 1, "view_version": view_version(fold),
@@ -2186,9 +1557,7 @@ def write_servable_manifest(fold):
 
 
 def write_store_quarantine(fold):
-    """Atomically publish the store's quarantine projection. Opt-in like the
-    index (same `.mesh-generated` marker, same sandbox guard via harness_store).
-    Never raises: a broken store must not fail the fold."""
+    """Atomically publish the store's QUARANTINE.md (opt-in via harness_store). Never raises."""
     store = harness_store()
     if store is None:
         return {"status": "skipped", "alarms": []}
@@ -2204,30 +1573,15 @@ def write_store_quarantine(fold):
                 "alarms": [f"store quarantine projection write failed: {e}"]}
 
 
-# The renderer's own cut, named so the ADMISSION GATE and the RENDERER can never
-# disagree about what fits. A content string longer than this does not become a
-# longer row; it becomes a row that stops mid-clause.
+# Renderer's content cut; shared with the admission gate so they agree.
 INDEX_CONTENT_CHARS = 200
 
-# A row that trails off is a FAILED ADMISSION, not a compact one. Measured
-# 2026-07-31: 87 events carry content ending in an ellipsis, 62 of them resident
-# in the always-on index — inherited from a pre-mesh authoring loop that wrote a
-# teaser, truncated it to fit, and appended "…". backfill.py then read that
-# derivative as if it were the source. Both halves are now refused at admission:
-# a rule the operator cannot read to the end cannot bind, and re-emitting the
-# stumps is not a repair anyone can make cheaply once the tail is gone
-# ([[bound-the-composed-artifact-not-a-section]]).
+# Content ending in an ellipsis is refused at admission (a truncated rule).
 _TRAILS_OFF = re.compile(r"(…|\.\.\.)\s*$")
 
 
 def admission_reject(content):
-    """Why this content may not enter the always-on index, or None if it may.
-
-    A REFUSAL, not an alarm. An earlier bound on this channel only appended to a
-    warning list while the write proceeded, which is how 62 stumps became
-    resident doctrine without anyone deciding they should be
-    ([[alarm-only-bound-is-not-a-bound]]).
-    """
+    """Why this content may not enter the always-on index, or None if it may."""
     text = (content or "").strip()
     if not text:
         return "empty content"
@@ -2246,24 +1600,10 @@ _STORE_DESC = re.compile(r"^description:\s*(.*)$", re.M)
 
 
 def projection_drift(fold, store):
-    """Where an event's `content` and its store file's `description:` disagree.
+    """Classify where a bodyless lesson's `content` and its store file's
+    `description:` disagree: file_richer, event_richer, or disjoint.
 
-    Every memory has two renderings of its one-line essence, and until this
-    check existed nothing compared them — the 2026-07-31 stumps (a producer
-    composing content from an already-truncated derivative while the lossless
-    text sat in the same file) were invisible until someone counted ellipses.
-
-    Classification, not repair — the fold detects, the operator decides:
-    * FILE-RICHER: the file's description extends the event's content. The
-      smoking gun that a producer read a derivative again (or a legacy stump
-      whose repair is still pending).
-    * EVENT-RICHER: the event extends the file. Projection lag or a hand-edit.
-    * DISJOINT: neither extends the other — two writers told two stories.
-
-    v4 tips carrying a `body` are exempt: for those the event is the declared
-    home and `project_store` already repairs the file from it. Grandfathered
-    tips are exactly the era where the FILE was the source (backfill read it),
-    which is why the comparison is worth a timer slot at all.
+    Detection only. Events carrying a body are skipped (project_store owns them).
     """
     out = {"file_richer": [], "event_richer": [], "disjoint": []}
     if store is None:
@@ -2274,16 +1614,14 @@ def projection_drift(fold, store):
             continue
         f = store / (e["subject"].split("/")[-1] + ".md")
         if not f.exists():
-            continue                      # ghost repair's problem, not drift
+            continue
         m = _STORE_DESC.search(f.read_text(encoding="utf-8"))
         if not m:
             continue
         desc, cont = norm(m.group(1).strip().strip('"')), norm(e["content"])
         if desc == cont:
             continue
-        # Strip a "Title: " head before comparing: the legacy composer prepended
-        # one, and flagging every stump as DISJOINT because of its own prefix
-        # would bury the real disjoints in 62 rows of known history.
+        # Ignore a legacy "Title: " prefix when comparing.
         bare = cont.split(": ", 1)[-1] if ": " in cont[:70] else cont
         if desc.startswith(bare) or desc.startswith(cont):
             out["file_richer"].append(e["subject"])
@@ -2304,16 +1642,12 @@ def index_subjects(text):
 
 
 def residency_delta(live_path, new_text):
-    """What this render would ADD to / DROP from always-on, or None if neither.
+    """Subjects this render would add to / drop from always-on, or None.
 
-    Membership only. A row whose prose changed is not a residency change: the
-    memory is still resident and the operator still lives with it. Conflating
-    the two would stage on every content refresh, the gate would be routine, and
-    a routine gate is one the operator clicks through — which is how a control
-    becomes a rubber stamp instead of a decision.
+    Membership only; changed prose on a resident row is not a delta.
     """
     if not live_path.exists():
-        return None                      # first write on a fresh host
+        return None                      # first write
     old = set(index_subjects(live_path.read_text(encoding="utf-8")))
     new = set(index_subjects(new_text))
     added, dropped = sorted(new - old), sorted(old - new)
@@ -2334,36 +1668,20 @@ def render_residency_diff(delta):
 def write_harness_memory(fold, allow_residency_delta=False):
     """Atomically regenerate <store>/MEMORY.md if this host has opted in.
 
-    THE WRITE GATE. A derived view whose consumer hard-truncates is not
-    "produced" until the composed artifact satisfies the CONSUMER's bound, so
-    nothing is published here that `delivery_breach` rejects, and what landed
-    is re-read and re-measured afterwards — publishing bytes is not the same as
-    the harness being able to load them ([[check-the-delivery-not-just-the-doing]]).
-
-    Returns a report dict describing what happened (never None once a store is
-    present); the caller is expected to surface `alarms`. Still never raises: a
-    broken store must not fail the fold, whose MESH views are unaffected — but
-    it must never look like success either.
+    A residency change is staged instead of written unless allowed; the
+    published file is re-measured against the loader ceilings. Returns a report
+    dict whose `alarms` the caller should surface. Never raises.
     """
     store = harness_store()
     if store is None:
         return {"status": "skipped", "alarms": []}
     try:
-        # SPEC-v4 live render is a per-host OPT-IN (2026-09-17), same pattern as
-        # the .mesh-generated marker: touch <MESH_ROOT>/state/render-v4 once the
-        # shadow diff has been reviewed. Until then the v3 rule (undeclared =
-        # always-on) keeps rendering, and the switch itself lands through the
-        # residency-delta gate below — HELD until the operator promotes.
+        # Residency-based render is a per-host opt-in via state/render-v4.
         if (MESH_ROOT / "state" / "render-v4").exists():
             text, report = render_harness_memory_v4(fold, store, live=True)
         else:
             text, report = render_harness_memory(fold, store)
-        # What is worth waking someone for. Trimming the NAMED SLUG LIST is the
-        # designed, healthy degradation — the appendix is meat, /recall reaches
-        # those slugs by name regardless, and it re-trims every time a memory is
-        # added. Alarming on it would page on a number that drifts constantly
-        # and teach the operator to ignore the channel. Losing an INDEX ROW is
-        # different: that row is a memory's only always-on trace.
+        # Alarm on dropped index rows, not on trimmed slug names.
         alarms = []
         if not report["ok"]:
             alarms.append(
@@ -2375,19 +1693,8 @@ def write_harness_memory(fold, allow_residency_delta=False):
                 f"harness MEMORY.md is dropping always-on index rows: "
                 f"{report['rows']}/{report['rows_total']} kept — the index has "
                 f"outgrown its ceiling, curate (merge/delete)")
-        # THE RESIDENCY GATE. Residency is the operator's data; a scheduler may
-        # not change it on his behalf. On 2026-07-31 a renderer edit freed bytes,
-        # the 5-minute timer folded, and 15 rows were promoted into always-on
-        # four minutes before the author could show the operator the diff he had
-        # promised. The review step was on the CONSUMER path and the machine path
-        # is faster than a human, every time — so the fix is here, at the
-        # producer, not in a resolution to be careful
-        # ([[fix-human-loop-races-at-the-producer]]).
-        #
-        # Asymmetric, not blanket: a fold that keeps the SAME row set is a
-        # refresh of rows the operator already lives with, and blocking it would
-        # freeze the index and call that safety. A fold that ADDS or DROPS a row
-        # is a residency change, and that one stages and waits.
+        # Residency gate: same row set writes through; an added or dropped
+        # row is staged for the owner to promote.
         live = store / "MEMORY.md"
         delta = residency_delta(live, text)
         if delta and not allow_residency_delta:
@@ -2407,9 +1714,7 @@ def write_harness_memory(fold, allow_residency_delta=False):
         os.replace(tmp, store / "MEMORY.md")
         for leftover in ("MEMORY.md.staged", "MEMORY.md.staged.diff"):
             (store / leftover).unlink(missing_ok=True)
-        # Post-write verification: measure what is actually on disk, not what we
-        # think we rendered. An atomic replace publishes a known-bad artifact
-        # just as reliably as a good one.
+        # Re-measure what actually landed on disk.
         published = (store / "MEMORY.md").read_text(encoding="utf-8")
         landed = delivery_breach(published)
         if landed:
@@ -2419,8 +1724,6 @@ def write_harness_memory(fold, allow_residency_delta=False):
                       alarms=alarms)
         return report
     except Exception as e:  # noqa: BLE001
-        # The MESH views are intact; the HARNESS view — the thing that just
-        # failed — is not. Say which.
         print(f"fold: harness MEMORY.md write FAILED, sessions keep the stale "
               f"copy (mesh views unaffected): {e}", file=sys.stderr)
         return {"status": "failed", "error": str(e),
@@ -2431,17 +1734,9 @@ _FRONT_LINEAGE = re.compile(r"^lineage:\s*(\S+)\s*$", re.M)
 
 
 def store_file_lineage(slug, store=None):
-    """The `lineage:` a store file ACTUALLY carries — the store's own answer.
+    """The `lineage:` a store file carries; "absent" if none, None if no file.
 
-    Public because two callers need the same answer and got it from different
-    places until 2026-09-12: the fold's drift DETECTOR (below) and sign.py's
-    store reconciliation. sign.py used neither — it keyed reconciliation on the
-    --promote verb instead of on this condition, so every other path from
-    quarantined to served left the file tagged contains-untrusted forever
-    (28 subjects, all via signed `correct`; see store_quarantine_drift).
-
-    Returns the lineage string, "absent" for a file with no lineage line, or
-    None when there is no store file for this slug at all.
+    Shared by store_quarantine_drift and sign.py's store reconciliation.
     """
     store = Path(store or store_dir())
     p = store / f"{slug}.md"
@@ -2450,26 +1745,14 @@ def store_file_lineage(slug, store=None):
     m = _FRONT_LINEAGE.search(p.read_text(encoding="utf-8", errors="replace"))
     return m.group(1) if m else "absent"
 
-# The store's vocabulary for "the operator stands behind this" differs from the
-# mesh's (`craig-direct` vs `operator-direct`). Two names for one idea is itself
-# a seam, but renaming either side would rewrite 140 events or every memory file,
-# so the mapping is stated in one place instead of assumed in several.
+# Trusted lineage in store vocabulary and mesh vocabulary.
 TRUSTED_LINEAGES = {"craig-direct", "operator-direct"}
 
 
 def store_quarantine_drift(fold, store=None):
-    """Ways the STORE's quarantine surface disagrees with the mesh's (2026-07-30).
+    """Human-readable ways the store's lineage tags disagree with the mesh's quarantine.
 
-    Craig's ruling: "if I promote it, that must be fact everywhere." Promotion
-    now writes both surfaces (sign.py reconcile_store), but a rule that is only
-    enforced at the moment of one command drifts the first time anything else
-    touches either side — which is precisely how the gate this session repaired
-    came to be documented-but-absent. So the fold checks the join every run.
-
-    This is DETECTION, not repair. It deliberately does not rewrite store files:
-    the per-file `lineage:` is a fact with an owner (memory_write.py), and a fold
-    that silently edited facts to match its own view would be the same class of
-    mistake in the other direction. Returns a list of human-readable drifts.
+    Detection only; store files are owned by memory_write.py.
     """
     store = Path(store or store_dir())
     if not store.is_dir():
@@ -2499,11 +1782,7 @@ def store_quarantine_drift(fold, store=None):
             drift.append(f"{subj} is QUARANTINED by the mesh but its store file "
                          f"says lineage: {lin} — the store would let /recall "
                          f"serve it as trusted")
-    # 3. Untrusted in the store but unknown to the mesh entirely. These predate
-    #    the mesh cutover, so no event carries their lineage and the mesh cannot
-    #    hold them back. Named rather than fixed: backfilling them is an operator
-    #    act, and silently dropping them from the quarantine picture is how a
-    #    withheld fact becomes an invisible one.
+    # 3. Untrusted in the store but with no mesh event at all.
     known = {s.split("/", 1)[1] for s in (live_subjects | quar_subjects)
              if s.startswith("lesson/")}
     for p in sorted(store.glob("*.md")):
@@ -2518,29 +1797,17 @@ def store_quarantine_drift(fold, store=None):
                          f"--subject lesson/{slug} --lineage contains-untrusted). "
                          f"NOT backfill.py: that reads the PRE-CUTOVER index "
                          f"format and matches nothing now")
-
-    # A fourth check used to live here: parse the store's quarantine LIST and
-    # flag entries no longer quarantined. It existed because that file had no
-    # writer (consolidate.py, which memory_write.py's retag docstring still
-    # names, does not exist) and kept listing a memory hours after it was
-    # promoted and served. As of 2026-07-30 the fold GENERATES that file from
-    # this same verdict set, so checking it would be asking the fold whether it
-    # agrees with itself. Retired deliberately, not lost: what it protected
-    # against is now structurally impossible rather than merely detected.
     return drift
 
 
 def view_version(fold):
-    """sha256 of folded state — identical on every host for identical logs
-    (drill 5), and the staleness contract for the future PreToolUse hook."""
+    """sha256 of folded state; identical on every host for identical logs."""
     reg_hash = hashlib.sha256((CODE_DIR / "subjects.toml").read_bytes()).hexdigest()[:16]
     basis = json.dumps(
         {"registry": reg_hash,
          "signed": sorted(e["id"] for e in fold["live"] if e.get("_signed")),
          "live": sorted(e["id"] for e in fold["live"]),
          "parked": {k: sorted(e["id"] for e in v) for k, v in fold["parked"].items()},
-         # Quarantine is folded state: promoting a held-back fact changes what
-         # every host serves, so it must move the staleness contract too.
          "quarantined": sorted(e["id"] for e in fold.get("quarantined", [])),
          "unnormalized": sorted(e["id"] for e in fold["unnormalized"])},
         sort_keys=True)

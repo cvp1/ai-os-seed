@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
-"""canary — positive control for the per-turn retrieval channel.
+"""canary: positive control for the per-turn retrieval channel.
 
-The 2026-08-13 memory-mesh tri-model review moved always-on weight onto
-retrieval and named the cost: rules demoted to retrieval-only "simply stop
-firing" if the retriever silently degrades, and nothing watched for that. This
-is the watcher — the same positive-control discipline as everywhere else in
-the fleet: a NEGATIVE result (no memories served) is only evidence if the
-instrument can be shown to produce a positive.
-
-Method: SELF-CUE. Sample three servable memories deterministically (first,
-middle, last of the sorted corpus) and ask retrieve.score() to find each one
-using its own frontmatter `description` as the turn text. A memory that cannot
-be retrieved by its own human-written summary — the exact field the scorer
-triple-weights — means the channel is degraded, whatever else looks green.
-No dedicated canary memory: a real corpus row can't rot into a special case,
-and the probe re-targets itself as the corpus changes.
-
-Pass: >=2 of 3 self-cues hit (scoring nuance on one pathological doc must not
-page daily). Silent on pass (Principle 7); loud + exit 1 on fail. A missing
-manifest or empty corpus is a FAIL — that is the channel being dark, which is
-the one thing this must never report as health.
-
-Wired into the daily `cc-context-health` job (cron/MANIFEST.md).
+Samples three servable memories (first, middle, last) and checks retrieve.score()
+finds each from its own `description`. Passes on >=2 of 3; silent on pass,
+exit 1 on fail. A missing manifest or empty corpus fails.
 
     /usr/bin/python3 ~/{{REDACTED}}/memory-mesh/canary.py
     /usr/bin/python3 ~/{{REDACTED}}/memory-mesh/canary.py --selftest
@@ -39,7 +21,7 @@ REQUIRED = 2
 
 
 def run(store=None, manifest=None):
-    """Returns (ok, findings)."""
+    """Return (ok, findings)."""
     store = store or M.harness_store()
     allow = R.servable(path=manifest)
     if allow is None:
@@ -69,7 +51,7 @@ def run(store=None, manifest=None):
 
 
 def _selftest():
-    """Prove the instrument can show the positive AND the negative."""
+    """Check the canary passes a healthy fixture and fails on missing manifest or empty corpus."""
     import json
     import tempfile
     fails = []

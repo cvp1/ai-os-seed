@@ -1,40 +1,10 @@
 #!/usr/bin/env python3
-"""retrieve — score the memory corpus against a turn and return the top-k.
+"""retrieve: score the memory corpus against a turn's text and inject the top-k.
 
-THE POINT. Always-on memory is capped at ~24 KB by the consumer, the corpus
-grows every session, and `/recall` is manual — an agent that does not know a
-rule exists cannot think to look for it. So everything important got crammed
-into the one channel that always fires, and 142 rows fought over one budget.
-That fight is a DELIVERY problem wearing a storage problem's clothes.
-
-This is the other delivery channel: given the text of a turn, surface the
-memories that turn actually needs. Corpus size stops touching the always-on
-budget, so growth stops requiring a curation session.
-
-LIFECYCLE. This tier serves only what the fold still stands behind, filtered
-through the `_servable.json` manifest (live, non-superseded, non-quarantined,
-non-parked). It did NOT until 2026-07-31: it globbed the store and consulted no
-verdict at all, so quarantined untrusted-lineage facts and superseded doctrine
-both rode in labelled "STANDING RULES" — verified live, including a session that
-was served a quarantined subject while reviewing this very file. A store file is
-not a servable fact; the fold keeps files for subjects it has retired.
-
-WHAT THIS DOES NOT SOLVE (say it plainly, so nobody reads it as a cure):
-  * multi-hop — needing memory A to learn that B exists. Flat top-k will not.
-  * conflicting or stale memories both scoring in — retrieval will serve both
-    confidently. The mesh parks DETECTED contradictions; undetected ones ride,
-    and same-proposition-different-subject pairs are not detected at all.
-  * which memories deserve to exist at all. Delivery is solved here; curation
-    QUALITY still scales with the corpus.
-
-SECURITY. Scoring runs on the turn's text, so text can steer which memories
-load — including AWAY from a rule an attacker would rather not fire. Untrusted
-spans (pasted mail, fetched pages, tool output) are fenced out of the scorer
-before it runs. That is necessary, not sufficient: the real answer is that
-anything genuinely dangerous is a GATE (see ~/.claude/hooks/safety-gate.py),
-not a memory that has to be retrieved to work.
-
-Stdlib only; targets /usr/bin/python3.
+Hook: reads the event JSON on stdin, prints a <memory-retrieved> block.
+Serves only slugs in the fold's `_servable.json` manifest. Untrusted spans are
+fenced out before scoring. Not multi-hop; does not resolve undetected conflicts.
+Stdlib only.
 """
 import json
 import math
@@ -50,9 +20,7 @@ import mesh_lib as M  # noqa: E402
 
 TOP_K = 5
 MAX_INJECT_BYTES = 1400
-# Spans we refuse to score on: content the agent INGESTED rather than the
-# operator's own words. A crafted page that repeats "ignore memory about
-# secrets" would otherwise reshape retrieval by sheer term frequency.
+# Ingested spans excluded from scoring so they cannot steer retrieval.
 FENCE_RX = re.compile(
     r"<system-reminder>.*?</system-reminder>"
     r"|```.*?```"
@@ -71,17 +39,9 @@ def _tok(text):
 
 
 def servable(store=None, path=None):
-    """The fold's delivery manifest: slugs this tier may serve. None if absent.
+    """Return the set of servable slugs from the fold's manifest, or None if missing/corrupt.
 
-    A store FILE is not a servable fact. Quarantined and superseded subjects
-    keep their files — deletion on a projection would be data loss — so the
-    file's existence says nothing about whether the fold still stands behind
-    it. Written by `mesh_lib.write_servable_manifest` on every fold.
-
-    `path` overrides the location OUTRIGHT — no fallback. A test that could
-    silently fall back to the host's real manifest would pass for the wrong
-    reason: its query matches nothing in the real corpus either, so "empty" would
-    look like "correctly suppressed" while proving nothing.
+    `path` overrides the location with no fallback.
     """
     p = path if path is not None else M.servable_manifest_path()
     try:
@@ -91,11 +51,9 @@ def servable(store=None, path=None):
 
 
 def corpus(store, allow=None):
-    """Servable memory files, as (slug, description, text).
+    """Return servable memory files as (slug, description, text).
 
-    `allow` is the fold's manifest. Filtering here rather than at render time is
-    deliberate: a held-out doc must not reach the SCORER either, or its terms
-    still shape idf and it can displace a legitimate hit without appearing.
+    Filtered by `allow` before scoring so excluded docs do not affect idf.
     """
     out = []
     if store is None:
@@ -116,13 +74,7 @@ def corpus(store, allow=None):
 
 
 def score(turn_text, docs, k=TOP_K):
-    """Plain TF-IDF cosine-ish scoring. Deterministic, no model, no network.
-
-    Deliberately dumb: the fold has a no-model invariant and this runs on every
-    turn, so an embedding call would add a dependency, a latency tail and a
-    failure mode to the hot path. If precision proves insufficient the answer is
-    corpus consolidation (merge duplicates), not a smarter scorer in the loop.
-    """
+    """Return the top-k (score, slug, desc) by TF-IDF; deterministic, no model or network."""
     q = _tok(turn_text)
     if not q:
         return []
@@ -131,8 +83,7 @@ def score(turn_text, docs, k=TOP_K):
     df = {}
     toks = []
     for slug, desc, text in docs:
-        # weight the description: it is the human-written summary, and matching
-        # it is a better relevance signal than matching a word buried in prose
+        # Weight the description above body text.
         t = _tok(desc) * 3 + _tok(text)
         tf = {}
         for w in t:
@@ -154,20 +105,12 @@ def score(turn_text, docs, k=TOP_K):
 
 
 def fence(text):
-    """Drop ingested spans before scoring (see SECURITY above)."""
+    """Drop ingested spans before scoring."""
     return FENCE_RX.sub(" ", text or "")
 
 
 def retrieve(turn_text, store=None, k=TOP_K, manifest=None):
-    """Top-k servable memories for this turn, or [] if the manifest is missing.
-
-    FAILS CLOSED, unlike the module's outer handler. That asymmetry is the
-    point: an exception means this code broke and a missed memory beats a
-    bricked turn, but a missing manifest means the fold's verdict is UNKNOWN —
-    and serving unfiltered was the live defect this exists to fix, not a
-    tolerable degradation. The fold republishes on every run, so the closed
-    window is bounded by the timer and self-heals.
-    """
+    """Return top-k servable memories for this turn; [] if the manifest is missing (fails closed)."""
     store = store or M.harness_store()
     allow = servable(path=manifest)
     if allow is None:
@@ -179,16 +122,9 @@ def retrieve(turn_text, store=None, k=TOP_K, manifest=None):
 
 
 def log_injection(turn_text, hits, path=None):
-    """Record what was injected and why.
+    """Append an audit record of injected hits to the retrieval log.
 
-    Without this, 'why did it do that' is unanswerable a week later, and a
-    poisoned memory that shaped a turn leaves no trace. The log is the audit
-    surface for a channel that otherwise operates invisibly.
-
-    `ts` (added 2026-08-14, effectiveness.py): a Unix timestamp per line so a
-    later reader can window by real time instead of line count. Additive
-    only — older lines have no `ts` and readers must treat that as "unknown
-    time," never as epoch 0.
+    Older lines may lack `ts`; readers treat that as unknown time, not epoch 0.
     """
     path = path or (M.MESH_ROOT / "state" / "retrieval-log.ndjson")
     try:
@@ -205,11 +141,7 @@ def log_injection(turn_text, hits, path=None):
 def render(hits):
     if not hits:
         return ""
-    # Framing is load-bearing and was MEASURED, not guessed (P1b, 2026-07-31):
-    # "relevant memories ... lower authority than always-on" scored 8/10 on the
-    # unnatural-behaviour probe; the directive framing below scored 9/10. Same
-    # rule, same model, same n. Retrieved rules still yield to the user and to
-    # always-on, but hedging the DELIVERY cost compliance.
+    # Directive framing measured better compliance than hedged framing.
     lines = ["<memory-retrieved>",
              "STANDING RULES retrieved for this turn. Follow them exactly "
              "unless the user or an always-on rule overrides them:"]
@@ -246,9 +178,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        # FAIL OPEN, loudly. A retrieval hook that can break a turn is worse
-        # than one that occasionally misses — a gate that bricks sessions gets
-        # deleted, and then there is no gate at all.
+        # Fail open loudly: a broken hook must not break the turn.
         print(f"retrieve: failed open ({e.__class__.__name__}: {e})",
               file=sys.stderr)
         sys.exit(0)

@@ -56,14 +56,12 @@ echo "== 4. fscrypt setup =="
 # Global config /etc/fscrypt.conf.
 fscrypt setup --force 2>/dev/null || true
 
-# Per-filesystem metadata at the mount root. --all-users lets your NON-root
-# login create/unlock the vault's protector (metadata dir becomes world-
-# writable + sticky; it holds only wrapped key material, useless without the
-# passphrase). v2 policy / fs keyring means one unlock then covers cron too.
+# Per-filesystem metadata. --all-users lets a non-root user create/unlock the
+# protector; the metadata dir holds only wrapped key material.
 if fscrypt setup / --all-users --force 2>/dev/null; then
   echo "   filesystem set up (all-users)"
 else
-  # "already setup" — fscrypt won't re-run, so verify it actually allows non-root.
+  # Already set up: verify it allows non-root.
   if [ "$(stat -c '%A' /.fscrypt 2>/dev/null | cut -c9)" = "w" ]; then
     echo "   already set up (all-users)"
   else

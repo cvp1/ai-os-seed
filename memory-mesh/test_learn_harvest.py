@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""learn_harvest / learn_card: only quarantined writes, only through the door;
-promotion only through sign.py; filters run before any model sees a line."""
+"""Tests for learn_harvest / learn_card: quarantined writes via the door, promotion via sign.py, filters before the model."""
 from __future__ import annotations
 
 import importlib

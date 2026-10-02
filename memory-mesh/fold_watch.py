@@ -1,34 +1,9 @@
 #!/usr/bin/env python3
-"""fold_watch — the mesh reporting its own breakage, from outside the fold.
+"""fold_watch: check mesh health from outside the fold (run under the scheduler).
 
-SEED-080 M6. A monitor cannot certify its own liveness (PRINCIPLES 21): the
-fold runs on a timer, and if that timer stops, the fold is the last thing that
-will say so — it is not running. Everything downstream still looks fine for a
-while: MEMORY.md is on disk, the servable manifest is on disk, retrieval keeps
-serving. The corpus simply stops being true, silently, and the first symptom
-is an agent acting on a rule that was superseded days ago.
-
-So this runs under the SCHEDULER, not under the fold — a different failure
-domain — and the scheduler's own run log and freshness backstop are in turn
-watched from outside it. Four checks, each a fact with a source:
-
-  1. FOLD LIVENESS  — the newest mesh state file's age against the timer's
-                      cadence. The fold rewrites state on every run, so an old
-                      state file means the timer stopped, not that nothing
-                      happened.
-  2. INDEX AGE      — the served index against the newest event. An index
-                      older than the log is a fold that ran and could not
-                      publish, which looks identical to health from a session.
-  3. HOOK WIRING    — the hook entries the install receipt says were approved,
-                      still present in settings.json. An agent cannot notice
-                      that its own retrieval hook stopped firing.
-  4. PEERS          — each configured peer's last-seen age, where a mesh has
-                      peers. Single-host meshes skip it by name, never
-                      silently.
-
-Edge-triggered (PRINCIPLES 7): silent and exit 0 when everything holds; loud
-and exit 1 on the first real problem. A check that cannot run says so and does
-NOT count as a pass.
+Checks: fold liveness (newest state file age), index age vs newest event,
+approved hook entries still wired in settings.json, and peer last-seen ages.
+Silent with exit 0 when all hold; exit 1 on FAIL or UNKNOWN.
 
     fold_watch.py                 # under the scheduler
     fold_watch.py --json
@@ -112,9 +87,7 @@ def check_index_age():
 
 
 def check_hook_wiring():
-    """What the receipt says was approved must still be wired. This is the
-    check an agent cannot perform on itself: a hook that stopped firing
-    produces silence, and silence is what a working hook produces too."""
+    """Check that hook entries approved in the install receipt are still wired in settings.json."""
     receipt = ROOT / ".cc-seed" / "receipt.json"
     if not receipt.exists():
         return ("hooks", "SKIP", f"no install receipt at {receipt} (not a seed "
@@ -137,12 +110,7 @@ def check_hook_wiring():
         doc = json.loads(settings.read_text(encoding="utf-8") or "{}")
     except ValueError as e:
         return ("hooks", "FAIL", f"{settings} is not valid JSON: {e}")
-    # Parsed, not grepped. Until 2026-09-19 this searched the settings file as
-    # raw TEXT for each approved command, so replacing the whole `hooks` block
-    # with a `notes` field holding the same strings left this check green with
-    # nothing runnable wired at all -- and `disableAllHooks: true` passed too
-    # (SEED-080 review, finding 2, executed as no_hooks_green /
-    # disabled_hooks_green).
+    # Parse the hooks structure rather than grepping the file text.
     if doc.get("disableAllHooks") is True:
         return ("hooks", "FAIL",
                 f"{settings} sets disableAllHooks: true — every approved hook "
@@ -157,7 +125,7 @@ def check_hook_wiring():
             for h in (e.get("hooks") or []):
                 if isinstance(h, dict) and h.get("command"):
                     wired.setdefault(event, set()).add(h["command"])
-    # Under ITS OWN EVENT: a retrieval hook moved to Stop is not retrieval.
+    # Each command must be wired under its own event.
     missing = [f"{event}: {cmd}"
                for event, cmds in approved.get("entries", {}).items()
                for cmd in cmds if cmd not in wired.get(event, ())]
@@ -181,13 +149,7 @@ def check_peers(max_age):
     now = time.time()
     stale, unknown = [], []
     for host, entry in data.items():
-        # Until 2026-09-19 fold.py wrote a bare git SHA here and this loop did
-        # `float(ts)`, which raises on every hex string -- and the `continue`
-        # then dropped the peer from consideration entirely, so the function
-        # went on to announce "N peer(s) seen recently" about peers whose age
-        # it had never established. A 24-hour-old file naming an offline peer
-        # returned OK (SEED-080 review, finding 6). File mtime is not usable
-        # as a substitute: git and Syncthing both reset it.
+        # Legacy entries are bare SHAs with no timestamp: report as unknown age.
         ts = entry.get("ts") if isinstance(entry, dict) else None
         if ts is None:
             unknown.append(host)

@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
-"""friction-miner — the generator that proposes generators (SPEC.md).
+"""friction-miner — propose one automation candidate per run from repeated toil.
 
-Weekly deterministic pass over corpora that already exist and nobody reads
-— session transcripts (Craig's own typed `!` commands ONLY), the proposal
-audit trail, and git hand-commit history across CC — surfacing at most ONE
-automation candidate per run as an initiative opener (source
-`initiative.friction`, wired via initiative/engine.py cond_friction). The
-miner never builds anything: its entire output is one candidates.jsonl row;
-the opener machinery owns caps, expiry, and the trust-ledger learning loop.
-
-Hard boundaries (SPEC.md): on-host only, zero LLM, evidence is command
-SHAPES and counts, never content. A command carrying an inline secret-like
-assignment is dropped entirely (when in doubt, drop the candidate). The
-miner reads only Craig's own actions — agent-run commands and ingested
-text are never mined.
+Deterministic, zero-LLM pass over user-typed `!` commands in session
+transcripts, shell history, the proposal audit trail, and hand-made git
+commits. Evidence is command shapes and counts, never content; commands with
+inline secret-like assignments are dropped. Output is one candidates.jsonl row.
 
 Usage:  miner.py run          weekly cron entry (edge-trigger: a no-find
                               run prints nothing)
@@ -22,15 +13,9 @@ Usage:  miner.py run          weekly cron entry (edge-trigger: a no-find
                               suggested command)
         miner.py status       candidates + dispositions, read-only
 
-On a cc-seed install (a .cc-seed/receipt.json at the root) there is no
-initiative engine: the candidate lands in
-observability/data/friction-miner/candidates.jsonl (a runtime-writable path
-the install audit expects), the run's FINDINGS line reaches runs.db, and
-`miner.py status` is the review surface. Shell history is read from
-~/.bash_history and ~/.zsh_history (zsh's extended ": <epoch>:<dur>;cmd"
-lines are dated), or from FRICTION_HISTORY (os.pathsep-separated paths).
-
-Deterministic, stdlib, /usr/bin/python3-safe.
+On a cc-seed install, candidates go to observability/data/friction-miner/.
+Shell history: ~/.bash_history and ~/.zsh_history, or FRICTION_HISTORY
+(os.pathsep-separated).
 """
 import argparse
 import hashlib
@@ -44,8 +29,7 @@ from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CC = os.path.dirname(HERE)
-# A seed install keeps runtime state out of its shipped component dirs (the
-# install audit hashes those); observability/data/ is where it expects writes.
+# Seed installs write runtime state under observability/data/, not component dirs.
 SEED_INSTALL = os.path.isfile(os.path.join(CC, ".cc-seed", "receipt.json"))
 STATE_PATH = os.environ.get("FRICTION_MINER_STATE") or (
     os.path.join(CC, "observability", "data", "friction-miner", "candidates.jsonl")
@@ -54,9 +38,7 @@ PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 
 def history_paths():
-    """Every shell history this operator has: FRICTION_HISTORY if set, else
-    whichever of bash's and zsh's default files exist (macOS defaults to zsh —
-    a bash-only reader mined nothing there; {{REDACTED}}'s fork, 2026-09-27)."""
+    """FRICTION_HISTORY paths if set, else the existing bash/zsh history files."""
     raw = os.environ.get("FRICTION_HISTORY")
     if raw:
         return [os.path.expanduser(p) for p in raw.split(os.pathsep) if p]
@@ -72,16 +54,10 @@ CONDITIONS_PATH = os.path.join(CC, "initiative", "state", "conditions.json")
 WINDOW_DAYS = 28
 MIN_SESSIONS = 3        # D1/D2: distinct sessions (claude session or a dated
                         # terminal day) before a shape is friction
-MIN_SHELL_HITS = 4      # D1: occurrence floor for UNDATED shell history —
-                        # Craig's correction 2026-07-21: most hand work
-                        # happens in a plain terminal, not via `!`; history
-                        # without HISTTIMEFORMAT can't window or count days,
-                        # and ignoredups collapses repeats, so raw counts
-                        # already undercount
+MIN_SHELL_HITS = 4      # D1: occurrence floor for undated shell history
 MIN_EDITS = 3           # D3: same-way edits before a generator is suspect
 MIN_COMMITS = 3         # D4: hand commits touching the same file
-MIN_COMMIT_DAYS = 3     # D4: across >= this many distinct days — a cadence,
-                        # not one day's dev burst (live-tuned 2026-07-21)
+MIN_COMMIT_DAYS = 3     # D4: across >= this many distinct days
 SEQ_GAP_MINUTES = 15    # D2: max gap for two commands to count as a sequence
 MAX_NEW_PER_RUN = 1     # the hard cap — one candidate a week, the best one
 MAX_DATES_KEPT = 14     # bound the evidence payload
@@ -128,9 +104,7 @@ def normalize(cmd):
     first = tokens[0].rsplit("/", 1)[-1]
     if first in STOP_FIRST_TOKENS:
         return None
-    # A bare program launch (`claude`, `{{REDACTED}}`) is entering a workspace,
-    # not automatable toil — but a bare SCRIPT invocation (…/unlock.sh) is
-    # exactly the canonical candidate. Live-tuned 2026-07-21.
+    # A bare program launch is not toil; a bare script invocation is.
     if len(tokens) == 1 and "/" not in tokens[0] \
             and not tokens[0].endswith((".sh", ".py")):
         return None
@@ -149,9 +123,7 @@ def _fp(detector, key):
 # ----------------------------------------------------------------- corpora ---
 
 def iter_bash_inputs(projects_dir, since):
-    """Yield (session_id, ts_iso, raw_command) for every command CRAIG TYPED
-    (the `!` prefix -> <bash-input> rows). Agent-run commands never appear
-    here — that's the learn-from-Craig's-actions boundary, structurally."""
+    """Yield (session_id, ts_iso, raw_command) for user-typed `!` commands only."""
     since_ts = since.timestamp()
     if not os.path.isdir(projects_dir):
         return
@@ -196,15 +168,11 @@ _ZSH_EXT = re.compile(r"^: (\d{9,12}):\d+;(.*)$")
 
 
 def iter_shell_history(history_path, since):
-    """Yield (pseudo_session_or_None, ts_iso_or_None, raw_command) from bash
-    history — the corpus where MOST of Craig's hand work actually lives (his
-    correction, 2026-07-21: the majority of manual commands run in a plain
-    terminal, never through `!`). Lines under a `#<epoch>` timestamp marker
-    (HISTTIMEFORMAT) get a real date and a per-day pseudo-session
-    (`shell-YYYY-MM-DD`), and the 28d window applies. Undated lines — all of
-    them until timestamps were enabled 2026-07-21 — yield (None, None, cmd):
-    countable occurrences, honestly unwindowed and undated. zsh's extended
-    history (`: <epoch>:<duration>;command`) is dated per line the same way."""
+    """Yield (pseudo_session_or_None, ts_iso_or_None, raw_command) from shell history.
+
+    Lines dated by a `#<epoch>` marker or zsh extended format get a per-day
+    pseudo-session (`shell-YYYY-MM-DD`) and the window applies; undated lines
+    yield (None, None, cmd)."""
     since_iso = since.strftime("%Y-%m-%d")
     pending_ts = None
     try:
@@ -290,9 +258,7 @@ def d1_repeated_command(events):
 
 def d2_sequence(events):
     """D2 — a fixed two-step sequence (A then B, close together, same
-    session) recurring in >= MIN_SESSIONS sessions. SPEC delta: v1 keys the
-    sequence on its own leading command rather than an external event feed
-    (reboot/drill markers aren't in any corpus the miner reads yet)."""
+    session) recurring in >= MIN_SESSIONS sessions."""
     by_session = defaultdict(list)
     for sid, ts, raw in events:
         if sid is None or ts is None:
@@ -332,10 +298,10 @@ def d2_sequence(events):
 
 
 def d3_approve_with_edit(audit_path, since):
-    """D3 — a card type repeatedly approved WITH edits: a mis-calibrated
-    generator's confession. Latent until the audit trail records an edit
-    marker (`edited: true` or decision `approved_with_edit`) — today it
-    records neither, so D3 correctly finds nothing (stated, not silent)."""
+    """D3 — a card type repeatedly approved with edits.
+
+    Requires an edit marker (`edited: true` or `approved_with_edit`) in the
+    audit trail; without one it finds nothing."""
     since_iso = since.strftime("%Y-%m-%dT%H:%M:%S")
     counts = defaultdict(lambda: {"n": 0, "dates": set()})
     try:
@@ -369,29 +335,23 @@ def d3_approve_with_edit(audit_path, since):
     return out
 
 
-# Commit-subject prefixes of VERIFIED scheduled committers — the fleet bus
-# (cc-handoff fleetd/worker/post_task traffic) and the typed publish verb.
-# Author identity CANNOT discriminate here: Craig's own terminal commits and
-# hand-run scripts (e.g. the seed pipeline) also land as {{REDACTED}} — his
-# correction, 2026-07-21, replacing the author-based filter that threw his
-# real hand toil away. Believe the operator.
+# Commit-subject prefixes of known scheduled committers. Author identity can't
+# discriminate: hand commits share the same author.
 AUTOMATED_SUBJECT_PREFIXES = ("post:", "claim:", "worker:", "sign:",
                               "done:", "reply:", "race-measure:")
 
 
 def d4_recurring_hand_edit(cc_root, since):
     """D4 — the same file hand-committed in >= MIN_COMMITS commits across
-    >= MIN_COMMIT_DAYS distinct days, per repo under CC. "Hand" = no Claude
-    co-author trailer AND the subject isn't a verified scheduled committer's
-    (AUTOMATED_SUBJECT_PREFIXES). Hand-RUN scripts that commit (the seed
-    pipeline) count deliberately: running them by hand is exactly the toil
-    a cron could carry."""
+    >= MIN_COMMIT_DAYS distinct days, per repo.
+
+    "Hand" = no Claude co-author trailer and not an AUTOMATED_SUBJECT_PREFIXES
+    subject; hand-run scripts that commit count."""
     since_arg = "--since=" + since.strftime("%Y-%m-%d")
     hits = defaultdict(lambda: {"commits": 0, "dates": set()})
     repos = [d for d in sorted(os.listdir(cc_root))
              if os.path.isdir(os.path.join(cc_root, d, ".git"))]
-    # A seed install is usually ONE repo at its root, with no per-project
-    # repos under it — scanning only children would find nothing there.
+    # A seed install is usually one repo at its root, so scan the root too.
     if SEED_INSTALL and os.path.isdir(os.path.join(cc_root, ".git")):
         repos.insert(0, ".")
     for repo in repos:
@@ -439,8 +399,7 @@ def d4_recurring_hand_edit(cc_root, since):
 # -------------------------------------------------------------------- state ---
 
 def load_state(state_path):
-    """-> (candidates_by_fp, disposition_by_fp). Every fingerprint ever
-    raised is permanent — raise-once is the whole anti-noise contract."""
+    """-> (candidates_by_fp, disposition_by_fp). A raised fingerprint is never raised again."""
     cands, disps = {}, {}
     try:
         with open(state_path) as f:
@@ -465,10 +424,9 @@ def _append_state(state_path, row):
 
 
 def sync_dispositions(state_path, conditions_path, now):
-    """Pull opener verdicts back from initiative/state/conditions.json —
-    done -> accepted, dismissed -> rejected, expired -> expired. Once a
-    candidate has a disposition, cond_friction stops reporting it and the
-    engine's condition entry re-arms (but the fingerprint stays burned)."""
+    """Map opener verdicts from initiative/state/conditions.json to dispositions.
+
+    done -> accepted, dismissed -> rejected, expired -> expired."""
     outcome_map = {"done": "accepted", "dismissed": "rejected",
                    "expired": "expired"}
     try:

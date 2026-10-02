@@ -6,12 +6,7 @@
                                         which needs the operator's signing key
     learn_card.py reject N [--reason]   fingerprint item N so it never comes back
 
-Accept is the SIGNED promotion and nothing weaker. {{REDACTED}}'s pre-upstream copy
-re-emitted the item with operator-direct lineage straight into the event log
-— a script could turn untrusted text into served memory with no key and no
-door, which is the exact path the quarantine exists to close. Upstreamed
-2026-09-27 without it: this tool can only hand an event id to sign.py, and
-sign.py is where the key is asked for.
+Accept only hands the event id to sign.py; this tool never writes trusted lineage.
 """
 from __future__ import annotations
 

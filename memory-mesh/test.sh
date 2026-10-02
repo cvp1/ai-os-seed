@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 PYTHON="${TEST_PYTHON:-python3}"
-# coverage is a nice-to-have, not a dependency: a stdlib-only host (the seed's
-# stated target) runs the same suite under plain unittest (SEED-081).
+# coverage is optional; without it the suite runs under plain unittest.
 if "$PYTHON" -c "import coverage" 2>/dev/null; then
   "$PYTHON" -m coverage erase
   "$PYTHON" -m coverage run -m unittest -v test_core.py test_learn_harvest.py

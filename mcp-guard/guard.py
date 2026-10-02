@@ -1,43 +1,12 @@
 #!/usr/bin/env python3
-"""guard — MCP supply-chain drift alarm (Story 031).
+"""guard — MCP supply-chain drift alarm.
 
-Tool poisoning is systemic (MCPTox: >60% attack success; ~5.5% of public MCP
-servers carry poisoning indicators; NSA MCP guidance May 2026). "Rug pulls" — a
-server silently redefining a tool AFTER you approved it — are a named class. At
-~14 self-authored servers + a handful of third-party clients, the right level is
-**pin + diff + allowlist**, not a platform.
-
-This module is the *diff* half: it snapshots each configured MCP server's launch
-surface (type + command + args incl. the pinned version + url + env + headers)
-at vet time, and a
-weekly check diffs live-vs-snapshot and edge-triggers on ANY change — the config-
-seam rug-pull detector. It also flags a FLOATING version (`@latest`/`@next`/no
-`@x.y.z` — `1.2`, `1.2.x` and `a || b` are ranges too) proactively, snapshot
-or not. env/headers joined the hash 2026-09-27 (FP 2); an entry recorded before
-that is reported `unfingerprinted` (re-vet, re-snapshot), never as a rug pull.
-
-Why the launch surface is the right thing to hash for pinned stdio servers: an
-exact npm/pypi version is immutable, so its advertised tools cannot change under
-a stable pin — a rug pull there REQUIRES a version/command change, which this
-catches. Servers whose tool defs come from a mutable UPSTREAM (composio → Composio
-cloud, ha-local → HA) are the deep-hash candidates (see MCP-SUPPLY-CHAIN.md); the
-pinned static servers are fully covered by pin-drift.
-
-Reads every scope Claude Code launches servers from: ~/.claude.json's user
-scope AND its per-project scopes, plus the workspace's own .mcp.json (and any
-extra files in MCP_GUARD_CONFIGS, os.pathsep-separated). Until 2026-09-27 it
-read the user scope only, so a server moved to project scope (Story 018's
-scope_migrate did exactly that) read as REMOVED and was never diffed again —
-{{REDACTED}}'s fork read every scope; folded here. A server keeps its bare name as
-its key unless that name is already taken by an earlier scope, so snapshots
-recorded before this change still match.
-
-The snapshot stores a REDACTED manifest (secret-named args and URL query
-strings blanked) — the hash is still taken over the full manifest, so a change
-hidden inside a redacted value is still drift. Snapshot is a deliberate human
-step (re-vet, then `guard.py snapshot`). Fail-loud: drift publishes a
-`mcp-guard/drift` bus event. On a cc-seed install the snapshot lives in
-observability/data/mcp-guard/ (the install audit hashes shipped dirs).
+Snapshots each configured MCP server's launch surface (type, command, args incl.
+pinned version, url, env, headers) at vet time; `check` diffs live vs snapshot
+and edge-triggers a `mcp-guard/drift` bus event on any change. Also flags
+floating (unpinned) package versions. Reads ~/.claude.json user and project
+scopes, the workspace .mcp.json, and any files in MCP_GUARD_CONFIGS. Snapshots
+store a redacted manifest; the hash covers the unredacted one.
 
 CLI:  guard.py snapshot     (re)record the vetted manifest — human vet step
       guard.py check        diff live vs snapshot; edge-trigger on drift
@@ -63,8 +32,7 @@ _PKG = re.compile(r"^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*(@[^@/]+)?$", 
 # Exact = full major.minor.patch (optional prerelease/build) and nothing else;
 # `1.2`, `1.2.x`, `1.2.*` and `a || b` are ranges npm resolves at launch time.
 _EXACT_VER = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$")
-# Snapshot fingerprint version. 2 = env + headers are hashed too (bug bash
-# 2026-09-27 #3a). An entry without it was hashed over the v1 surface only.
+# Snapshot fingerprint version: 2 hashes env + headers; 1 did not.
 FP = 2
 
 
@@ -75,10 +43,10 @@ def _extra_configs():
 
 
 def load_servers(path=CLAUDE_JSON, extra=None):
-    """{key: cfg} for every server Claude Code can launch: the user scope and
-    each project scope of `path`, then each .mcp.json in `extra` (default: the
-    workspace's own, plus MCP_GUARD_CONFIGS). The key is the bare server name
-    unless an earlier scope already took it. Missing files -> skipped."""
+    """{key: cfg} for every launchable server across all scopes.
+
+    The key is the bare name unless an earlier scope took it; missing files
+    are skipped."""
     scopes = []
     try:
         d = json.load(open(path, encoding="utf-8"))
@@ -110,9 +78,7 @@ def load_servers(path=CLAUDE_JSON, extra=None):
 
 
 def _redact(manifest_):
-    """The manifest as stored: secret-named args (and the value after a
-    secret-named flag) blanked, URL query strings dropped. Display/storage only
-    — server_hash() still covers the unredacted manifest."""
+    """Manifest with secret-named args, env/header values and URL queries blanked."""
     m = dict(manifest_)
     args, blank_next = [], False
     for a in m.get("args") or []:
@@ -133,10 +99,7 @@ def _redact(manifest_):
 
 
 def manifest(cfg):
-    """Canonical security-relevant launch surface of one server. env and
-    headers are in it: NODE_OPTIONS=--require, PYTHONPATH or a swapped
-    Authorization header change what runs / who it talks to as surely as a
-    version bump does."""
+    """Canonical security-relevant launch surface of one server."""
     return {"type": cfg.get("type") or ("stdio" if cfg.get("command") else None),
             "command": cfg.get("command"),
             "args": list(cfg.get("args") or []),
@@ -152,17 +115,13 @@ def server_hash(cfg):
 
 
 def _legacy_hash(cfg):
-    """The v1 hash (no env/headers) — only to compare against snapshot entries
-    recorded before FP 2, so the fingerprint change does not read as a flood
-    of rug pulls. It cannot vouch for env/headers; those entries are reported
-    as `unfingerprinted` until a human re-vets and re-snapshots."""
+    """FP 1 hash (no env/headers), for comparing against older snapshot entries."""
     m = {k: v for k, v in manifest(cfg).items() if k not in ("env", "headers")}
     return hashlib.sha256(json.dumps(m, sort_keys=True).encode()).hexdigest()
 
 
 def _pkg_spec(cfg):
-    """The dynamic-runner package spec (first non-flag arg after -y), or None.
-    Only npx/uvx/etc. launches pull code at runtime — a local path is immutable."""
+    """Package spec for npx/uvx-style launches (first non-flag arg), else None."""
     if os.path.basename(cfg.get("command") or "") not in _DYNAMIC_RUNNERS:
         return None
     for a in cfg.get("args") or []:
@@ -175,8 +134,7 @@ def _pkg_spec(cfg):
 
 
 def floating_pkgs(cfg):
-    """The server's runtime package spec if it is NOT exactly pinned (a floating
-    tag like @latest/@next, a range @^/@~, or no version) — else []."""
+    """[spec] if the runtime package is not pinned to an exact version, else []."""
     spec = _pkg_spec(cfg)
     if spec is None:
         return []
@@ -202,8 +160,7 @@ def snapshot(path=CLAUDE_JSON, quiet=False, extra=None):
 
 
 def diff(path=CLAUDE_JSON, extra=None):
-    """Return {added, removed, changed, unfingerprinted, floating,
-    no_snapshot} vs the snapshot."""
+    """Return {added, removed, changed, unfingerprinted, floating, no_snapshot}."""
     servers = load_servers(path, extra)
     try:
         snap = json.load(open(SNAP, encoding="utf-8"))
@@ -243,13 +200,8 @@ def _emit_drift(report):
 def check(path=CLAUDE_JSON, quiet=False):
     """Diff live vs snapshot; edge-trigger a bus event on drift.
 
-    Story 008 exit semantics (cron/MANIFEST.md): FINDING drift is this job
-    WORKING, so it exits 0 with a `FINDINGS:` first stdout line. Non-zero is
-    reserved for the guard itself breaking. Until 2026-07-26 drift returned 1
-    with the detail on stderr, which meant a real crash and a successful
-    detection were indistinguishable in runs.db — and the detail was discarded
-    entirely, since log_run only kept stderr on failure. Both halves of that are
-    fixed; see cron/AUDIT-2026-07-26.md.
+    Drift exits 0 with a `FINDINGS:` first stdout line; non-zero means the
+    guard itself failed.
     """
     rep = diff(path)
     dirty = any(rep[k] for k in ("added", "removed", "changed", "unfingerprinted",
@@ -284,8 +236,7 @@ def check(path=CLAUDE_JSON, quiet=False):
     return 0
 
 
-# Fixture versions are spelled `name + _AT + ver` so the seed build's de-branding
-# scrub (which reads `{{OPERATOR_EMAIL}}` as an email address) leaves them intact.
+# Fixture versions use `name + _AT + ver` so build scrubbers don't read them as emails.
 _AT = "@"
 
 
@@ -346,8 +297,7 @@ def _selftest():
     write_live({"pw": pinned})
     ok(diff(live, extra=[])["removed"] == ["cz"], "diff-detects-removed")
 
-    # project scopes and .mcp.json are scopes too (the 2026-09-27 hole: a
-    # server moved to project scope read as REMOVED and was never diffed again)
+    # project scopes and .mcp.json are scanned too
     json.dump({"mcpServers": {"pw": pinned},
                "projects": {"/w": {"mcpServers": {"cz": local, "pw": bumped}}}},
               open(live, "w"))
@@ -365,8 +315,7 @@ def _selftest():
     sec2 = dict(sec, args=["--api-key", "OTHER", "--token=SEKRIT2", "--caps", "pdf",
                            "https://h/x?key=SEKRIT3"])
     ok(server_hash(sec) != server_hash(sec2), "hash-sees-redacted-change")
-    # bug bash 2026-09-27 #3a: env and headers are launch surface too — an
-    # injected NODE_OPTIONS or a swapped Authorization header is a rug pull
+    # env and headers are launch surface too
     evil = dict(pinned, env={"NODE_OPTIONS": "--require /tmp/evil.js"})
     ok(server_hash(pinned) != server_hash(evil), "hash-detects-env-injection")
     ok(server_hash(dict(pinned, env={"A": "1"})) != server_hash(dict(pinned, env={"A": "2"})),
@@ -377,9 +326,7 @@ def _selftest():
     stored = json.dumps(_redact(manifest(dict(evil, **{"headers": http["headers"]}))))
     ok("SEKRIT4" not in stored and "evil.js" not in stored and "NODE_OPTIONS" in stored,
        "stored-env-headers-redacted")
-    # ...and a snapshot recorded before env/headers were hashed must not read
-    # as a flood of rug pulls: it reads as unfingerprinted (re-vet), unless the
-    # old-shape surface itself changed, which is still `changed`.
+    # an FP 1 entry reads as unfingerprinted unless its v1 surface changed
     write_live({"pw": pinned, "cz": local})
     snapshot(path=live, quiet=True, extra=[])
     old = json.load(open(SNAP))

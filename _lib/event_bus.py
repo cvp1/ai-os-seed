@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
-"""Event Bus — local SQLite append-only event log for the agent framework.
+"""Event bus: append-only SQLite event log (stdlib-only).
 
-Every agent publishes and subscribes through this bus. Design:
-
-  - SQLite-backed, single file, no external deps (stdlib)
-  - Append-only: events are never deleted, only marked processed
-  - Subscribers track their cursor via since_id (last event they read)
-  - Lightweight: ~1KB per 1000 events at our volume
+Events are never deleted, only marked processed; subscribers track a since_id cursor.
 
 Usage:
     bus = EventBus()

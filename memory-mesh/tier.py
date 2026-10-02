@@ -8,17 +8,10 @@
                                            tier event covers yet (migration)
     ... [--commit]                         dry run by default
 
-Why (Craig 2026-09-27, "do the recommended for 2"): `_index-exclude.txt` was a
-per-host file, so {{REDACTED}} and {{REDACTED}} disagreed on 38 always-on rows with
-nothing to reconcile them. A `tier` event travels with the log; every host's
-fold projects its file from the events (mesh_lib.project_index_exclude).
-
-What it does NOT do: publish. Any always-on change a tier event causes is
-STAGED by each host's fold behind the existing residency gate; Craig promotes
-it (`fold.py --promote-residency`). A subject may be a bare lesson slug
-(`one-home-per-fact` -> `lesson/one-home-per-fact`) or a full subject; one that
-has no event in the log is refused, so a typo can never silently do nothing.
-Stdlib only; one lock, one commit per run. Bounded: at most MAX_BATCH subjects.
+Each host's fold projects its `_index-exclude.txt` from these events; resulting
+always-on changes are staged behind the residency gate, not published. A bare
+slug means `lesson/<slug>`; subjects with no event in the log are refused.
+One commit per run; at most MAX_BATCH subjects.
 """
 import argparse
 import sys
@@ -36,7 +29,7 @@ def subject_of(name):
 
 
 def plan(targets, tier, events, fold):
-    """-> (emit [(subject, supersede_ids)], skipped [(subject, why)])."""
+    """Return (emit [(subject, supersede_ids)], skipped [(subject, why)])."""
     known = {e["subject"] for e in events}
     live_tiers = {}
     superseded = {s for e in events for s in
@@ -107,7 +100,7 @@ def main():
         M.git("commit", "-q", "-m", f"tier: {len(lines)} subject(s) -> {tier}")
     print(f"emitted {len(lines)} tier event(s) -> {log.name}. Each host's next fold "
           f"projects its _index-exclude.txt and STAGES any always-on change for "
-          f"Craig's --promote-residency.")
+          f"the owner's --promote-residency.")
     return 0
 
 

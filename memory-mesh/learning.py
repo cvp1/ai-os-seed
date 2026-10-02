@@ -1,70 +1,18 @@
 #!/usr/bin/env python3
-"""learning — are we actually learning, or re-buying lessons we already own?
+"""learning: detect relearned lessons (new lessons that near-duplicate prior ones).
 
-The third instrument in the measurement stack, and the one Craig asked for
-directly (2026-08-15: "extend the memory platform so we understand when we
-are not learning"). The other two each answer a different question:
+Pairs each judged lesson with its closest strictly-prior lessons by token
+Jaccard similarity. Tags:
 
-  canary.py         CAN the channel serve a memory (positive control)
-  effectiveness.py  IS it serving well (delivery / coverage / cost)
-  learning.py       did what it served CHANGE anything (this file)
+  RELEARNED?         new lesson closely matches a prior one on a different
+                     subject, with no supersedes link.
+  RE-FILED           same subject re-emitted without a supersedes link.
+  SERVED+REOFFENDED  one of the closest priors appears in the retrieval log
+                     within the lookback window (no session attribution).
 
-effectiveness.py's own docstring names the gap this fills: it deliberately
-does not measure "whether a served memory changed the agent's behavior at
-all." The full answer needs transcripts; the honest proxy that doesn't is
-RECURRENCE — a new lesson event whose content near-duplicates a lesson we
-already hold. Every such pair is a lesson paid for twice. Three tiers:
-
-  RELEARNED?         new lesson B closely matches prior lesson A on a
-                     different subject, with no supersedes link. The
-                     memory existed; the mistake happened anyway.
-  RE-FILED           same subject re-emitted with NO supersedes link — a
-                     smoking-gun re-file, reported separately (an explicit
-                     supersedes is deliberate revision and excluded).
-  SERVED+REOFFENDED  one of B's closest priors was actually SERVED
-                     (retrieval log) in the days before B was emitted.
-                     "Served" means present in some session's retrieval
-                     window — NOT proof it was in the offending session's
-                     context (the log carries no session attribution), so
-                     this is "recently served, attribution unknown", the
-                     strongest signal this data supports and no stronger.
-
-NO ALARM THRESHOLD IS SHIPPED IN THIS FILE, deliberately. The standing rule
-(seed-targets-from-measured-reality) is measure current ordinary FIRST,
-then set the bar just beyond it. Default mode reports the full similarity
-distribution and the top pairs; `--threshold` exists for follow-up runs
-once a measured baseline says where ordinary ends.
-
-Panel-reviewed 2026-08-15 (grok-4.6 / gpt-5.6-terra / gemini-pro,
-unanimous sound-with-fixes) — this revision applies their findings:
-superseded lessons stay in the PRIORS pool (dropping them blinded the
-instrument to regression onto an old bad habit) and are only excluded from
-the judged/new side; the same-subject skip now requires an explicit
-supersedes link (a same-subject re-file without one is the clearest
-relearn there is, and was being silently excluded); strictly-prior is
-enforced on PARSED timestamps, not string sort; the served-join checks the
-TOP_PRIORS closest priors, not only the single best (a served twin at
-0.25 was invisible behind an unserved 0.26); bulk-import days (>= BURST
-lessons/day — their ts is import time, not learning time) are excluded
-from the judged side and from any threshold distribution, and named in
-the report; and the retrieval-log loader parses ts defensively (float
-epoch or ISO) with selftest coverage — the panel unanimously called a
-crash there, refuted on live data (ts is float, and the live run produced
-a real SERVED hit), but nothing had ASSERTED the format, which is the
-assert-every-promise failure the fleet keeps re-finding.
-
-WHAT THIS DOES NOT MEASURE, so a green number can't be misread:
-  * A relearn candidate is a CANDIDATE — token overlap can't tell "we
-    repeated the mistake" from "two genuinely different lessons share
-    vocabulary." The list is for a human (or a sampled tri-model review,
-    the reviews/*.md pattern) to judge; the count alone convicts nobody.
-    Jaccard also misses PARAPHRASED repeats entirely — a reworded relearn
-    scores low, so the relearn count is a floor, not a total.
-  * The served-join only covers retrieval-log lines with a parseable ts
-    (field added 2026-08-14) — older service events are invisible, and
-    the report states what fraction of the log it could use.
-  * Lessons that SHOULD exist but were never written (the silent
-    non-learning) — no instrument can see those from this data.
+No default alarm threshold; --threshold reports a flagged count. Superseded
+lessons are priors only; bulk-import days are excluded from the judged side.
+Candidates need human judgment; paraphrased repeats are missed.
 
     python3 memory-mesh/learning.py                # full baseline report
     python3 memory-mesh/learning.py --days 30      # only judge recent lessons
@@ -116,9 +64,7 @@ def _jaccard(a, b):
 
 
 def _parse_ts(v):
-    """Epoch float from either an epoch number or an ISO 'Z' string.
-    Returns None for anything else — callers must hold unknown-time events
-    out of temporal claims, never guess."""
+    """Return epoch seconds from an epoch number or ISO 'Z' string, else None."""
     if isinstance(v, (int, float)):
         return float(v)
     try:
@@ -145,19 +91,17 @@ def _superseded_ids(events):
 
 
 def burst_days(lessons, burst_min=BURST_MIN):
-    """UTC days carrying >= burst_min lessons — bulk imports whose ts is
-    import time, not learning time. Judged-side poison, fine as priors."""
+    """Return UTC days with >= burst_min lessons (bulk imports)."""
     per_day = Counter((e.get("ts") or "")[:10] for e in lessons)
     return {d for d, n in per_day.items() if d and n >= burst_min}
 
 
 def relearn_pairs(priors_pool, judged, top_priors=TOP_PRIORS):
-    """For each judged lesson, its closest STRICTLY PRIOR lessons from the
-    full pool (parsed-timestamp order, unknown-time priors held out).
-    Excluded per pair: explicit supersedes links, and same-subject pairs
-    ONLY when a supersedes link exists (a same-subject re-emission without
-    one is flagged, not skipped). Returns
-    [(new_ev, [(prior_ev, sim), ...closest-first...])]."""
+    """Return [(new_ev, [(prior_ev, sim), ...])] of each judged lesson's closest strictly-prior lessons.
+
+    Skips explicitly superseded priors, and same-subject priors only when the
+    new event has a supersedes link.
+    """
     ptoks = [(e, _parse_ts(e.get("ts")), _tokens(e)) for e in priors_pool]
     out = []
     for new in judged:
@@ -183,9 +127,7 @@ def relearn_pairs(priors_pool, judged, top_priors=TOP_PRIORS):
 
 
 def parse_served_lines(lines):
-    """{slug: [epoch, ...]} from retrieval-log lines whose ts parses
-    (float epoch or ISO — nothing asserts the producer's format, so accept
-    both and count honestly). Returns (mapping, lines_with_ts, total)."""
+    """Return ({slug: [epoch, ...]}, lines_with_ts, total) from retrieval-log lines."""
     served, with_ts, total = {}, 0, 0
     for line in lines:
         line = line.strip()
@@ -198,7 +140,7 @@ def parse_served_lines(lines):
             continue
         ts = _parse_ts(rec.get("ts"))
         if ts is None:
-            continue                          # pre-2026-08-14 line: time unknown
+            continue                          # time unknown
         with_ts += 1
         for hit in rec.get("hits", []):
             served.setdefault(hit.get("slug"), []).append(ts)
@@ -215,10 +157,7 @@ def load_served_times():
 
 def served_prior(new, priors_scored, served_times,
                  lookback_days=SERVED_LOOKBACK_DAYS):
-    """The first of the closest priors that was served within lookback of
-    the new emission, or None. Checks ALL the closest priors, not only the
-    single best — a served twin must not hide behind a marginally more
-    similar unserved one (panel finding, 2026-08-15)."""
+    """Return the first of the closest priors served within lookback before `new`, or None."""
     new_ts = _parse_ts(new.get("ts"))
     if new_ts is None:
         return None
@@ -259,9 +198,7 @@ def main():
     dead = _superseded_ids(events)
     bursts = burst_days(lessons)
 
-    # Superseded lessons LEAVE the judged side but STAY as priors — a new
-    # lesson matching an old superseded one is regression onto a bad habit,
-    # exactly what this instrument must see (panel finding, 2026-08-15).
+    # Superseded lessons stay as priors but are not judged.
     judged = [e for e in lessons
               if e["id"] not in dead
               and (e.get("ts") or "")[:10] not in bursts]
@@ -381,7 +318,7 @@ def selftest():
                        {"scrub-corrupts-identifiers":
                         [_parse_ts("2026-08-09T00:00:00Z")]}) is not None)
 
-    # the loader itself (panel: nothing asserted the ts format)
+    # the loader's ts parsing
     lines = [
         json.dumps({"ts": 1786766502.129, "chars": 10,
                     "hits": [{"slug": "float-ts-slug", "score": 1.0}]}),

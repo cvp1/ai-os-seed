@@ -1,38 +1,18 @@
 #!/usr/bin/env python3
-"""Soft on/off switches for cron jobs — toggled by the status-site control panel.
+"""Soft on/off switches for scheduled jobs, stored in ``control/switches.json``.
 
-A job whose name is in ``control/switches.json``'s ``disabled`` list is skipped by
-``log_run.py`` (the wrapper every cron job routes through) and ignored by
-``freshness.py`` (so a deliberately-off job doesn't page as STALE).
-
-This is deliberately decoupled from {{REDACTED}}' own enable/pause state: the
-status-site runs in a container and can write this file via a bind mount without
-racing the {{REDACTED}} scheduler that owns ``~/.{{REDACTED}}/cron/jobs.json``. The job name
-is the log_run ``--job`` key, which equals the shim filename without ``.sh``
-(e.g. ``panel_health.sh`` -> ``panel_health``). Stdlib only; never raises on read.
-
-**A pause carries a reason and an expiry** (2026-09-07,
-``ontology/HANDOFF-EXTENSIONS-2026-09-07.md`` WP2). A switch is an open-ended
-proposal to stay silent, and PRINCIPLES 4 says a proposal decays. Beside
-``disabled`` the file now carries a sibling ``reasons`` map::
+A job in the ``disabled`` list is skipped by ``log_run.py`` and not paged by
+``freshness.py``. Each pause carries a ``reasons`` entry with an expiry::
 
     {"disabled": ["warm_llm"],
-     "reasons": {"warm_llm": {"why": "...", "owner": "craig",
-                              "since": "2026-09-06", "until": "2026-10-06",
+     "reasons": {"warm_llm": {"why": "...", "owner": "agent",
+                              "since": "YYYY-MM-DD", "until": "YYYY-MM-DD",
                               "resume_when": "..."}}}
 
-Two readers, deliberately different:
-
-* ``disabled_jobs()`` stays PERMISSIVE — a corrupt control file must never stop
-  jobs from running (degrade toward safety = keep working AND keep watching).
-  It is what ``log_run.py`` calls, and it never raises.
-* ``load_strict()`` / ``active()`` / ``expired()`` are the strict reader added
-  for ``freshness.py`` and the ontology: an unreadable file is reported as
-  unreadable rather than read as "nothing is paused".
-
-Expiry means freshness RESUMES WATCHING (the job reads STALE again); nothing
-here ever flips, resumes or deletes a switch — resume-watching and
-resume-running are different verbs, and only the first is automatic.
+``disabled_jobs()`` is permissive (never raises; a corrupt file never stops
+jobs). ``load_strict()``/``active()``/``expired()`` report an unreadable file
+as an error. An expired switch resumes watching only; jobs stay skipped until
+switched back on.
 """
 import datetime
 import json
@@ -80,13 +60,8 @@ def _parse_date(v):
 
 
 def load_strict(path=None):
-    """``(dict, None)`` or ``(None, reason)`` — the reader that refuses to
-    guess. A missing file is honestly "nothing paused" (the panel creates it on
-    first use); anything malformed is a REASON, never an empty set.
-
-    `path` lets a caller read ANOTHER estate's control file with this module's
-    rules — the ontology binding reads its fixture tree's copy that way, so the
-    format has one home even when the file does not."""
+    """Return ``(dict, None)`` or ``(None, reason)``; a missing file means nothing
+    is paused, anything malformed is a reason. `path` overrides the default file."""
     try:
         with open(path or PATH) as fh:
             d = json.load(fh)
@@ -112,8 +87,7 @@ def load_strict(path=None):
 
 
 def _switch_map(now=None, path=None):
-    """``({job: reason_or_None}, {job: reason}, err)`` — unexpired, expired, and
-    the strict-read failure (in which case both maps are empty)."""
+    """Return ``(unexpired, expired, err)``; both maps are empty on a read error."""
     d, err = load_strict(path)
     if err:
         return {}, {}, err
@@ -123,9 +97,7 @@ def _switch_map(now=None, path=None):
     for job in d.get("disabled", []) or []:
         r = reasons.get(job)
         until = _parse_date((r or {}).get("until"))
-        # No reason entry at all (a file written before this shape existed) is
-        # NOT expired — it is unexplained, which is `switch-reasoned`'s finding,
-        # not a silent resumption of watching.
+        # A switch with no reason entry is treated as unexpired.
         if until is not None and until < now:
             dead[job] = r
         else:
@@ -134,8 +106,7 @@ def _switch_map(now=None, path=None):
 
 
 def active(now=None, path=None):
-    """``{job: reason_or_None}`` for switches that have not expired. Empty when
-    the file cannot be read strictly — see ``load_strict``."""
+    """``{job: reason_or_None}`` for unexpired switches; empty on a read error."""
     return _switch_map(now, path)[0]
 
 
@@ -146,13 +117,10 @@ def expired(now=None, path=None):
 
 def set_disabled(job, disabled, *, why=None, owner=None, until=None,
                  resume_when=None, since=None):
-    """Switch a job off (disabled=True) or on. Atomic write. Returns the new set.
+    """Switch a job off or on (atomic write); returns the new disabled set.
 
-    Switching OFF records why, who, since and until (default +30 days) in the
-    sibling ``reasons`` map. A ``why`` of None is NOT invented into text — it is
-    written as null, and the ontology's ``switch-reasoned`` constraint reports it
-    the next morning, which is the visible nag. Switching ON evicts the entry
-    (PRINCIPLES 23 — eviction is accretion's other half)."""
+    Switching off records why/owner/since/until (default +30 days) in
+    ``reasons``; a missing ``why`` is stored as null. Switching on removes it."""
     d = _load()
     cur = set(d.get("disabled", []) or [])
     cur.add(job) if disabled else cur.discard(job)
@@ -164,14 +132,9 @@ def set_disabled(job, disabled, *, why=None, owner=None, until=None,
         prev = reasons.get(job) if isinstance(reasons.get(job), dict) else {}
         reasons[job] = {
             "why": why if why is not None else prev.get("why"),
-            "owner": owner or prev.get("owner") or "craig",   # a panel click is Craig's hand
-            # `since` is when the pause STARTED, so re-writing an already-off
-            # switch (a panel re-click, an extended window) must not reset it —
-            # switch-reasoned measures the window from here.
-            # `since` is normally today; it is settable only to TRANSCRIBE a
-            # pause that already happened (the 2026-09-07 migration of six
-            # switches Craig turned off on 2026-09-06), never to backdate a new
-            # one — the window `switch-reasoned` measures starts here.
+            "owner": owner or prev.get("owner") or "craig",
+            # `since` is when the pause started; re-writing an existing switch
+            # keeps it. An explicit `since` only records an earlier pause.
             "since": prev.get("since") or since or today.isoformat(),
             "until": until or prev.get("until")
                      or (today + datetime.timedelta(days=DEFAULT_WINDOW_DAYS)).isoformat(),
@@ -184,9 +147,8 @@ def set_disabled(job, disabled, *, why=None, owner=None, until=None,
     fd, tmp = tempfile.mkstemp(dir=CONTROL_DIR, prefix=".sw_", suffix=".json")
     with os.fdopen(fd, "w") as fh:
         json.dump(d, fh, indent=1)
-    # World-readable: the status-site container writes this as root, but the host
-    # log_run.py / freshness.py read it as the unprivileged user (mkstemp is 0600,
-    # which would lock them out and silently fail the gate open).
+    # World-readable: mkstemp's 0600 would hide it from readers running as
+    # another user.
     os.chmod(tmp, 0o644)
     os.replace(tmp, PATH)
     return cur

@@ -1,27 +1,10 @@
 #!/usr/bin/env python3
-"""Stdlib-only self-test for Story 007's freshness.json coverage additions.
+"""Self-test for freshness.json coverage and soft-failure detection.
 
-Run: /usr/bin/python3 observability/selftest_freshness_coverage.py
-     (from repo root)
-Exits 0 on success, non-zero with the failing checks listed.
-
-Covers the two things a coverage-only PR can silently get wrong:
-1. Every target job is actually configured, under the EXACT --job name its
-   own wrapper passes to log_run.py (a name mismatch makes the entry
-   permanently MISSING — never wrong-but-visible, just silently useless).
-2. The max_age chosen for each job's real schedule is neither too tight
-   (false STALE during a normal scheduled gap) nor so loose it can't catch
-   a genuinely missed run. panel_health has a non-trivial gap by design (only
-   runs 09:00-15:00 AZ, an ~18h overnight gap) and is checked at both
-   boundaries using the REAL runs.db (read-only; never writes). {{REDACTED}}_brief
-   was a second such case until it was retired 2026-08-07.
-3. Every job NAMED in the `_skipped` documentation block actually exists —
-   `_skipped` is pure documentation (evaluate() never reads it), so nothing
-   else would ever catch a wrong or invented job name in there; a
-   /review-story pass caught "career_check / career_pipeline" referencing
-   two job names that don't exist (the real jobs are career_jobscan /
-   career_content / career_audit) — this makes that class of mistake a red
-   test instead of a silent doc rot.
+Run: /usr/bin/python3 observability/selftest_freshness_coverage.py  (from repo root)
+Checks: target jobs are configured under their real --job names; max_age
+fits each job's schedule gap (real runs.db, read-only); every job named in
+`_skipped` exists; soft_failure() tracks current state. Exits non-zero on failure.
 """
 import json
 import re
@@ -52,17 +35,13 @@ TARGET_JOBS = [
     "telegram_bridge_healthcheck", "notes_backup",
     "signal_scan", "signal_scan_eval", "home_digest",
 ]
-# energy_advisor removed 2026-08-04 — the 06:30 daily push was retired, so a
-# staleness monitor on it would alarm on the retirement, not on a fault.
 
 cfg_jobs = freshness.json.loads(freshness._CONFIG.read_text())["jobs"]
 
 for job in TARGET_JOBS:
     check("%s: configured in freshness.json" % job, job in cfg_jobs)
 
-# --- every target evaluates against the REAL runs.db as a real status,
-# never MISSING (all 17 have live run history — a MISSING result here means
-# the freshness.json job name doesn't match the wrapper's real --job string)
+# --- every target evaluates against the real runs.db and is never MISSING
 conn = obs_db.connect()
 now = datetime.now(timezone.utc)
 results = {r["job"]: r for r in freshness.evaluate(conn, now)}
@@ -75,18 +54,9 @@ for job in TARGET_JOBS:
               r["status"] != "MISSING")
 
 
-# --- boundary checks: max_age must survive the job's OWN normal gap, but
-# still catch a genuinely missed run. Uses real runs.db (read-only) + a
-# synthetic `now` to probe both edges without waiting for the real clock.
+# --- boundary checks: max_age survives the normal gap but catches a missed run
 def status_at(job, now):
-    """Status of `job` at `now`, or "ABSENT" if freshness doesn't evaluate it.
-
-    Returns a sentinel rather than raising: a bare next() here made ONE
-    unconfigured job abort the entire selftest with StopIteration, so every
-    check after it never ran and the suite reported nothing at all rather than
-    one red line. Found 2026-08-11 — {{REDACTED}}_brief is in TARGET_JOBS but not
-    in freshness.json, and it was hiding the rest of the file.
-    """
+    """Status of `job` at `now`, or "ABSENT" if freshness doesn't evaluate it."""
     for r in freshness.evaluate(conn, now):
         if r["job"] == job:
             return r["status"]
@@ -106,29 +76,14 @@ check("panel_health: NOT stale just before the next scheduled run (~18h gap)",
 check("panel_health: IS stale if a run is genuinely missed (well past 20h)",
       status_at("panel_health", lr + timedelta(hours=21)) == "STALE")
 
-# {{REDACTED}}_brief was RETIRED 2026-08-07 (cron commit 983b68d, "retire the
-# weekday work brief"): manifest entry enabled=false, unit no longer rendered,
-# last real run 2026-08-07. Its coverage entry and its two weekend-gap edge
-# checks stayed behind and failed forever after — the retirement removed the
-# job but not the things watching it. Asserting the retirement instead, so this
-# turns red if the job comes back without its freshness entry.
+# {{REDACTED}}_brief is retired; fail if it returns without a freshness entry.
 check("{{REDACTED}}_brief: retired — absent from freshness.json, and that is correct",
       "{{REDACTED}}_brief" not in cfg_jobs)
 
 
-# --- _skipped documentation: every job it names must actually exist. Pure
-# documentation is invisible to evaluate(), so this is the ONLY thing that
-# would ever catch an invented or stale job name in there.
+# --- _skipped documentation: every job it names must actually exist
 def real_job_scripts():
-    """Live job names, from cron/schedules.toml — the current source of truth.
-
-    Was reading ~/.{{REDACTED}}/cron/jobs.json. {{REDACTED}} cron has been PAUSED since
-    2026-07-26 (the estate runs on systemd user timers), so that file froze on
-    the migration date: every job added afterwards read as "not a real live
-    job". Measured 2026-08-11 — grok_tier_check and soak_check both failed this
-    check while being scheduled and running normally, which is the checker
-    lying about the estate rather than the estate being wrong.
-    """
+    """Live job names from cron/schedules.toml."""
     import tomllib
     manifest = Path(__file__).resolve().parent.parent / "cron" / "schedules.toml"
     with open(manifest, "rb") as fh:
@@ -161,18 +116,8 @@ for key in skipped:
               name in real_scripts)
 
 # ---------------------------------------------------------------------------
-# soft_failure() must track the CURRENT state, not a stale window.
-#
-# Until 2026-08-11 it judged purely on "what share of the last SOFT_WINDOW runs
-# wrote stderr", with no recency gate — so a repaired job kept reporting for a
-# further 12 runs. On a nightly job that is twelve nights of telling the
-# operator something is broken after it was fixed, and the note was quoted from
-# the most recent NOISY run, which could be days old, printed beside the word
-# "recent". Measured live: system_status was fixed on 08-09 and still read
-# SOFTFAIL on 08-12.
-#
-# Synthetic patterns, latest-first, so this holds regardless of what the real
-# runs.db happens to contain today.
+# soft_failure() must track the current state, not a stale window.
+# Synthetic latest-first patterns, independent of the real runs.db.
 # ---------------------------------------------------------------------------
 import sqlite3 as _sq  # noqa: E402
 

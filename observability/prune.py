@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""Bound the observability store (principle 8): delete run/egress/fleet rows
-older than a retention cutoff, then VACUUM to reclaim the space.
+"""Delete run/egress/fleet rows older than a retention cutoff, then VACUUM.
 
-Safe to run repeatedly. The daily/weekly rollups already project history into
-InfluxDB (cost_rollup 35d window, egress_rollup 14d, fleet_rollup 14d,
-interactive_rollup 90d) and every eval/freshness reader looks only at recent
-rows, so raw rows past the cutoff are dead weight — nothing reads them.
-
-Default is --dry-run (report only). Pass --apply to actually delete + VACUUM.
-Prints DB size before/after. Stdlib only; targets /usr/bin/python3.
+Dry-run by default; --apply deletes and vacuums. Prints DB size before/after.
 
     prune.py                 # dry-run: how many rows WOULD be pruned
     prune.py --apply         # delete >RETENTION_DAYS + VACUUM

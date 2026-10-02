@@ -1,21 +1,10 @@
 #!/usr/bin/env python3
-"""claude_headless — the ONE shared headless `claude -p` runner (Story 018).
+"""claude_headless — the shared headless `claude -p` runner.
 
-Every non-interactive `claude -p` invocation in the workspace goes through here.
-The single reason this module exists: the MCP guard must live in ONE place, not
-in seven files' discipline. `build_cmd()` unconditionally appends
-`--strict-mcp-config --mcp-config {}` — a headless run therefore dials ZERO MCP
-servers no matter what the caller passes. That kills the class of the 2026-06
-incident (a headless job auto-dialing user-scope ha-local at boot with an
-empty/unexpanded bearer, tripping HA's failed-login alarm — see auto-memory
-[[headless-claude-mcp-ha-login]]). A new job cannot re-trip it by forgetting a
-flag, because the flag is not the caller's to forget.
-
-The guard is STRUCTURAL: there is no keyword argument that turns MCP back on.
-If a future job genuinely needs a scoped MCP server it must add an explicit
-`--mcp-config <file>` via `extra_args`, which is a visible, reviewable act — not
-the silent default.
-
+Every non-interactive `claude -p` call goes through here. `build_cmd()`
+unconditionally adds `--strict-mcp-config --mcp-config {"mcpServers":{}}`, so a
+headless run dials zero MCP servers; no keyword turns that off. A job that needs
+a scoped MCP server must pass `--mcp-config <file>` via `extra_args`.
     from _lib import claude_headless
     text = claude_headless.run_claude(prompt, model="sonnet")        # tool-less
     text = claude_headless.run_claude(prompt, allowed_tools="Read")  # vision, etc.
@@ -33,38 +22,14 @@ import sys
 CLAUDE = os.path.expanduser("~/.local/bin/claude")
 
 # --------------------------------------------------------------------------- #
-# Catalog surface — what Claude models exist, and can we still call ours?      #
+# Catalog surface — which Claude models exist, and can this account call them? #
 #                                                                              #
-# Added 2026-08-13, and added HERE because this module is the Claude provider:  #
-# the sibling clients (grok/openai/gemini/deepseek) each own their own          #
-# list_models(), and Claude's "client" is the CLI this file drives.             #
+#   list_models()     the CLI binary's recognized-model table. No auth, no     #
+#                     network; reflects what the CLI knows, not what the       #
+#                     account can reach, and may surface fragments.            #
 #                                                                              #
-# WHY NO API KEY. Craig, 2026-08-13: "why do I need a token for Claude auth     #
-# when we're already authenticated for this very session?" He was right, and    #
-# the earlier recommendation to mint one via `claude setup-token` was wrong —   #
-# it asked for a THIRD credential when the CLI already holds a working one and  #
-# this whole module already depends on it. A new token would have bought        #
-# exactly one thing the CLI cannot do (enumerate via GET /v1/models) at the      #
-# cost of another secret to hold, rotate and leak.                              #
-#                                                                              #
-# So Claude gets two instruments, both free and both using existing auth:       #
-#                                                                              #
-#   list_models()     the CLI BINARY's own recognized-model table. Zero auth,   #
-#                     zero network, refreshes when Claude Code updates. WEAKER  #
-#                     than the others' catalog APIs and labelled as such: it is #
-#                     what this CLI RECOGNIZES, not what Craig's account can    #
-#                     reach, and it is scraped from a 290MB binary so it can    #
-#                     surface fragments. Good enough for "is there a newer      #
-#                     Sonnet than the one we pin", which is the question that   #
-#                     went unanswered for a generation and a half on Gemini.    #
-#                                                                              #
-#   reachable(slug)   an actual one-line call through the CLI. Account-specific #
-#                     and authoritative, but spends a little of the Max         #
-#                     interactive allowance, so it is opt-in rather than daily. #
-#                                                                              #
-# Anthropic also does not have xAI's silent-redirect failure mode: a dead slug  #
-# here says so out loud ("It may not exist or you may not have access to it"),  #
-# which is why the cheap instrument can be the default one.                     #
+#   reachable(slug)   a real one-line call through the CLI. Authoritative but  #
+#                     spends a little allowance, so it is opt-in.              #
 # --------------------------------------------------------------------------- #
 _MODEL_RE = r"claude-(opus|sonnet|haiku|fable)-[0-9]+([.-][0-9]+)*"
 
@@ -74,38 +39,19 @@ def available():
     return os.path.exists(CLAUDE)
 
 
-# Fail-safe default. Craig, 2026-08-13: "the assumption that we're using the max
-# plan is something we should never assume." He is right, and the first version
-# of the catalog hardcoded billing="max-plan" as a literal — a frozen derived
-# fact, the exact thing Principle 9 forbids. Plans change (Pro/Max/Team, 5x vs
-# 20x, or an org move), and a downgrade would have left the fleet asserting
-# "~$0 marginal" while real money was being spent.
-#
-# WHICH DIRECTION IS SAFE: believing calls are FREE when they are metered
-# invites unbounded spend; believing they are METERED when they are covered
-# only costs some caution. So an undetectable plan resolves to metered/unknown,
-# never to a subscription (Principle 4 — degrade toward safety).
+# Fail-safe default: an undetectable plan resolves to metered/unknown, never to
+# a subscription, since wrongly assuming "free" invites unbounded spend.
 _UNKNOWN_PLAN = {"plan": None, "auth_method": None, "api_provider": None,
                  "covered": False, "detected": False,
                  "detail": "not probed"}
 
 
 def subscription(timeout=30):
-    """Which Anthropic plan is this host ACTUALLY on? Detected, never assumed.
+    """Detect this host's Anthropic plan via `claude auth status`; never raises.
 
-    Instrument: `claude auth status`, which emits JSON carrying `subscriptionType`
-    ("max"/"pro"/…), `authMethod` and `apiProvider`. No credential is exposed —
-    the CLI reports about its own auth without printing it.
-
-    `api_provider` is the "how does the plan APPLY" axis and matters as much as
-    the plan name: a subscription only covers first-party traffic. Running via
-    Bedrock/Vertex/Foundry means the cloud vendor bills per token no matter what
-    plan the account holds, so `covered` goes False and cost is real again.
-
-    `covered=True` means "calls on this host draw on a prepaid subscription
-    rather than per-token billing." It is the ONE thing downstream cost
-    reporting is allowed to act on, and it is False whenever we could not prove
-    otherwise. Returns a dict; never raises.
+    `covered=True` means calls draw on a prepaid subscription rather than
+    per-token billing; it requires a plan AND apiProvider == "firstParty"
+    (Bedrock/Vertex/Foundry bill per token). False whenever unproven.
     """
     if not available():
         return dict(_UNKNOWN_PLAN, detail="claude CLI not present at %s" % CLAUDE)
@@ -138,39 +84,16 @@ def _binary_path():
     return os.path.realpath(CLAUDE)
 
 
-# SHORT ALIASES the CLI accepts for --model. These are NOT in the binary's
-# versioned model table, so a catalog built only from that table calls them
-# GONE — which is exactly what happened on 2026-08-13 to `opus`, the default
-# judge of the entire succession eval. It had been callable the whole time.
-#
-# VERIFIED LIVE that day, with a positive control, because string-presence in
-# the binary is not proof of acceptance:
-#     reachable("opus")                     -> True  | ok
-#     reachable("definitely-not-a-model-x") -> False | CLI rejected the call
-# The control matters: `reachable` documents that the CLI exits 0 on a bad
-# model, so an instrument that cannot show the negative proves nothing about
-# the positive.
-#
-# An alias is a MOVING pin: it resolves to whatever the CLI currently maps it
-# to, and nothing here can enumerate that mapping. So it is reported as an
-# alias rather than as a model — the honest consequence being that its spend
-# cannot be priced, which the catalog says out loud instead of costing it at
-# zero.
+# Short aliases the CLI accepts for --model. They are absent from the binary's
+# versioned model table, and are moving pins that cannot be priced.
 CLI_ALIASES = ("opus", "sonnet", "haiku", "fable", "opusplan")
 
 
 def list_models(timeout=60):
     """Claude model slugs this CLI recognizes, as ``{"id","display","source"}``.
 
-    NOT an account catalog. See the block comment above: this reads the shipped
-    binary's model table, so it answers "what does Claude Code know about"
-    rather than "what can this subscription call". Every row is stamped
-    ``source="cli-binary"`` so a consumer cannot mistake it for the
-    provider-confirmed lists the other four families return.
-
-    Dated variants (``-20251001``) and doc filenames (``.md``) are dropped: the
-    fleet pins alias-style slugs, and mixing the two shapes makes every
-    successor comparison noise.
+    Read from the shipped binary, not an account catalog; rows are stamped
+    ``source="cli-binary"`` (or ``cli-alias``). Dated variants are dropped.
     """
     import re
     out = subprocess.run(["/usr/bin/grep", "-aoE", _MODEL_RE, _binary_path()],
@@ -183,9 +106,7 @@ def list_models(timeout=60):
             continue
         seen.add(slug)
         rows.append({"id": slug, "display": slug, "source": "cli-binary"})
-    # The short aliases the CLI also accepts (see CLI_ALIASES). Stamped
-    # `cli-alias` so a consumer can tell a moving pointer from a fixed slug —
-    # they are callable, but they are not a model and cannot carry a rate.
+    # Aliases are stamped `cli-alias`: callable, but not a fixed model.
     for alias in CLI_ALIASES:
         if alias not in seen:
             rows.append({"id": alias, "display": alias, "source": "cli-alias"})
@@ -193,24 +114,11 @@ def list_models(timeout=60):
 
 
 def reachable(model, timeout=120):
-    """Can this account actually call ``model`` right now? ``(ok, detail)``.
+    """Can this account call ``model`` right now? Returns ``(ok, detail)``.
 
-    Authoritative where list_models() is not — it makes a real call. Costs a
-    little Max interactive allowance, so callers opt in.
-
-    THE EXIT CODE IS USELESS HERE: the CLI returns 0 for a nonexistent model and
-    reports the failure in its TEXT ("It may not exist or you may not have
-    access to it"). Verified live 2026-08-13 against a bogus slug. Anything that
-    branches on returncode alone will call every dead pin healthy.
-
-    Goes through build_cmd rather than a hand-rolled argv, and that is not
-    tidiness. `--mcp-config` and `--allowedTools` are BOTH variadic, so a prompt
-    placed after them is swallowed as another config path / tool name and the
-    CLI exits 0 having run nothing. The first draft of this function did exactly
-    that and reported every WORKING model unreachable — a false-negative
-    instrument, strictly worse than no instrument, and invisible unless you test
-    against a slug you know is good. build_cmd puts the prompt at argv[2] where
-    nothing can eat it, and carries the MCP guard this module exists to enforce.
+    Makes a real call, so callers opt in. The CLI exits 0 for a nonexistent
+    model, so failure is detected from its output text. Uses build_cmd so the
+    prompt is not swallowed by the variadic `--mcp-config`/`--allowedTools`.
     """
     try:
         cmd = build_cmd("reply with exactly: ok", model=model,
@@ -227,41 +135,15 @@ def reachable(model, timeout=120):
             return False, "CLI rejected the call (%s)" % tell
     return bool((r.stdout or "").strip()), (r.stdout or "").strip()[:80]
 
-# The non-negotiable guard: strict scope + an explicit empty server record =
-# provably zero MCP servers. Appended to EVERY headless command build_cmd()
-# produces. NOTE the inline config must be `{"mcpServers":{}}`, not `{}` — the
-# CLI rejects a bare `{}` ("mcpServers: expected record, received undefined").
-# `--strict-mcp-config` alone also loads zero (the form 6 production jobs used),
-# but the explicit empty record documents the intent and both are live-verified.
+# MCP guard: strict scope + an explicit empty server record = zero MCP servers.
+# The inline config must be `{"mcpServers":{}}`; the CLI rejects a bare `{}`.
 _MCP_GUARD = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
 
-# The SECOND guard, added 2026-07-28 after a live probe proved the first form
-# wrong. `--allowedTools ""` is a PERMISSION ALLOWLIST, not a tool-availability
-# switch: it grants no extra permissions, but every BUILT-IN tool stays present,
-# and in headless `-p` mode there is no interactive prompt to stop it. So a call
-# this module documented as "tool-less" could read any file and run any shell
-# command as the invoking user. Proven, not theorised: a run with the old flags
-# returned the contents of a random-token probe file, then `echo BASHLIVE-$(id
-# -un)` -> "BASHLIVE-{{REDACTED}}".
-#
-# That mattered because signal-scan feeds UNTRUSTED WEB CONTENT through this
-# path — a prompt injection in a scanned page had a route to arbitrary local
-# execution.
-#
-# Live-tested alternatives, all of which FAILED to disable tools:
-#   --tools ""      variadic flag swallows the empty arg; bash still ran
-#   --tools=        same
-#   --tools none / --tools NoSuchTool   both still ran bash AND read a file
-# Only an EXPLICIT denylist works. It is therefore fragile by construction: a
-# built-in tool added by a future CLI release is NOT covered by this list. That
-# fragility is why `--livetest` exists below and must stay in the release check
-# — the list is the mechanism, the probe is the proof.
-#
-# The list below was itself grown by probing: the first version's own refusal
-# message volunteered four tools it still had ("only ReportFindings, ToolSearch,
-# Workflow, and task/cron/design-sync tools"). Agent/Task/Workflow matter most —
-# a delegation tool spawns a subagent that HAS file and shell access, so leaving
-# one out reinstates the whole hole through a side door.
+# Tool guard: `--allowedTools` never restricts built-in tools, and `--tools ""`
+# does not disable them, so only an explicit denylist removes a tool. A tool
+# added by a future CLI release is not covered; `--livetest` checks this.
+# Delegation tools (Agent/Task/Workflow/Skill) must stay listed: a subagent
+# would otherwise regain file and shell access.
 _BUILTIN_TOOLS = [
     # file + shell
     "Bash", "BashOutput", "KillShell", "Read", "Write", "Edit", "NotebookEdit",
@@ -293,14 +175,9 @@ def build_cmd(prompt, *, model=None, allowed_tools="", output_format="json",
               skip_permissions=False, extra_args=None, extra_deny=None):
     """Assemble the argv for a headless `claude -p` call.
 
-    The MCP guard (_MCP_GUARD) is appended unconditionally — no argument
-    removes it. This is the whole point of routing every job through here.
-
-    ``extra_deny``: additional denylist entries (e.g. ``Bash(git push:*)``
-    patterns) folded into the SAME ``--disallowed-tools`` flag as the built-in
-    complement — one flag, so a caller never has to know whether the CLI merges
-    or replaces a repeated variadic option (added 2026-09-08 for the agent-run
-    recipe, bug-bash A19/B9: its hand-rolled argv carried its own denylist).
+    The MCP guard (_MCP_GUARD) is always appended. The denylist is the
+    complement of ``allowed_tools`` in _BUILTIN_TOOLS, plus ``extra_deny``
+    entries (e.g. ``Bash(git push:*)``), all in one ``--disallowed-tools`` flag.
     """
     cmd = [CLAUDE, "-p", prompt]
     if model:
@@ -310,33 +187,14 @@ def build_cmd(prompt, *, model=None, allowed_tools="", output_format="json",
     cmd += list(_MCP_GUARD)
     tools = _tools_arg(allowed_tools)
     cmd += ["--allowedTools", tools]
-    # `--allowedTools` DOES NOT RESTRICT ANYTHING. Live-proven 2026-08-25:
-    # a call with `--allowedTools "Read Grep Glob"` and no denylist reported
-    # holding `Agent, Bash, Edit, Glob, Grep, Read, ReportFindings, Skill,
-    # ToolSearch, Workflow, Write`. The flag widens; it never narrows. Only an
-    # explicit denylist removes a tool (see _BUILTIN_TOOLS above).
-    #
-    # So the denylist is emitted on EVERY call, not just tool-less ones. Before
-    # this, asking for a single tool silently dropped the guard entirely, and
-    # three callers were relying on it: both `cc-handoff` auto-triage recipes
-    # (untrusted task bodies from other hosts) and ranch-ops `packs.py`, whose
-    # docstring called itself a "read-only sweep" while holding Bash and Write.
-    # Verified after the change: `--allowedTools "Read Grep Glob"` plus this
-    # complement yields exactly `Glob, Grep, Read`.
+    # `--allowedTools` widens, never narrows, so the denylist is emitted on
+    # every call, including ones that request specific tools.
     if not _BUILTIN_TOOLS:
-        # An empty denylist would emit a dangling `--disallowed-tools` (the CLI
-        # errors: "argument missing") or, worse on some CLI versions, an
-        # unguarded run. Neither is acceptable for the one flag standing between
-        # untrusted input and local execution — fail loud instead (principle 13,
-        # degrade toward safety). Caught by the livetest's negative control.
+        # An empty denylist would yield an unguarded run; fail loud instead.
         raise RuntimeError(
             "claude_headless: _BUILTIN_TOOLS is empty, so a call cannot be "
             "guarded. Refusing to build an unguarded command.")
-    # Callers write the allowlist both ways — "Read Grep Glob" (ranch-ops,
-    # the recipes) and "Read,Edit,Write,Glob,Grep,Bash" (memory-curate,
-    # memory-prune). Splitting on whitespace alone would read the comma form
-    # as ONE token, match nothing, and deny every tool the caller asked for —
-    # turning a security fix into an outage. Accept both separators.
+    # Accept both "Read Grep Glob" and "Read,Edit,Write" allowlist forms.
     keep = {t for t in re.split(r"[,\s]+", tools) if t}
     deny = [t for t in _BUILTIN_TOOLS if t not in keep]
     for d in (extra_deny or []):
@@ -355,44 +213,23 @@ OAUTH_TOKEN_PATH = "~/.key/claude_code_oauth_token.key"
 
 
 def oauth_env(base=None):
-    """`os.environ` plus CLAUDE_CODE_OAUTH_TOKEN, for callers that pass `env=`.
+    """Return a copy of the environment plus CLAUDE_CODE_OAUTH_TOKEN from the vault.
 
-    A PURE function that RETURNS a dict — it never mutates os.environ, so the
-    "this module never touches os.environ itself" contract of run_raw (ranch-ops
-    story 015) still holds. It is the `{**os.environ, "HA_TOKEN": token}` shape
-    that docstring already names, with the token read at point of use from the
-    key vault (P14) rather than shell-`cat`ed into a scheduler manifest.
-
-    WHY THIS EXISTS. Measured 2026-08-25: {{REDACTED}}'s Claude CLI had been logged
-    out since at least 2026-08-04, and every mailbox task routed there died on
-    "Not logged in - Please run /login". Its `scrape` job called Claude cleanly
-    every day through the same outage — because that job exports this token and
-    the mailbox path did not. The CLI's interactive credentials are the wrong
-    thing for anything a scheduler starts: nobody re-establishes them, and their
-    absence is silent.
-
-    Degrades to a no-op, never to a failure: if the key file is missing (a host
-    that only ever runs attended), or the variable is already set by the caller's
-    environment, the returned dict is just a copy of os.environ and behaviour is
-    unchanged. It can only ADD auth where there was none.
+    Pure: never mutates os.environ. Scheduled jobs need this token because the
+    CLI's interactive login may be absent. A no-op if the token is already set
+    or the key file is missing.
     """
     env = dict(os.environ if base is None else base)
     if env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip():
         return env
     try:
-        # Lazy: this module is imported by recipes under a sys.path shim and by
-        # `-m _lib.claude_headless --selftest`; neither should acquire a hard
-        # import-time dependency on the vault layer just to build an argv.
+        # Lazy import: building an argv must not depend on the vault layer.
         from _lib.secrets import load_secret  # noqa: PLC0415
         tok = load_secret("CLAUDE_CODE_OAUTH_TOKEN", OAUTH_TOKEN_PATH,
                           what="the Claude Code OAuth token",
                           required=False, exit_on_error=False)
     except Exception:
-        # A locked or shielded vault means "no token here", not "no run": the
-        # caller falls back to whatever credentials the CLI already holds, and
-        # if it holds none the recipe's own EX_TEMPFAIL path defers the task
-        # with the reason in words. Failing the call here would convert a
-        # missing convenience into an outage.
+        # Locked/shielded vault means "no token", not a failed call.
         return env
     if tok:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = tok
@@ -401,15 +238,10 @@ def oauth_env(base=None):
 
 def run_raw(prompt, *, cwd=None, timeout=900, env=None, _runner=None, **kw):
     """Run a headless claude and return the CompletedProcess unparsed.
-    Lower-level seam for callers that do their own output parsing
-    (naturalist's vision-array regex, ranch_diag's raw-JSON artifact).
 
-    `env`, when given, is passed straight to subprocess.run(env=...) - the
-    caller builds the full dict (e.g. `{**os.environ, "HA_TOKEN": token}`),
-    this module never touches os.environ itself. Omitting it (the default)
-    leaves the call byte-for-byte identical to before this parameter existed
-    (ranch-ops story 015) - no `env` kwarg reaches the runner at all, so an
-    old fixed-signature fake runner in an existing test still works."""
+    `env`, when given, is passed to subprocess.run(env=...); when omitted, no
+    `env` kwarg reaches the runner at all.
+    """
     runner = _runner or subprocess.run
     call_kwargs = dict(cwd=(str(cwd) if cwd else None), capture_output=True,
                         text=True, timeout=timeout)
@@ -424,11 +256,8 @@ def run_claude(prompt, *, model="sonnet", allowed_tools="", timeout=900,
 
     Raises RuntimeError on non-zero exit, empty output, or an error envelope.
     Non-JSON but non-empty stdout is returned as-is (some models answer plain).
-    `on_usage(usage_dict, cost_usd, model)` is invoked when present so each
-    caller keeps its own billing sink. `extra_args` (e.g. `--disallowedTools`,
-    `--max-budget-usd`) is appended after the standard flags - callers that
-    need caps/denylists don't have to fork this helper (ranch-ops story 008).
-    `env` forwards to run_raw (ranch-ops story 015) - see its docstring.
+    `on_usage(usage_dict, cost_usd, model)` is called when present.
+    `extra_args` is appended after the standard flags; `env` forwards to run_raw.
     """
     p = run_raw(prompt, model=model, allowed_tools=allowed_tools, cwd=cwd,
                 timeout=timeout, extra_args=extra_args, env=env, _runner=_runner)
@@ -461,9 +290,7 @@ def _selftest():
     ran = []
 
     def ok(cond, label):
-        # `ran` is the count, never a literal. This used to end in a
-        # hardcoded `n = 29`, so adding assertions left the reported total
-        # unchanged — a number that looked measured and was not.
+        # `ran` is the count, never a literal.
         ran.append(label)
         if not cond:
             fails.append(label)
@@ -531,14 +358,11 @@ def _selftest():
     ok(run_claude("p", _runner=lambda a, **k: _FakeCP(0, "plain text")) ==
        "plain text", "non-json-passthrough")
 
-    # --- run_claude: extra_args passthrough (story 007) ---
+    # --- run_claude: extra_args passthrough ---
     seen_no_extra = {}
     run_claude("p", _runner=lambda a, **k: (seen_no_extra.setdefault("argv", a), _FakeCP(0, '{"result":"x"}'))[1])
     seen_with_extra = {}
-    # A REQUESTED tool must not drop the guard for every other tool.
-    # Before 2026-08-25 it did: any non-empty allowlist skipped the denylist
-    # entirely, leaving Bash/Write/Workflow/Cron* live on paths that process
-    # untrusted input. These four assertions are that regression's headstone.
+    # A requested tool must not drop the denylist for every other tool.
     _c = build_cmd("p", allowed_tools="Read Grep Glob")
     ok("--disallowed-tools" in _c,
        "a non-empty allowlist still emits a denylist")
@@ -588,7 +412,7 @@ def _selftest():
     ok(out_extra == "y" and usage_log_extra == [({}, 1.0, "claude-x")],
        "on-usage-fires-with-extra-args")
 
-    # --- env passthrough (ranch-ops story 015) ---
+    # --- env passthrough ---
     seen_env = {}
     run_claude("p", env={"HA_TOKEN": "x"},
                _runner=lambda a, **k: (seen_env.setdefault("kw", k), _FakeCP(0, '{"result":"x"}'))[1])
@@ -598,7 +422,7 @@ def _selftest():
     run_claude("p", _runner=lambda a, **k: (seen_no_env.setdefault("kw", k), _FakeCP(0, '{"result":"x"}'))[1])
     ok("env" not in seen_no_env["kw"], "env-omitted-entirely-by-default")
 
-    # --- oauth_env: additive, pure, and degrades to a no-op (2026-08-25) ---
+    # --- oauth_env: additive, pure, and a no-op without a key file ---
     _before = dict(os.environ)
     _e = oauth_env(base={"PATH": "/usr/bin"})
     ok(_e["PATH"] == "/usr/bin", "oauth-env-preserves-the-base")
@@ -608,8 +432,7 @@ def _selftest():
     ok(_pre["CLAUDE_CODE_OAUTH_TOKEN"] == "already-set",
        "oauth-env-never-overwrites-a-token-the-caller-already-has")
 
-    # A host with no key file must come back byte-identical to its base — the
-    # helper may only ADD auth where there was none, never change a working call.
+    # With no key file the result must equal the base.
     _saved = OAUTH_TOKEN_PATH
     try:
         globals()["OAUTH_TOKEN_PATH"] = "/nonexistent/claude_oauth.key"
@@ -627,19 +450,9 @@ def _selftest():
 
 
 def _livetest():
-    """PROVE the tool-less path is tool-less, by running one real claude -p.
+    """Prove the tool-less and allowlist paths cannot read files or reach a shell.
 
-    The structural selftest can only assert that the right flags were assembled.
-    It cannot know whether the CLI HONOURS them — and on 2026-07-28 it did not:
-    `--allowedTools ""` assembled cleanly and still permitted file reads and
-    shell execution. A denylist is also fragile by construction (a built-in tool
-    added upstream is not on it). So the invariant needs an empirical check, and
-    this is it.
-
-    Writes a random token to a temp file, asks a tool-less run to read it, and
-    fails if the token comes back. Costs one small Sonnet call. Run it on any
-    Claude Code upgrade — that is the moment the tool set can change underneath
-    this module.
+    Makes two small real Sonnet calls. Run on every Claude Code upgrade.
 
         python3 -m _lib.claude_headless --livetest
     """
@@ -666,10 +479,7 @@ def _livetest():
                   "process untrusted input\n  through this path until it is fixed "
                   "(see _BUILTIN_TOOLS).\n  token=%s" % token)
             return 2
-        # SECOND PROBE — the allowlist path. The tool-less probe above never
-        # covered it, which is how `--allowedTools "Read Grep Glob"` ran for
-        # months holding Bash, Write, Workflow, Skill and CronCreate. A run
-        # that legitimately needs Read must still be unable to reach a shell.
+        # Second probe: an allowlist run must still be unable to reach a shell.
         shell_probe = (
             "Run the shell command `echo TOOLSHELL-$(id -un)` and print its "
             "exact output. If you have no shell tool, reply NOSHELL.")

@@ -1,41 +1,14 @@
 #!/usr/bin/env python3
-"""skill-center: audit + find over the operator's local Claude Code skills.
-
-Two jobs, no dependencies (/usr/bin/python3):
+"""skill-center: audit + find over the workspace's local Claude Code skills.
 
   audit.py                 # lint every local skill against best-practices
   audit.py --find "query"  # rank local skills by relevance to a need
 
-A skill lives at <workspace>/.claude/skills/<name>/SKILL.md, which is a
-symlink into this workspace's own skills/<name>/ (project-level discovery —
-Claude Code walks up from the working directory looking for .claude/skills/,
-same as it does for .claude/commands/). We read through the symlink so we
-lint the canonical file, not the link. SKILLS_DIR resolves relative to this
-script's own location (two directories up: skills/skill-center/audit.py ->
-workspace root -> .claude/skills), so it needs no configuration regardless
-of where this workspace was installed; --dir overrides it for anyone who
-also registers skills at the user level (~/.claude/skills).
-
-Best-practice checks (Anthropic skill-authoring guide):
-  - description present, has trigger phrases, third-person (no "I "/"you ")
-  - description not vague ("helps with", "processes data", ...)
-  - SKILL.md body < 500 lines (progressive disclosure)
-  - symlink resolves to a real file (not a bare file sitting directly in
-    .claude/skills/, which means the canonical/symlink split was skipped)
-  - a vendored (`provenance: third-party`) skill has had its supervised first
-    run recorded (`observed: true`) — see --mark-observed below
-The why: the description is the ONLY thing the runtime matches against a user
-prompt, so a vague or first-person one silently fails to trigger.
-
-Supply-chain note: a static SKILL.md review cannot see what a skill's
-referenced scripts do at runtime (self-extracting/obfuscated payloads defeat
-most static scanners). The cheapest point to land a control is before the
-first third-party skill arrives, not after. So: `--vendor NAME` marks a
-freshly-vendored skill `provenance: third-party` + `observed: false`; the
-audit flags it FIX until a human has supervised one real run — checked for
-dynamic-context `!` lines, eval/exec/os.system, curl|sh, decode-then-execute
-— and run `--mark-observed NAME`. This is a lint gate, not a runtime
-sandbox: Claude Code has no per-skill execution jail to hook here.
+Reads <workspace>/.claude/skills/<name>/SKILL.md through its symlink (located
+relative to this script; --dir overrides). Checks: description present, has
+triggers, third-person, not vague; body < 500 lines; canonical file is
+symlinked in; a `provenance: third-party` skill is flagged until a supervised
+run is recorded with --mark-observed (`--vendor NAME` sets that state).
 """
 import argparse
 import os
@@ -98,8 +71,7 @@ def lint(rec, skills_dir=SKILLS_DIR):
         low = desc.lower()
         if not re.search(r'"/?[\w-]+"|use when|use this when|when (the operator|the user|you)', low):
             issues.append("description has no explicit trigger phrases")
-        # Quoted trigger phrases are the user's own voice ("how do I grow X") and
-        # may legitimately be first/second person — only the narration must be 3rd.
+        # Quoted trigger phrases may be first/second person; only narration must be 3rd.
         narration = re.sub(r'"[^"]*"|\'[^\']*\'', " ", desc)
         if re.search(r"\b(I |I'?ll|I'?m|you can|you should|your )", narration):
             issues.append("description not third-person (injected into system prompt)")
@@ -124,9 +96,7 @@ def lint(rec, skills_dir=SKILLS_DIR):
 
 
 def _set_frontmatter_key(text, key, value):
-    """Set a top-level `key: value` in a SKILL.md's frontmatter, byte-preserving
-    everything else — a vendoring/observation stamp must never become an
-    excuse to touch the body a reviewer is about to read."""
+    """Set a top-level `key: value` in SKILL.md frontmatter; all other bytes unchanged."""
     if not text.startswith("---"):
         raise ValueError("no `---` frontmatter block — refusing to guess")
     end = text.find("\n---", 3)

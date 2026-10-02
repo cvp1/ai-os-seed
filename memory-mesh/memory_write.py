@@ -1,25 +1,15 @@
 #!/usr/bin/env python3
-"""memory_write.py — deterministic writer for Craig's auto-memory store.
+"""memory_write.py — deterministic writer for the auto-memory store.
 
-Backs the `improve` and `capture` skills. Their prose already does the real
-judgment (harvest, filter, classify, dedup, get Craig's approval) — this
-script only handles the mechanical part that was previously hand-typed each
-run: exact frontmatter formatting, the MEMORY.md one-line-per-memory index
-(add/update/remove), and supersede bookkeeping (new file gets `supersedes:`,
-old file's index line is dropped, old file itself is kept as history).
+Backs the `improve` and `capture` skills: formats frontmatter, maintains the
+MEMORY.md index (add/update/remove), and records supersedes (new file gets
+`supersedes:`, old index line dropped, old file kept as history).
 
-Store: ~/.claude/projects/-home-{{REDACTED}}-Github-CC/memory/ (MEMORY.md = index).
-Lineage gate (Story 029, OWASP ASI06): `contains-untrusted` memories are written
-to disk but never served — the memory-mesh FOLD holds them out of the generated
-index, keeps them out of /recall's pack (tombstone, never the body), and
-publishes both quarantine projections. Promotion needs a signed mesh event
-(memory-mesh/sign.py --promote), which requires Craig's passphrase-gated key.
-
-That enforcement lives entirely in the fold, so on a host without the mesh an
-untrusted write is REFUSED rather than half-honoured — see
-require_enforceable_quarantine(). Until 2026-07-30 this docstring described a
-routing that the fold ignored and whose store-side owner (consolidate.py) no
-longer existed; the description was true of nothing for the life of the feature.
+Store: ~/.claude/projects/<workspace-key>/memory/ (MEMORY.md = index).
+`contains-untrusted` memories are written but never served: the memory-mesh
+fold holds them out of the index and /recall. Promotion needs a signed mesh
+event (memory-mesh/sign.py --promote). Without the mesh, untrusted writes are
+refused (see require_enforceable_quarantine()).
 
 Usage:
     # New or updated memory (same slug = in-place update)
@@ -37,23 +27,20 @@ Usage:
         --hook "..." --section "..." --description "..."
 
     # user / reference memories: single paragraph, no --why/--how
-    python3 memory_write.py write --slug craig-likes-x --type user \\
+    python3 memory_write.py write --slug likes-x --type user \\
         --description "..." --rule "Single paragraph body." \\
         --hook "..." --section "..."
 
-Two maintenance subcommands touch the index/frontmatter but never memory
-CONTENT, so neither takes a --lineage of its own:
+Maintenance subcommands (index/frontmatter only, no --lineage of their own):
 
     # free always-on index headroom (fact file stays live for /recall)
     python3 memory_write.py demote slug-a slug-b --commit
 
-    # Story 029 backfill: set lineage: on EXISTING notes, body byte-preserved
+    # set lineage: on EXISTING notes, body byte-preserved
     python3 memory_write.py retag slug-a slug-b --lineage craig-direct --commit
 
-Always prints the rendered file + the MEMORY.md diff and asks nothing — the
-skill shows this to Craig for approval BEFORE calling with --commit. Without
---commit it's a dry run (prints what would be written, writes nothing).
-Stdlib only — no deps.
+Prints the rendered file + MEMORY.md diff. Without --commit it is a dry run.
+Stdlib only.
 """
 import argparse
 import datetime
@@ -65,19 +52,8 @@ import sys
 from pathlib import Path
 
 # ── where the mesh code lives ────────────────────────────────────────────────
-# Resolved, never hardcoded. Until 2026-09-18 this was the literal
-# `~/{{REDACTED}}/memory-mesh` in four places, which is one host's truth: on any
-# install whose workspace is not `~/{{REDACTED}}` — i.e. EVERY seed recipient —
-# `mesh_emit.exists()` was False, the emit was skipped, and the memory landed
-# in the store while the event log never heard about it. Silently: the door
-# printed nothing, and the next fold had nothing to project. Caught by
-# memory-mesh/contract_test.py M3 against a fresh-install-shaped sandbox.
-#
-# Order: an explicit env override, then this file's own directory (after the
-# engine moves into memory-mesh/ the emitter is its sibling), then the
-# workspace root walking up from cwd — `<root>/memory-mesh/` is the one door
-# convention every harness and every seed install shares — then the fleet's
-# historical path, last, so a fleet host keeps working mid-migration.
+# Order: $MESH_CODE_DIR, this file's directory, <root>/memory-mesh walking up
+# from cwd, then the legacy ~/{{REDACTED}} path.
 def _mesh_code_dir():
     here = Path(__file__).resolve().parent
     cands = []
@@ -97,9 +73,9 @@ def _mesh_code_dir():
 
 
 def _emit_tier(slugs, tier):
-    """Replicate an index-tier change as `tier` events (2026-09-27), so every
-    host's fold agrees on what is on-demand. The local file change already
-    happened and stands on its own; a failure here is loud, never fatal."""
+    """Replicate an index-tier change as `tier` events so every host's fold agrees.
+
+    The local change already happened; a failure here is loud, never fatal."""
     d = _mesh_code_dir()
     tool = d / "tier.py" if d else None
     if not (tool and tool.is_file() and slugs):
@@ -120,25 +96,16 @@ def _mesh_emit_path():
     return (d / "emit.py") if d else None
 
 
-# Derived per host (homes differ: /home/{{REDACTED}} vs /Users/craigvandeputte) —
-# the harness keys the store by the CC workspace path with / → -.
+# The harness keys the store by the workspace path with / → -.
 def _store():
-    """The store the harness serves for THIS workspace. Walk up from cwd to the
-    first directory whose cwd-keyed store carries the .mesh-generated marker
-    ({{REDACTED}}: ~/ai-os; {{REDACTED}}/{{REDACTED}}: ~/{{REDACTED}}); fall back to the CC
-    tree, the only path this ever knew until 2026-09-17 — when on {{REDACTED}} it
-    wrote side-effect files into a store nothing folded."""
+    """The store the harness serves for this workspace.
+
+    $MEMORY_WRITE_STORE, else mesh_lib.store_dir(), else the first cwd ancestor
+    whose store carries .mesh-generated, else the ~/{{REDACTED}} store."""
     override = os.environ.get("MEMORY_WRITE_STORE")
     if override:
         return Path(override).expanduser()
-    # SEED-080: the workspace is where the CODE lives, which is the same rule
-    # mesh_lib.store_dir() uses — ask it rather than deriving a second answer.
-    # Until the engine moved into memory-mesh/ this file had no workspace
-    # ancestry to reason from, so it walked up from cwd instead; that walk
-    # survives below as a fallback, but it can no longer be the first answer.
-    # It is why a fresh seed install failed M2: mesh_lib resolved the install's
-    # own store while this file resolved ~/{{REDACTED}}'s, and the two halves of
-    # one door disagreed about where memory lives.
+    # Ask mesh_lib so both halves of the door agree on the store.
     d = _mesh_code_dir()
     if d is not None:
         try:
@@ -163,29 +130,15 @@ STORE = _store()
 INDEX = STORE / "MEMORY.md"
 EXCLUDE = STORE / "_index-exclude.txt"
 QUARANTINE = STORE / "QUARANTINE.md"
-# Cutover phase 7 (memory-mesh, 2026-07-28): when this marker exists,
-# MEMORY.md is GENERATED by the mesh fold — this writer must never edit it.
-# Index changes flow through the mesh event (dual-write below) + the fold;
-# the exclude manifest and QUARANTINE.md remain this writer's to maintain.
+# When this marker exists MEMORY.md is generated by the mesh fold and must not
+# be edited here; the exclude manifest and QUARANTINE.md stay this writer's.
 MESH_MARKER = STORE / ".mesh-generated"
-# SPEC v4: the served index line is bounded at the door by rewrite. Kept in
-# sync with mesh_lib.HOOK_MAX_CHARS — asserted at import below rather than
-# imported, because this writer must keep working with the mesh absent.
+# Mirrors mesh_lib.HOOK_MAX_CHARS (checked in _mesh_lib(); copied so the door
+# works with the mesh absent).
 HOOK_MAX_CHARS = 140
-# mesh_lib.make_event's admission_reject() refuses any lesson content over
-# mesh_lib.INDEX_CONTENT_CHARS — kept in sync the same way HOOK_MAX_CHARS is.
-# Found 2026-08-08: the mesh dual-write below used to slice --content to
-# [:1000], so any description over 200 chars ALWAYS failed emit.py with
-# "make_event refused ... content is N chars" — every such write printed
-# "mesh: EMIT FAILED (store write is safe; mesh will lag)" and silently
-# never caught up, because the failure was a permanent refusal, not a
-# transient lag. Caught by reproducing the exact emit.py call by hand after
-# it fired twice in one session.
+# Mirrors mesh_lib.INDEX_CONTENT_CHARS: make_event refuses longer lesson content.
 INDEX_CONTENT_CHARS = 200
-# Bytes the generated index spends on things that are not rows: the header, the
-# quarantine-count line, the on-demand stub. Held back so the door's budget is
-# measured on the COMPOSED file rather than on the rows alone — a bound that
-# measures a subsection is not a bound.
+# Bytes of the generated index that are not rows (header, counts, stub).
 HARNESS_HEADER_RESERVE = 600
 
 
@@ -194,21 +147,10 @@ def index_is_generated():
 
 
 def proc_error(r, limit=400):
-    """The most informative line of a failed subprocess — not the first one.
+    """The most informative line of a failed subprocess.
 
-    emit.py surfaces an admission refusal as an uncaught exception, so the
-    reason is the LAST line of the traceback ("make_event refused ...: content
-    is 224 chars; the renderer cuts at 200"). Every mesh call site here used to
-    keep `(stderr or stdout).strip()[:150]`, which clips the traceback HEADER
-    and throws away the only line that says why. Measured 2026-08-09 on
-    `adopt`: a permanent, actionable refusal reached the operator as a bare
-    "skipped" plus a fragment of "Traceback (most recent call last):" — and
-    the fold is what advises the operator to run adopt, so the dead end was
-    one the tooling walked him into.
-
-    Only reach past the head when there is actually a traceback to reach past:
-    emit.py's own hand-written errors (the GHOST check) are already the
-    message, and are multi-line by design.
+    For a traceback that is the last line (the exception message); otherwise
+    the output as-is, truncated to `limit`.
     """
     text = (r.stderr or r.stdout or "").strip()
     if not text:
@@ -220,25 +162,10 @@ def proc_error(r, limit=400):
 
 
 def require_enforceable_quarantine():
-    """Refuse a contains-untrusted write on a host where quarantine is a fiction.
+    """Refuse a contains-untrusted write on a host without the mesh fold.
 
-    Craig's call, 2026-07-30, closing the last finding on Grok 4.5's board.
-
-    Quarantine has exactly one enforcer: the memory-mesh fold, which holds
-    untrusted events out of the generated index, publishes the quarantine
-    projection, and requires a signature to promote. Its per-host opt-in is
-    MESH_MARKER. Without the marker there is no fold enforcing anything here —
-    and the fallback that used to run instead was add-only: this writer appended
-    to a list whose stated routing owner (consolidate.py) does not exist, so
-    nothing could ever remove an entry and nothing could promote one. A seed
-    recipient in that state accumulates memories that are neither served nor
-    promotable nor removable, while a file named QUARANTINE.md implies a control
-    that is not there. That implication is the whole failure this repaired.
-
-    So the write is REFUSED rather than half-honoured. Deliberately no --force:
-    an override would recreate exactly the surface it exists to remove, and the
-    honest alternative is not a weaker memory — it is a document, which is where
-    an unpromotable observation belongs anyway.
+    The fold (opted in via MESH_MARKER) is quarantine's only enforcer. No
+    --force on purpose: the alternative is to write a document instead.
     """
     if index_is_generated():
         return
@@ -268,12 +195,7 @@ SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
 def on_demand_slugs():
-    """Slugs deliberately kept OUT of the always-on MEMORY.md index.
-
-    The two-tier index is a standing decision per memory (see auto-memory
-    `memory-index-two-tier`), so an UPDATE to an on-demand memory must not
-    silently promote it back to always-on.
-    """
+    """Slugs kept out of the always-on index (an update must not promote them)."""
     if not EXCLUDE.exists():
         return set()
     return {l.strip() for l in EXCLUDE.read_text().splitlines()
@@ -288,34 +210,13 @@ def resident_slugs():
 
 
 def default_on_demand(slug):
-    """Enforce admission policy E at the PRODUCER: a NEW memory defaults to
-    on-demand. Returns the paths it touched (for the commit).
+    """Default a NEW memory to on-demand (admission policy E).
 
-    Craig ratified 2026-07-31: "New rules default to on-demand; promotion into
-    always-on requires Craig's explicit word and a named displacement." Nothing
-    enforced it at this door. The fold ranks every live lesson, so a memory
-    written here became an always-on CANDIDATE the moment it existed and
-    displaced a lower-ranked incumbent by score — a residency change nobody
-    decided. Measured 2026-08-01: three memories a sibling session wrote in the
-    evening were, within one fold, staged to evict three standing behavioural
-    rules including `validate-the-instrument-before-trusting-silence`.
-
-    The residency GATE caught it every time, which is why nothing was lost —
-    but a gate that fires on routine writes is a gate the operator learns to
-    click through, and the fix belongs where the artifact is created
-    ([[fix-human-loop-races-at-the-producer]]).
-
-    REFUSES on a slug that is already resident: removing a live rule from the
-    always-on tier is a real demotion and stays Craig's call. That asymmetry is
-    the whole safety argument — this may only ever keep a NEW memory out, never
-    push an existing one out. (Applied by hand without this guard on
-    2026-08-01, it demoted a resident rule; the gate held, and the guard is
-    here so judgment is not the thing standing between a batch and Craig's
-    index.)
+    Returns the paths touched. Never demotes a slug that is already resident.
     """
     if slug in resident_slugs():
         print(f"note: '{slug}' is already always-on — left resident. "
-              f"Demoting a live rule is Craig's call, not a write's side effect.")
+              f"Demoting a live rule is the owner's call, not a write's side effect.")
         return []
     if slug in on_demand_slugs():
         return []
@@ -330,23 +231,14 @@ def render_frontmatter(args):
     lines = ["---", f"name: {args.slug}", f"description: {args.description}"]
     if args.lineage:
         lines.append(f"lineage: {args.lineage}")
-    # B2 (2026-08-06, quick-fix round per Grok review): the session-provenance
-    # verdict travels WITH the file, not just in a stderr NOTE at write time —
-    # PRINCIPLES 18, keep the artifact, not just the conclusion.
-    # clean | unverified | flagged-downgraded. (flagged-override retired —
-    # see the write subparser's --provenance-override removal note.)
+    # Session-provenance verdict: clean | unverified | flagged-downgraded.
     if getattr(args, "provenance", None):
         lines.append(f"provenance: {args.provenance}")
     if args.supersedes:
         lines.append(f"supersedes: [{args.supersedes}]")
     if args.contradicts:
         lines.append(f"contradicts: [{args.contradicts}]")
-    # SPEC v4: an OPTIMISTIC MIRROR of the event, never the authority. The
-    # event's lineage tip is the sole home of residency (A1); this line exists
-    # so a human reading the file sees the tier, and so the fold can repair a
-    # projection without a second lookup. A tool that writes this and skips the
-    # event leaves the fold blind — the exact failure the SPEC's lineage
-    # epistemology paragraph was written to prevent.
+    # Mirror of the event's residency for readers; the event is the authority.
     if getattr(args, "residency", None):
         lines.append(f"residency: {args.residency}")
     if getattr(args, "doctrine_candidate", False):
@@ -397,14 +289,12 @@ def insert_index_line(text, section, line, slug):
 
     m = find_section(text, section)
     if not m:
-        # No matching section — append to the Unsorted section, or the end of
-        # the file if even that is missing. Loud, not silent.
+        # No matching section: file under Unsorted (created if missing).
         print(f"warning: section '{section}' not found in MEMORY.md — filing under Unsorted", file=sys.stderr)
         m = find_section(text, "Unsorted")
         if not m:
             return text.rstrip("\n") + f"\n\n## Unsorted (auto-added by memory_write.py)\n{line}\n"
-    # Insert before the on-demand recall continuation line if present, else
-    # right after the section header, else before the next "## " heading.
+    # Insert at the end of the section's body.
     section_start = m.end()
     next_heading = re.search(r"^## ", text[section_start:], re.MULTILINE)
     section_end = section_start + next_heading.start() if next_heading else len(text)
@@ -432,20 +322,10 @@ def _git(*argv, check=False):
 
 
 def git_commit(paths, args):
-    """Commit ONLY the files this invocation touched, then push.
+    """Commit only the files this invocation touched, then push.
 
-    The store is git-backed but nothing in the memory workflow ever called git,
-    so every /improve and /capture wrote files that sat uncommitted until a
-    human noticed. On 2026-07-25 that backlog was 64 files and 10 days deep,
-    and it was found by accident. A memory that exists only in one working tree
-    is not a memory that survives the disk.
-
-    Scoped to `paths` on purpose: the store frequently holds unrelated in-flight
-    edits, and `git add -A` here would sweep them into someone else's commit.
-
-    Never fatal. The write already succeeded by the time we get here; failing
-    the whole command would be a lie about what happened on disk. Degrade
-    loudly instead — the operator needs to know it is only local.
+    Scoped to `paths` so unrelated in-flight edits are not swept in. Never
+    fatal: the write already succeeded, so failures are reported loudly.
     """
     if not (STORE / ".git").exists():
         print("note: memory store is not a git repo — nothing to commit", file=sys.stderr)
@@ -486,23 +366,11 @@ def git_commit(paths, args):
         print("pushed")
 
 
-# --- Fact-shape gate (2026-07-27, "one home per fact") -----------------------
-# Infrastructure facts (hosts, routes, endpoints, install state) have exactly
-# one home — FLEET.md, a CLAUDE.md, an OPS.md, the code — and memory POINTS at
-# it. A restated fact in memory is a drift liability: on 2026-07-27 a memory
-# asserting "no SSH key to .21 (Permission denied), verified" landed the same
-# afternoon Craig corrected the opposite in a sibling session. This gate makes
-# the conflict impossible at the only chokepoint instead of asking every future
-# session to be careful. Surgical on purpose: an IPv4 literal is the strongest
-# fact signal with near-zero overlap with behavioral lessons; per
-# fix-the-discriminator, widen only on an observed miss, never speculatively.
-# The ONE home for this list is mesh_lib.FACT_SHAPES (2026-09-16): make_event
-# applies it at the funnel to every text field, so the same text can never be
-# admitted by this door and refused by the emitter after the file has landed.
-# This copy exists only so the door still bounds a write with the mesh absent;
-# _mesh_lib() warns the moment the two diverge, as it does for HOOK_MAX_CHARS.
-# `0.0.0.0` is excluded: the all-sources CIDR idiom, not a host — an observed
-# false positive on 2026-09-16 ("never widen to 0.0.0.0/0").
+# --- Fact-shape gate ("one home per fact") -----------------------------------
+# Infrastructure facts (hosts, endpoints, reachability) live in their owning
+# doc or code; memory points at them. Mirrors mesh_lib.FACT_SHAPES so the door
+# works with the mesh absent; _mesh_lib() warns if they diverge. `0.0.0.0` is
+# excluded as the all-sources CIDR idiom, not a host.
 FACT_SHAPES = [
     (re.compile(r"\b(?!0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
      "an IPv4 address"),
@@ -526,12 +394,9 @@ def fact_shape(*texts):
 
 
 def _session_provenance():
-    """Import session_provenance.py lazily — same degrade-safe pattern as
-    _mesh_lib(): its hooks are STAGED, not wired into ~/.claude/settings.json
-    (see the module's own docstring), so this writer must keep working with
-    it absent exactly as it keeps working with the mesh absent. A missing or
-    broken import degrades the craig-direct check to UNVERIFIED, never to a
-    silent pass framed as verified-clean (see _cmd_write)."""
+    """Import session_provenance lazily, or None.
+
+    A missing import degrades the craig-direct check to UNVERIFIED, never clean."""
     try:
         d = _mesh_code_dir()
         if d is None:
@@ -544,11 +409,9 @@ def _session_provenance():
 
 
 def _mesh_lib():
-    """Import mesh_lib lazily — the mesh is optional infrastructure.
+    """Import mesh_lib lazily, or None; warns if mirrored constants drifted.
 
-    memory_write predates the mesh and must keep working without it (a mesh
-    outage degrades to exactly the pre-mesh world, loudly). So every v4 feature
-    that needs mesh_lib degrades to "no metering" rather than refusing a write.
+    The mesh is optional: features needing it degrade rather than refuse a write.
     """
     try:
         d = _mesh_code_dir()
@@ -558,11 +421,7 @@ def _mesh_lib():
         import mesh_lib
     except Exception:
         return None
-    # HOOK_MAX_CHARS is duplicated here so the door still bounds the hook with
-    # the mesh absent — which makes it a second home for one number. Rather
-    # than trust the copies to stay equal, say so the moment they diverge: a
-    # door that bounds at 140 feeding an emitter that refuses at 120 would
-    # reject writes only AFTER the file landed.
+    # Mirrored limits must match, or the emitter refuses after the file landed.
     if mesh_lib.HOOK_MAX_CHARS != HOOK_MAX_CHARS:
         print(f"warning: HOOK_MAX_CHARS disagrees — memory_write "
               f"{HOOK_MAX_CHARS} vs mesh_lib {mesh_lib.HOOK_MAX_CHARS}; "
@@ -573,11 +432,6 @@ def _mesh_lib():
               f"{INDEX_CONTENT_CHARS} vs mesh_lib {mesh_lib.INDEX_CONTENT_CHARS}; "
               f"the mesh dual-write's truncation won't match what "
               f"make_event actually enforces", file=sys.stderr)
-    # Same drift check for the fact-shape discriminator. Until 2026-09-16 this
-    # door and emit.py each had their OWN list, and the emitter never looked at
-    # the body at all — which is how a fact-copy entered the log through one
-    # door and became unpromotable through the other. One list now (mesh_lib);
-    # this mirror must match it, or the door admits a body the funnel refuses.
     if [rx.pattern for rx, _ in FACT_SHAPES] != \
             [rx.pattern for rx, _ in getattr(mesh_lib, "FACT_SHAPES", [])]:
         print("warning: FACT_SHAPES disagrees — memory_write's fact-shape gate "
@@ -589,50 +443,13 @@ def _mesh_lib():
 
 
 def has_signed_promotion(slug):
-    """(ok: bool, reason: str) — does `lesson/<slug>` have a live,
-    cryptographically verified operator signature that covers its CURRENT
-    content? The ONLY thing that may promote a memory to lineage:
-    craig-direct via `retag` (2026-08-06, B2 quick-fix round; content
-    binding added 2026-08-06, B3).
+    """(ok, reason): does `lesson/<slug>` carry a verified operator signature
+    covering its current content?
 
-    Story: B1 proved the self-declared lineage tag gates nothing; B2 round 1
-    added a session-provenance check to `_cmd_write`, but Grok's adversarial
-    review (memory-mesh/reviews/2026-08-06-grok-b2-quickfix-convergence.md)
-    found the actual chokepoint was fictional as long as `retag` had no check
-    of its own: write as contains-untrusted (which pays the quarantine cost),
-    wait for a later CLEAN session, `retag --lineage craig-direct` — session
-    taint on retag would only see the retagging session, never the tainted
-    one that actually authored the content. Session state is the wrong
-    signal for retag/adopt: those tools don't author content this session,
-    they promote something ALREADY WRITTEN — so the check has to be about
-    the memory's history, not this session's.
-
-    The fix reuses infrastructure Craig already trusts rather than building
-    anything new: `memory-mesh/sign.py --promote` requires his
-    passphrase-gated key (mesh_lib.sign_event's docstring: "an agent cannot
-    promote" is a property of that key, not of this check) and produces a
-    signed mesh event. `mesh_lib.fold_events()` independently RE-verifies
-    every claimed signature — it never trusts a stored flag — and stamps the
-    result as `_signed` on each live event (mesh_lib.py ~846-850), so this
-    function only has to consume that, matching the codebase's own existing
-    idiom (see e.g. mesh_lib.py:2025) rather than re-implementing signature
-    verification.
-
-    B3 (memory-mesh/reviews/2026-08-06-grok-b3-plan-review.md): a signed
-    event used to bind only a short --content description string, not the
-    store file's actual bytes — a promote on clean content followed by a
-    LATER overwrite of the file body would still pass this check on the
-    new, unreviewed bytes (TOCTOU). Closed by comparing the CURRENT file's
-    `mesh_lib.content_fingerprint()` against the signed event's
-    `body_sha256` (bound INSIDE the signature — sign.py computes it at
-    promote time, before signing). A signed event from before B3 carries no
-    `body_sha256` at all and is grandfathered (legacy — the only signer is
-    Craig's passphrase-gated key, so grandfathering READS old events, it
-    doesn't open a write path for new unbound ones).
-
-    Degrades toward safety: no mesh, no readable log, any exception ->
-    (False, reason), never a free pass — same posture as
-    require_enforceable_quarantine().
+    The only path to promote a memory to craig-direct via `retag`. Relies on
+    fold_events() re-verifying signatures (`_signed`) and compares the file's
+    content_fingerprint() to the signed `body_sha256`; events without
+    `body_sha256` are accepted as legacy. Any failure returns (False, reason).
     """
     M = _mesh_lib()
     if M is None:
@@ -662,14 +479,7 @@ def has_signed_promotion(slug):
 def door_lock():
     """Serialise budget-check + write across concurrent agents on this host.
 
-    Grok round 2 caught the TOCTOU: two agents both read "doctrine tier has
-    room", both pass the check, both write, and the tier is over budget with
-    neither refused. `emit.py` already locks its append; that lock is held too
-    late and too narrowly to cover the DECISION this door makes.
-
-    Advisory flock on a lock file, not the store dir: the store is a git
-    worktree that other tools legitimately touch, and an flock on a directory
-    other processes open would deadlock work that has nothing to do with us.
+    Advisory flock on a dedicated lock file, not the store directory.
     """
     import fcntl
     lock_path = STORE / ".door.lock"
@@ -682,9 +492,7 @@ def door_lock():
 def doctrine_budget_state():
     """(used_bytes, cap_bytes, demotable_rows) for the doctrine tier, or None.
 
-    Returns None when the mesh is absent or no memory has declared residency
-    yet — during migration the tier does not exist, and a door that meters an
-    undeclared tier would refuse every write for a budget nobody set.
+    None when the mesh is absent or no memory has declared doctrine residency.
     """
     M = _mesh_lib()
     if M is None:
@@ -701,13 +509,7 @@ def doctrine_budget_state():
             rows.append((M.line_bytes(M.index_row(e)), e["subject"]))
     if not rows:
         return None
-    # Doctrine gets the delivered file minus what pins ACTUALLY USE — not minus
-    # the pin CAP. Reserving the cap would hold ~8.7 KB idle for pins that do
-    # not exist and refuse doctrine writes while a third of the file sat empty.
-    # (Measured 2026-07-31: pins used 3,409 B of a 12,100 B cap, so the wrong
-    # formula made 106 feedback rows look 7,986 B over budget when they in fact
-    # fit with room to spare.) Pins remain the hard floor: when a new pin lands,
-    # doctrine is what sheds, which is the priority order we want.
+    # Doctrine cap = delivered size minus bytes pins actually use (not the pin cap).
     pin_bytes = sum(M.line_bytes(M.index_row(e))
                     for e in M.ranked_index(fold, "operator")
                     if e.get("pin") or e.get("_pin"))
@@ -736,21 +538,10 @@ def _locked(fn, args):
 
 
 def _cmd_adopt(args):
-    """Carry existing store files into the event log as the fact's one home.
+    """Carry existing store files into the event log.
 
-    Two jobs, and the second is the subtle one:
-
-    1. Give each file a v4 event carrying its body, so the fold can project it
-       on every host and /recall works fleet-wide.
-    2. SUPERSEDE any pre-existing event for the same memory. Without this the
-       log holds two live events per fact — the old content-only one and the
-       new body-carrying one — which is a dual canonical, i.e. the one-home
-       violation this whole design exists to close (Grok round 3, A3).
-
-    Adopt is a trust-tier entry point: it turns an unverified file into
-    canonical, replicated, signable state. So it carries the same bar as
-    sign.py --promote — show the body, confirm per item — rather than the bar
-    of a bulk edit.
+    Emits a body-carrying event per file and supersedes any prior events for
+    the same memory. Shows each body and confirms per item unless --yes.
     """
     M = _mesh_lib()
     if M is None:
@@ -766,18 +557,8 @@ def _cmd_adopt(args):
             continue
         body = f.read_text(encoding="utf-8")
         raw_lineage = _frontmatter_value(body, "lineage")
-        # B2 quick-fix (2026-08-06, Grok-reviewed): an UNTAGGED file used to
-        # default silently to craig-direct — a file with literally no
-        # lineage claim became trusted with zero check, the same class of
-        # gap the retag signed-mesh gate closes for an explicit claim. Now
-        # treated identically: an untagged file needs the same signed
-        # operator promotion retag requires, or it stays contains-untrusted
-        # (the safe default) rather than being waved through. A file that
-        # already carries an explicit `lineage: craig-direct` tag is NOT
-        # re-checked here — it already flowed through write/correct's own
-        # session-provenance check or retag's signed-mesh check to get that
-        # tag in the first place; re-deciding trust here would be a second,
-        # redundant, and potentially conflicting judgment.
+        # An untagged file needs a signed promotion to be adopted as
+        # craig-direct; an explicit tag was already checked when it was set.
         if raw_lineage is None:
             ok, reason = has_signed_promotion(slug)
             if not ok:
@@ -789,12 +570,8 @@ def _cmd_adopt(args):
                 continue
         lineage = raw_lineage or "craig-direct"
         desc = _frontmatter_value(body, "description") or slug
-        # DELIBERATELY NOT read from frontmatter. Residency is Craig's
-        # declaration; frontmatter is a hand-editable mirror. Carrying
-        # `residency: pinned` from a file into a log claim would let anything
-        # that can write a store file declare its own tier — laundering an
-        # edit into a privilege claim. Adopted memories arrive UNDECLARED and
-        # are declared by the retag, deliberately.
+        # Residency is NOT read from frontmatter (a hand-editable mirror);
+        # adopted memories arrive undeclared.
         prior = M.unsuperseded_ids(f"lesson/{slug}", events)
         already = [e for e in events
                    if e["subject"] == f"lesson/{slug}" and e.get("body")]
@@ -803,8 +580,7 @@ def _cmd_adopt(args):
                                   "(divergence? use --reconcile)"))
             continue
         if len(body.encode()) > M.MAX_EVENT_BYTES - 1024:
-            # Refuse, never truncate (A4): a half-body projected over a whole
-            # file destroys the part that did not fit.
+            # Refuse, never truncate: a partial body would overwrite the file.
             skipped.append((slug, f"body {len(body.encode())}B too large — "
                                   f"split it or shorten before adopting"))
             continue
@@ -813,9 +589,7 @@ def _cmd_adopt(args):
         print(f"    supersedes {len(prior)} prior event(s): "
               f"{', '.join(prior) if prior else 'none'}")
         if already:
-            # Principle 17: the approval must SHOW what it replaces. A
-            # reconcile overwrites a body that already exists in the log, so
-            # printing only the file is presence, not consent.
+            # Show the diff against the body being replaced.
             import difflib
             old_body = already[-1]["body"]
             print(f"    RECONCILE — event body {len(old_body.encode())} B "
@@ -842,11 +616,7 @@ def _cmd_adopt(args):
                 continue
         cmd = [sys.executable, str(mesh_emit), "--no-nudge",
                "--kind", "lesson", "--subject", f"lesson/{slug}",
-               # INDEX_CONTENT_CHARS, not [:1000]: make_event REFUSES lesson
-               # content over 200 chars rather than truncating it, so a
-               # 1000-char slice is a permanent failure for every description
-               # over 200 — the same bug fixed in cmd_write on 2026-08-08 and
-               # missed here, its sibling call site.
+               # make_event refuses content over INDEX_CONTENT_CHARS.
                "--content", desc[:INDEX_CONTENT_CHARS],
                "--hook", desc[:HOOK_MAX_CHARS],
                "--body", body,
@@ -857,20 +627,13 @@ def _cmd_adopt(args):
             cmd += ["--supersedes", ",".join(prior)]
         if re.search(r"^\s*type:\s*reference\s*$", body, re.M) and \
                 "--pointer" in mesh_emit.read_text(encoding="utf-8"):
-            # Same carve-out as `write`: a reference-type FILE being carried
-            # into the log may name the fact it points at. Any other type with
-            # a fact literal is refused by make_event, and that refusal is the
-            # one-home rule finding a copy — the reason is printed, not hidden.
+            # A reference-type memory may name the fact it points at.
             cmd += ["--pointer"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             adopted.append((slug, prior))
             print(f"adopted {slug}")
-            # Same producer rule as `write`: adoption carries an existing FILE
-            # into the log, so the memory is not new to Craig — but it IS new to
-            # the fold's ranking, and that is what spends residency. Keeping it
-            # on-demand preserves the status quo ante exactly; a slug that was
-            # already resident is left alone by default_on_demand.
+            # New to the fold's ranking, so default to on-demand like `write`.
             touched += default_on_demand(slug)
         else:
             skipped.append((slug, proc_error(r)))
@@ -892,14 +655,9 @@ def _cmd_adopt(args):
 
 
 def cmd_write(args):
-    """Serialise the whole check-then-write against other agents on this host.
+    """Run _cmd_write under the door lock (budget read through mesh emit).
 
-    The lock spans the doctrine budget read, the file write, the index/exclude
-    updates AND the mesh emit — because the invariant is "what I measured is
-    still true when I write", and any gap between those two lets a second agent
-    slip a doctrine row in between. A dry run takes no lock: it writes nothing,
-    and blocking previews behind a writer's lock would make `stage` hang on a
-    busy store for no safety gain.
+    A dry run takes no lock.
     """
     if not args.commit:
         return _cmd_write(args)
@@ -911,10 +669,7 @@ def cmd_write(args):
 
 
 def _write_store_file(path, text):
-    """Write a store file WITHOUT following a symlink (bug bash 2026-09-27 #4,
-    verify-A G4). Path.write_text follows one, so a link planted in the store
-    sent the door's bytes to whatever it pointed at. Refused loudly; the
-    O_NOFOLLOW open closes the check-then-write race as well."""
+    """Write a store file without following a symlink (refused loudly)."""
     path = Path(path)
     if path.is_symlink():
         raise SystemExit(f"error: {path} is a symlink — refusing to write "
@@ -936,54 +691,15 @@ def _cmd_write(args):
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
 
-    # B2 (continuous-verification audit, 2026-08-06; quick-fix round per Grok
-    # review — memory-mesh/reviews/2026-08-06-grok-b2-provenance-review.md +
-    # .../2026-08-06-grok-b2-quickfix-convergence.md): a second signal on a
-    # craig-direct claim, independent of the self-declared tag itself. B1
-    # (evals/memory_poison_probe.py) proved the lineage tag alone gates
-    # nothing — a GhostWriter-style mistag sails straight to the servable
-    # index because nothing checks the tag against anything. This checks it
-    # against ONE thing the caller cannot assert honestly by just typing a
-    # different flag: did THIS session's own tool-call record show it
-    # touching an untrusted-content tool (a web fetch, a Gmail/Outlook/
-    # Calendar/Drive read) before this write? See
-    # memory-mesh/hooks/session_provenance.py for the full design and the
-    # STAGED (not-yet-wired) hook that produces the evidence this reads.
-    #
-    # Round 1 (shipped 2026-08-06) refused a flagged write unless the caller
-    # passed --provenance-override. Grok's review named that the load-bearing
-    # hole (F1): the flag sits on the SAME process that wants the write, so
-    # an agent about to mistag a memory will just as happily rubber-stamp its
-    # own override — "recorded in git" is not a control against the process
-    # making the commit. This round: there is no override. A flagged
-    # craig-direct write is silently REASSIGNED to contains-untrusted and
-    # routed through the same require_enforceable_quarantine() gate below
-    # that an honestly-declared contains-untrusted write already pays. The
-    # write always SUCCEEDS — Grok's F2 finding was that a hard refusal
-    # (even an audited one) creates exactly the friction that trains an
-    # operator or agent to route around a control entirely; downgrading
-    # instead of blocking removes that pressure while still keeping the
-    # memory OUT of the trusted index until Craig reviews and promotes it
-    # (memory-mesh/sign.py --promote).
-    #
-    # Applies to craig-direct only: a contains-untrusted claim already pays
-    # the require_enforceable_quarantine() cost below, and this signal exists
-    # to catch an UNDER-classified claim, not to further gate an honestly
-    # over-cautious one.
+    # Session-provenance check on craig-direct claims: if this session touched
+    # untrusted content (web fetch, mail/calendar/drive read) before the write,
+    # downgrade to contains-untrusted. No override flag; the write still succeeds.
     args.provenance = None
     if args.lineage == "craig-direct":
         SP = _session_provenance()
         session_id = args.session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
         if SP is None:
-            # Degrade exactly like doctrine_budget_state(): never block a
-            # write over an unmeterable check (the hook is not wired on any
-            # host yet, so this is the common case today) — but never let an
-            # unchecked claim render as a VERIFIED one either
-            # (no-data-must-not-render-as-positive-data). UNVERIFIED is
-            # deliberately NOT downgraded: forcing every write to
-            # contains-untrusted before Craig has even authorized wiring the
-            # hook would quarantine ordinary memory-writing by accident — a
-            # much bigger behavior change than this fix is scoped to make.
+            # Unavailable check: record UNVERIFIED (not clean), but do not downgrade.
             args.provenance = "unverified"
             print("NOTE: session-provenance check unavailable (module not "
                   "importable) — writing craig-direct as UNVERIFIED, not "
@@ -1011,17 +727,8 @@ def _cmd_write(args):
                       f"second signal, not claiming it as clean.",
                       file=sys.stderr)
 
-    # B3 (2026-08-06, Grok-reviewed — memory-mesh/reviews/2026-08-06-grok-b3
-    # -plan-review.md): the "quiet twin" of has_signed_promotion(), found
-    # during B3's own design review. That check gates retag/adopt; a plain
-    # `write` on an ALREADY-promoted slug was a second, ungated door to the
-    # same TOCTOU — a clean session (passing the check above with no
-    # trouble) could silently overwrite signed content with unreviewed
-    # bytes, never touching retag at all. Only engages when there's a
-    # signed promotion on record to protect: brand-new memories and updates
-    # to never-promoted craig-direct files are unaffected — same
-    # downgrade-not-refuse philosophy as the session-taint check above, so
-    # the write still succeeds, just not as the trusted claim it asked for.
+    # Changing the content of a signed-promoted slug downgrades it to
+    # contains-untrusted until re-promoted.
     if args.lineage == "craig-direct":
         target_preview = STORE / f"{args.slug}.md"
         if target_preview.exists():
@@ -1048,11 +755,7 @@ def _cmd_write(args):
     if args.lineage == "contains-untrusted":
         require_enforceable_quarantine()
 
-    # SPEC v4 A4: bound the hook by REWRITE at the door, never by truncation
-    # downstream. The hook is the line every session reads; a machine-cut rule
-    # can lose the qualifier that made it correct ("...only when X"). Checked
-    # here so the human fixes it while the content is in front of them, rather
-    # than having emit.py refuse after the file is already written.
+    # Over-long hooks are refused (to be rewritten), never truncated.
     if len(args.hook) > HOOK_MAX_CHARS:
         raise SystemExit(
             f"error: --hook is {len(args.hook)} chars, over the "
@@ -1068,22 +771,12 @@ def _cmd_write(args):
             f"Put the fact in its home ({FACT_HOMES}), then write a --type "
             f"reference memory that POINTS there if a recall hook is needed.")
 
-    # SPEC v4 door metering. A full doctrine tier NEVER drops the lesson: it
-    # lands as `state` carrying doctrine-candidate, which the brief surfaces as
-    # a promotion queue. Grok round 2 caught the alternative — a nonzero exit
-    # on a full tier turns session-end capture into amnesia under exactly the
-    # pressure the door creates.
+    # Doctrine metering: a full or unmeasurable tier writes as `state` with
+    # doctrine-candidate set; the lesson is never dropped.
     args.doctrine_candidate = False
     if getattr(args, "residency", None) == "doctrine":
         budget = doctrine_budget_state()
         if budget is None:
-            # Fail toward the SAFE tier, not toward "no metering". An
-            # unmeterable doctrine write is exactly the one that must not
-            # silently claim always-on space — but refusing it outright would
-            # let a mesh outage block a memory write, which the mesh was built
-            # never to do. Degrading to state keeps the lesson AND the budget.
-            # (Undeclared-residency writes never reach here, so migration is
-            # unaffected.)
             args.residency = "state"
             args.doctrine_candidate = True
             print("NOTE: doctrine budget is unmeasurable (mesh unavailable or "
@@ -1122,20 +815,8 @@ def _cmd_write(args):
     print(f"wrote {target}")
 
     if index_is_generated():
-        # Fold-owned projections: the mesh event (emitted below) carries this
-        # write into the generated index within one fold cycle. Editing a
-        # generated file here would just be overwritten — and reintroduce
-        # dueling writers.
-        #
-        # 2026-07-30: this deference now covers the QUARANTINE list too, not
-        # only the craig-direct index. It was `args.lineage == "craig-direct"
-        # and index_is_generated()`, so an untrusted write still hand-maintained
-        # the store's quarantine list — a list whose stated owner consolidate.py
-        # NO LONGER EXISTS, so nothing ever removed an entry again. That is how
-        # a memory promoted and served in the morning was still listed as
-        # quarantined hours later. The fold writes both projections from one
-        # verdict set (Craig's ruling: "if I promote it, that must be fact
-        # everywhere"), so both are left alone here.
+        # The fold generates both the index and the quarantine list from the
+        # mesh event emitted below; neither is edited here.
         touched = [target]
         print(f"note: {index_target.name} is fold-generated (.mesh-generated) — "
               "index update flows via the mesh event")
@@ -1146,10 +827,7 @@ def _cmd_write(args):
             index_text = remove_index_line(index_text, args.supersedes)
         if args.lineage == "craig-direct":
             if args.slug in on_demand_slugs():
-                # Respect the standing two-tier choice: updating an on-demand memory
-                # refreshes the FILE, never re-promotes it to the always-on index.
-                # (Before this guard, `write` on an on-demand slug added a second
-                # index entry that `demote` then refused to clean up.)
+                # Updating an on-demand memory never re-adds it to the index.
                 print(f"note: '{args.slug}' is on-demand (_index-exclude.txt) — "
                       "file updated, always-on index left alone. "
                       "Remove it from _index-exclude.txt to promote.")
@@ -1165,19 +843,11 @@ def _cmd_write(args):
     if not args.no_git:
         git_commit(touched, args)
 
-    # Mesh dual-write (cutover phase 7, 2026-07-27): every store write also
-    # becomes a mesh event so parallel sessions and peer hosts see it within
-    # one fold cycle, and contradictions PARK instead of silently coexisting.
-    # Best-effort by design — the store write above already succeeded, and a
-    # mesh outage must never block a memory write (it degrades to exactly the
-    # pre-mesh world, loudly).
+    # Mesh dual-write: best-effort; the store write above already succeeded.
     mesh_emit = _mesh_emit_path()
     if mesh_emit is not None:
-        # SPEC v4: the event carries the FACT — the approved hook (the served
-        # index line) and the full body — so store files become projections
-        # the fold can repair on any host, and a pin signs the whole fact
-        # rather than a slogan. `--content` stays the description for
-        # backwards compatibility with every pre-v4 event already in the log.
+        # The event carries the hook and full body; --content stays the
+        # description for compatibility with older events.
         cmd = [sys.executable, str(mesh_emit), "--no-nudge",
                "--kind", "lesson", "--subject", f"lesson/{args.slug}",
                "--content", args.description[:INDEX_CONTENT_CHARS],
@@ -1192,22 +862,11 @@ def _cmd_write(args):
             cmd += ["--expires", args.expires]
         if args.type == "reference" and \
                 "--pointer" in mesh_emit.read_text(encoding="utf-8"):
-            # The reference carve-out this door granted at fact_shape() above,
-            # carried to the funnel so make_event's body gate honours the same
-            # decision — otherwise the file lands and the event is refused.
-            # Skew-guarded on the EMITTER's text: a host whose memory-mesh
-            # checkout predates --pointer would choke on the flag, and that
-            # older emit does not gate the body anyway, so nothing is lost.
+            # Pass the reference carve-out on, if this emit.py supports it.
             cmd += ["--pointer"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if r.returncode == 0:
-            # emit.py prints "emitted <id> (kind subject) -> log". That id is
-            # the ONLY handle `sign.py --promote` accepts, and this used to
-            # swallow it — so a quarantined write ended with "event emitted"
-            # and no way to act on it short of grepping the ndjson by hand.
-            # 2026-08-11: Craig was handed `--promote <slug>` and it failed
-            # with "no event found". A producer that does not tell you what it
-            # produced is half-shipped.
+            # The event id is what `sign.py --promote` needs.
             emitted = re.search(r"emitted\s+([0-9a-f]{8,})", r.stdout or "")
             event_id = emitted.group(1) if emitted else None
             print(f"mesh: event emitted{f' ({event_id})' if event_id else ''}")
@@ -1215,13 +874,10 @@ def _cmd_write(args):
                 _emit_tier([args.slug], "ondemand")
             if args.lineage != "craig-direct" or args.provenance == \
                     "flagged-downgraded":
-                # Quarantined: not served by ANY tier until the operator's key
-                # says otherwise. Print the exact command rather than the shape
-                # of it — surfacing the depth at the decision point is the
-                # whole difference between a note and an action.
+                # Quarantined: print the exact promote command.
                 if event_id:
                     print(f"QUARANTINED (lineage contains-untrusted) — not "
-                          f"served until promoted. Craig runs:\n"
+                          f"served until promoted. The owner runs:\n"
                           f"  python3 memory-mesh/sign.py "
                           f"--promote {event_id}")
                 else:
@@ -1231,11 +887,7 @@ def _cmd_write(args):
         else:
             print(f"mesh: EMIT FAILED (store write is safe; mesh will lag): "
                   f"{proc_error(r)}")
-        # A supersede must also retire the OLD slug's lesson event, or the
-        # generated index would keep serving the superseded rule forever.
-        # Never on its own slug: `--supersedes <same slug>` (an in-place
-        # rewrite) retracted the lesson this call had just written — 15 such
-        # retracts across 13 subjects, measured 2026-09-27.
+        # Retract the superseded slug's event (never this call's own slug).
         if args.supersedes and args.supersedes != args.slug and index_is_generated():
             r2 = subprocess.run(
                 [sys.executable, str(mesh_emit), "--no-nudge",
@@ -1265,16 +917,7 @@ def _subject_in_log(subject):
 def cmd_demote(args):
     """Move memories from the always-loaded index to the on-demand tier.
 
-    Demotion is the cheapest lever the store has when MEMORY.md approaches its
-    ~24.4 KB load ceiling (see memory-reconcile/budget.py): the fact file is
-    untouched and stays fully live for /recall and the typed graph — only its
-    always-on index line goes away. Nothing is deleted, so this is reversible
-    by deleting the slug from _index-exclude.txt.
-
-    It lives here rather than in a standalone script because the memory-write
-    guard (Story 029) blocks every other write path into the store, and it
-    should: an out-of-band editor is exactly the hole the lineage gate exists
-    to close. Demotion writes no memory CONTENT, so it needs no lineage.
+    The fact file stays live for /recall; reversible with --undo.
     """
     missing, demoted = [], []
     gen = index_is_generated()
@@ -1306,7 +949,7 @@ def cmd_demote(args):
         print(f"updated {EXCLUDE}")
         _emit_tier(dropped, "always")
         print("the next fold STAGES this as a residency delta — it is not live "
-              "until Craig promotes it.")
+              "until the owner promotes it.")
         if not args.no_git:
             class _A:
                 slug = ", ".join(dropped)
@@ -1316,14 +959,8 @@ def cmd_demote(args):
         return
 
     for slug in args.slugs:
-        # A PREFIXED SUBJECT (`home/cc-claude-md`, `ssh-route/{{REDACTED}}`) is a
-        # legitimate demotion target with no store file behind it: those rows
-        # are fold-emitted pointer events, not written memories. Until
-        # 2026-08-01 both this loop and mesh_lib.residency_partition keyed on
-        # the bare lesson slug, so such a row could not be named here AND would
-        # not have matched the exclude list if it had been — an always-on row
-        # that structurally could not leave the tier. Found when Craig asked to
-        # demote `home/*` and the sanctioned door had no handle on that side.
+        # A prefixed subject (`home/x`) is a fold-emitted pointer row with no
+        # store file; it is verified against the log instead.
         prefixed = "/" in slug
         if prefixed:
             head, _, tail = slug.partition("/")
@@ -1332,9 +969,6 @@ def cmd_demote(args):
                     f"error: subject must be kebab-case[/kebab-case]: {slug!r}")
         elif not SLUG_RE.match(slug):
             raise SystemExit(f"error: slug must be kebab-case: {slug!r}")
-        # Existence check only applies to written memories. A prefixed subject
-        # is verified against the LOG instead, so a typo still cannot silently
-        # do nothing.
         if prefixed:
             if not _subject_in_log(slug):
                 missing.append(slug)
@@ -1343,8 +977,7 @@ def cmd_demote(args):
             missing.append(slug)
             continue
         if gen:
-            # Fold-owned index: demotion is purely an exclude-manifest change;
-            # the next fold moves the slug to the on-demand appendix.
+            # Fold-owned index: only the exclude manifest changes.
             if slug in already:
                 print(f"note: '{slug}' already on-demand — nothing to do")
             else:
@@ -1354,10 +987,7 @@ def cmd_demote(args):
         index_text = remove_index_line(index_text, slug)
         stripped = index_text != before
         if slug in already:
-            # Already excluded, but a stray always-on line can still exist (a
-            # `write` update used to re-add one). Clean it up rather than
-            # short-circuiting — the old code skipped here and left the
-            # duplicate stranded, unfixable through the sanctioned tool.
+            # Already excluded: still remove any stray always-on line.
             if stripped:
                 print(f"note: '{slug}' already on-demand — removed a stray "
                       "always-on index line")
@@ -1378,8 +1008,7 @@ def cmd_demote(args):
         print("nothing to demote")
         return
 
-    # Only slugs not already listed get appended — a stray-line cleanup on an
-    # already-excluded slug must not duplicate it in the exclude file.
+    # Append only slugs not already listed.
     to_add = [s for s in demoted if s not in already]
     new_exclude = (exclude_text.rstrip("\n") + "\n" + "\n".join(to_add) + "\n"
                    if to_add else exclude_text)
@@ -1414,17 +1043,10 @@ def cmd_demote(args):
 
 
 def cmd_delete(args):
-    """Delete memories whose fact now lives in its ONE home (2026-07-27 purge).
+    """Delete memories whose fact now lives in its own home.
 
-    The counterpart of the fact-shape gate in cmd_write: the gate stops NEW
-    fact-copies at the door; delete retires the existing ones once their fact
-    has a verified home. --home is REQUIRED and recorded in the commit — the
-    tool refuses an unexplained deletion the same way the gate refuses an
-    unexplained fact. Files stay recoverable in the store's git history.
-
-    Lives here for the same reason demote does: the memory-write guard blocks
-    every out-of-band mutation of the store, and deletion must not be the one
-    unguarded door.
+    --home is required and recorded in the commit; files stay recoverable in
+    the store's git history.
     """
     missing, victims = [], []
     for slug in args.slugs:
@@ -1470,8 +1092,7 @@ def cmd_delete(args):
     EXCLUDE.write_text(exclude_text)
     print(f"updated {EXCLUDE}")
 
-    # Fold-owned index: also retire any live lesson event for each deleted
-    # slug, or the generated MEMORY.md would keep serving a deleted memory.
+    # Fold-owned index: retract each deleted slug's lesson event.
     if gen:
         mesh_emit = _mesh_emit_path()
         if mesh_emit is not None:
@@ -1496,14 +1117,7 @@ def cmd_delete(args):
 
 
 def cmd_flip(args):
-    """Cutover phase 7 (memory-mesh): flip THIS store's MEMORY.md to
-    fold-generated, or revert. The marker (.mesh-generated) is what every
-    gated consumer keys on — this writer, consolidate.py, reconcile.py, and
-    the fold itself. Lives here because the memory-write guard rightly blocks
-    every out-of-band mutation of the store, including this one: the flip is
-    a store-level state change and deserves the same one-door audit trail.
-    Writes no memory CONTENT, so it needs no lineage (same reasoning as
-    demote/retag)."""
+    """Flip this store's MEMORY.md to fold-generated (.mesh-generated), or revert."""
     gitignore = STORE / ".gitignore"
 
     if args.revert:
@@ -1558,8 +1172,7 @@ def cmd_flip(args):
 
 
 def _flip_commit(msg, args):
-    """Commit the staged index (the flip stages a removal, which a path-scoped
-    git_commit() would drop). Verify nothing unrelated is staged first."""
+    """Commit the staged flip; refuses if unrelated changes are staged."""
     _, staged = _git("diff", "--cached", "--name-only")
     unrelated = [f for f in staged.splitlines()
                  if f not in ("MEMORY.md", ".gitignore", MESH_MARKER.name)]
@@ -1599,14 +1212,7 @@ def _split_frontmatter(text):
 def set_lineage(text, value):
     """Return `text` with a top-level `lineage: <value>` in its frontmatter.
 
-    Rewrites ONLY the lineage key: body, description, metadata and every other
-    field are byte-preserved. That is the whole point — a lineage backfill must
-    never become an excuse to regenerate a memory's content, or the tag would
-    certify text the tagger just rewrote.
-
-    Also strips any INDENTED `lineage:` (the nested-lineage drift
-    memory-reconcile/lineage.py lints for: nested tags parse as `unknown`, so a
-    note can carry a confident-looking tag that counts for nothing).
+    Everything else is byte-preserved; any indented (nested) `lineage:` is removed.
     """
     fm, rest = _split_frontmatter(text)
     if fm is None:
@@ -1622,51 +1228,18 @@ def set_lineage(text, value):
 
 
 def cmd_retag(args):
-    """Set `lineage:` on EXISTING memories without touching their content.
+    """Set `lineage:` on existing memories without touching their content.
 
-    Story 029's backfill path. Pre-029 memories carry no tag, so
-    lineage.trust_class() reads them as `unknown` — which means
-    policy_gate.justification_ok() will not let them anchor a privileged
-    action, and reconcile.py flags them every week. The only other writers are
-    `write` (regenerates the whole file from --rule/--why/--how — it would
-    clobber the body) and a hand edit (blocked by the memory-write guard, and
-    rightly: an out-of-band editor is the hole the gate exists to close).
-
-    Retag writes no memory CONTENT, so it needs no lineage of its own — same
-    reasoning as `demote`. It does NOT move index lines: promoting a note to
-    `contains-untrusted` pulls it out of MEMORY.md into QUARANTINE.md on the
-    next consolidate.py run, which owns that routing.
-
-    B2 quick-fix (2026-08-06, Grok-reviewed): promoting TO craig-direct now
-    requires `has_signed_promotion(slug)` — a live, cryptographically
-    verified operator signature on `lesson/<slug>` in the mesh event log
-    (memory-mesh/sign.py --promote, gated on Craig's passphrase key). Session
-    taint (the check `_cmd_write` uses) is the WRONG signal here: retag
-    doesn't author content this session, it promotes something already
-    written, possibly long ago in a different, tainted session — a clean
-    session checking its OWN taint proves nothing about the memory's
-    history. Grok's review demonstrated the exact laundering path this
-    closes: write as contains-untrusted (pays the quarantine cost), wait for
-    a later clean session, retag straight to craig-direct with no session
-    check catching it. See has_signed_promotion()'s docstring for the one
-    known residual (the signed event isn't yet bound to a content hash).
+    Does not move index lines. Retagging to craig-direct requires either a
+    signed promotion (has_signed_promotion) or --operator-approved words.
     """
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
     if args.lineage == "contains-untrusted":
         require_enforceable_quarantine()
 
-    # VERBAL PROMOTION (2026-08-12, Craig's ruling). The second promotion class.
-    # A per-call ARGUMENT carrying his actual words, deliberately not an env var
-    # and not a bare flag — the _lib/mail.py authorized=True pattern, so it
-    # cannot be set once and forgotten, and so the thing recorded is WHAT he
-    # approved rather than merely THAT something was approved.
-    #
-    # Say plainly what this is not: it is not a security control. An agent can
-    # pass any string. The signature path remains the only agent-impossible one.
-    # What this buys is an auditable record and a distinct stamp, which is the
-    # trade Craig made knowingly (decisions/verbal-approval-promotes-untrusted-
-    # memory-2026-08-12.md).
+    # Verbal promotion: a per-call quote of the owner's approval. An audit
+    # record, not a security control; the signature path remains the strong one.
     approved = (getattr(args, "operator_approved", None) or "").strip()
     PROMOTION_KEY = PROMOTION_VERBAL = None
     if args.lineage == "craig-direct":
@@ -1679,7 +1252,7 @@ def cmd_retag(args):
             "it had done something it had not.")
     if approved and len(approved) < MIN_APPROVAL_WORDS:
         raise SystemExit(
-            f"error: --operator-approved must quote Craig's actual words "
+            f"error: --operator-approved must quote the owner's actual words "
             f"(at least {MIN_APPROVAL_WORDS} characters; got {len(approved)}).\n"
             "  The quote IS the audit trail for a promotion with no signature "
             "behind it. A token value would serve an untrusted-lineage memory "
@@ -1704,10 +1277,7 @@ def cmd_retag(args):
                     continue
                 klass = PROMOTION_KEY
         before = p.read_text()
-        # A key-signed promotion outranks a verbal one. Downgrading is legal —
-        # Craig may re-approve something verbally — but it must never be quiet,
-        # because the file would afterwards claim WEAKER provenance than it once
-        # had and nothing else would say so.
+        # Replacing a key-signed stamp with a verbal one is allowed but warned.
         if klass == PROMOTION_VERBAL and f"promotion: {PROMOTION_KEY}" in before:
             print(f"warning: {slug} was {PROMOTION_KEY}; a verbal approval is "
                   f"WEAKER provenance and will replace that stamp",
@@ -1731,7 +1301,7 @@ def cmd_retag(args):
             "  retag no longer decides trust itself; it only executes what a "
             "signed mesh event already declared. Promote first:\n"
             "    memory-mesh/sign.py --promote <event-id>\n"
-            "  (or --subject/--content directly), which requires Craig's "
+            "  (or --subject/--content directly), which requires the owner's "
             "passphrase-gated key and will call this retag for you as its "
             "mechanical follow-through. A 'modified after promotion' reason "
             "means the file changed since it was last signed — re-promote "
@@ -1768,12 +1338,7 @@ def cmd_retag(args):
 def _promotion_vocab():
     """(PROMOTION_KEY, PROMOTION_VERBAL, MIN_APPROVAL_WORDS) from mesh_lib.
 
-    Read from the one authority rather than copied here. memory_write.py and
-    mesh_lib already carry one duplicated constant (INDEX_CONTENT_CHARS) with a
-    drift WARNING as its only guard; a second copy of the promotion vocabulary
-    would be the same bug with worse consequences, because a drifted class name
-    would silently stop matching the fold's serve gate and the memory would just
-    never be served. Degrades safe: no mesh, no promotion.
+    Not copied locally; without the mesh no promotion is possible.
     """
     M = _mesh_lib()
     if M is None:
@@ -1790,18 +1355,9 @@ _FM_APPROVED = re.compile(r"^approved:[ \t]*.*$\n?", re.M)
 
 
 def set_promotion(text, klass, words=None):
-    """Stamp HOW a memory was promoted, byte-preserving everything else.
+    """Stamp how a memory was promoted (`promotion:`), byte-preserving the rest.
 
-    Two classes since 2026-08-12 (Craig: "there is key signed and verbally
-    signed"). Both are stamped, not just the weak one: if only verbal
-    promotions carried a marker, an UNSTAMPED file would be ambiguous between
-    "key-signed" and "predates this field", and the audit question — how did
-    this become trusted? — would have no answer for exactly the files where it
-    matters. Absence now means "promoted before 2026-08-12", which is honest.
-
-    `approved:` holds Craig's verbatim words on the verbal path. That quote is
-    the entire audit trail for a promotion with no signature behind it, so it
-    is stored next to the fact rather than only in the mesh event log.
+    On the verbal path `approved:` stores the verbatim approval words.
     """
     fm, rest = _split_frontmatter(text)
     if fm is None:
@@ -1824,11 +1380,7 @@ _FM_CORRECTED = re.compile(r"^corrected:[ \t]*.*$\n?", re.M)
 
 
 def set_corrected(text, stamp):
-    """Return `text` with a top-level `corrected: <stamp>` in its frontmatter.
-
-    A visible staleness marker: memory-prune's LLM pass is staleness-triggered,
-    so a note that has been corrected once is exactly the kind of note worth
-    re-reading later."""
+    """Return `text` with a top-level `corrected: <stamp>` in its frontmatter."""
     fm, rest = _split_frontmatter(text)
     if fm is None:
         raise ValueError("no `---` frontmatter block — refusing to guess")
@@ -1842,22 +1394,7 @@ def set_corrected(text, stamp):
 
 
 def _reemit_corrected(slug):
-    """Carry a just-corrected FILE back into the event log.
-
-    Root cause of the four store/event divergences alarming on every fold as of
-    2026-08-01 (`memory-mesh/audits/2026-08-01-rehome-and-divergence-audit.md`):
-    `correct` wrote the store file and emitted nothing, so the file forked away
-    from its event permanently and the fold alarmed forever after. Worse, the
-    alarm's advice — `adopt <slug>` — refused precisely because an event body
-    existed, and the only remaining path (signing the stale event) would have
-    overwritten the correction with the text it corrected. Measured on
-    `cc-backup`: the event still claimed a {{REDACTED}} cron job retired by the
-    2026-07-26 systemd migration, so signing it would have restored a verified
-    falsehood.
-
-    A correction is a supersede, not a side channel. Emitting here keeps the
-    log the one home and makes `correct` self-consistent by construction.
-    """
+    """Carry a just-corrected file back into the event log (adopt --reconcile)."""
     class _Adopt:
         slugs = [slug]
         yes = True
@@ -1873,26 +1410,10 @@ def _reemit_corrected(slug):
 
 
 def cmd_correct(args):
-    """Fix a WRONG FACT inside a memory without rewriting the memory.
+    """Replace one exact substring in a memory's body (or description).
 
-    The gap this closes (found 2026-07-29 by memory-reconcile): every other way
-    to fix one stale line was disproportionate or forbidden.
-      * `write` regenerates the body from --rule/--why/--how, so correcting one
-        path in a 127-line reference memory means re-authoring the document —
-        and re-authoring to fix a typo is how the *rest* of a document silently
-        drifts.
-      * a hand edit is blocked by the memory-write guard, and rightly: an
-        out-of-band editor is the hole the lineage gate exists to close.
-    So the cheapest honest fix cost a full rewrite, nobody paid it, and five
-    known-wrong facts sat in the always-on store for weeks. A store that can
-    add knowledge and replace it wholesale, but cannot cheaply CORRECT it, will
-    always drift toward wrong.
-
-    Unlike `retag` and `demote`, this writes memory CONTENT, so it needs its
-    own honest --lineage: whoever sourced the correction is making a claim.
-
-    Fails closed, loudly, on anything ambiguous — an edit that silently hits
-    the wrong occurrence is worse than the stale fact it replaces.
+    Writes content, so it takes its own --lineage. Fails closed on any
+    ambiguity (zero or multiple matches, frontmatter hits).
     """
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
@@ -1913,12 +1434,7 @@ def cmd_correct(args):
     if fm is None:
         raise SystemExit(f"error: {args.slug}: no `---` frontmatter — refusing to guess")
 
-    # The laundering guard runs BEFORE any write path, not inside one of them.
-    # It first sat below the --in-description branch, which returns early — so
-    # the description (the field that decides whether a memory surfaces at all)
-    # was writable with contains-untrusted lineage while the body was not. A
-    # control that only covers the path you thought of is not a control; found
-    # by an adversarial review of this very change, 2026-07-29.
+    # Laundering guard: must run before every write path, including --in-description.
     note_lineage = re.search(r"^lineage:[ \t]*(\S+)", fm, re.M)
     note_lineage = note_lineage.group(1) if note_lineage else "unknown"
     if args.lineage == "contains-untrusted" and note_lineage != "contains-untrusted":
@@ -1928,16 +1444,8 @@ def cmd_correct(args):
             "exists to close. If the correction is real, `demote`/`retag` the "
             "note deliberately first, or write it as its own quarantined note.")
 
-    # B2 quick-fix (2026-08-06, Grok-reviewed): correct writes memory CONTENT
-    # with its own --lineage claim, same class of live assertion as `write` —
-    # so it gets the same session-provenance check, not retag's signed-mesh
-    # check (retag/adopt promote something already-written; correct is
-    # authoring new body text right now, possibly from something this
-    # session just read). Unlike `write`, correct can't silently redirect to
-    # contains-untrusted: its whole charter is "never touch the lineage
-    # frontmatter" (that's what the check above enforces the other
-    # direction), so a flagged session's claim of craig-direct is refused
-    # outright rather than downgraded.
+    # Session-provenance check as in `write`, but refused rather than
+    # downgraded: correct never changes the note's lineage.
     if args.lineage == "craig-direct":
         SP = _session_provenance()
         session_id = getattr(args, "session_id", None) or os.environ.get("CLAUDE_CODE_SESSION_ID")
@@ -1955,11 +1463,7 @@ def cmd_correct(args):
                     "   - apply the correction from a session that hasn't "
                     "touched untrusted content this session.")
 
-    # --in-description scopes the same exact-substring replace to the
-    # `description:` line. It is a separate flag rather than a widening of the
-    # body search because description feeds RECALL RELEVANCE: it decides
-    # whether a memory surfaces at all, so editing it should be a deliberate
-    # act, never something a body correction does as a side effect.
+    # --in-description: apply the replace to the `description:` line only.
     if args.in_description:
         dm = re.search(r"^description:[ \t]*(.*)$", fm, re.M)
         if not dm:
@@ -1987,8 +1491,7 @@ def cmd_correct(args):
             git_commit([p], _A())
         return
 
-    # Body only. Correcting frontmatter through a text-replace would let a
-    # "correction" rewrite name/description/lineage — use write/retag for those.
+    # Body only; frontmatter changes go through write/retag.
     nl = rest.find("\n")
     body_start = nl + 1 if nl != -1 else len(rest)
     head, body = rest[:body_start], rest[body_start:]
@@ -2031,21 +1534,11 @@ def cmd_correct(args):
 
 
 def selftest():
-    """Deterministic, isolated, bounded — proves the B2 session-provenance
-    check at the ACTUAL enforced chokepoint (_cmd_write), not a preview
-    helper. Called both via the door-locked production entry point
-    (cmd_write) and DIRECTLY (_cmd_write) to prove there is no wrapper-only
-    enforcement a caller could route around.
+    """Isolated selftest of the write/retag/correct/adopt gates.
 
-    SAFETY: every write lands in a throwaway shadow store + a throwaway,
-    git-init'd shadow mesh event log (same MESH_ROOT-diversion mechanism
-    evals/memory_poison_probe.py and memory-mesh/drill.py already use, and
-    the same sandbox guard: a fresh subprocess must show
-    mesh_lib.harness_store() resolving to None under the diverted MESH_ROOT
-    BEFORE anything is planted, or this refuses to proceed). Nothing here
-    can reach Craig's real store or ~/memory-events. Verified again at the
-    end: the real store is globbed for the selftest's self-labeling
-    zzselftest-b2-* slugs.
+    Runs against a shadow store and shadow mesh log (MESH_ROOT diverted);
+    aborts before writing unless mesh_lib.harness_store() resolves to None.
+    Afterwards verifies the real store has no zzselftest-b2-* files.
     """
     import shutil
     import subprocess
@@ -2078,11 +1571,6 @@ def selftest():
     subprocess.run(["git", "-C", str(shadow_mesh), "commit", "-q", "-m",
                      "shadow mesh seed"], check=True, env=git_env)
     prov_log = tmp / "provenance.jsonl"
-    # Set once, up front, for the whole selftest (not toggled per-scenario):
-    # the B2 quick-fix routes a flagged write through the SAME
-    # require_enforceable_quarantine() gate an honest contains-untrusted
-    # write already pays, and that gate raises unless the store looks
-    # mesh-adopted. Every scenario below needs that to be true.
 
     saved_env = {k: os.environ.get(k) for k in
                  ("MESH_ROOT", "MESH_HOST", "SESSION_PROVENANCE_LOG",
@@ -2108,8 +1596,7 @@ def selftest():
         return ns
 
     try:
-        # Safety FIRST: prove the sandbox guard engages under the diverted
-        # MESH_ROOT, in a fresh subprocess, before planting anything.
+        # Prove the sandbox guard engages before planting anything.
         code = ("import sys; sys.path.insert(0, %r); import mesh_lib as M; "
                  "print(repr(M.harness_store()))"
                  % str(_mesh_code_dir()))
@@ -2133,10 +1620,8 @@ def selftest():
             "SAFETY ABORT: shadow STORE resolves under the real store"
         MESH_MARKER.write_text("selftest marker\n")
 
-        # 1. No session id at all -> unverified, write proceeds. (This is
-        #    also the FIRST craig-direct write, so it's what lazily imports
-        #    session_provenance and binds its LOG to our shadow prov_log —
-        #    every later scenario relies on that having already happened.)
+        # 1. No session id -> unverified. Also the first import of
+        #    session_provenance, binding its log to prov_log.
         a = base_args(session_id=None)
         _cmd_write(a)
         p = shadow_store / f"{a.slug}.md"
@@ -2148,12 +1633,8 @@ def selftest():
         check("session_provenance module was actually imported by _cmd_write "
               "(not skipped)", SP is not None)
 
-        # 1b. Fact-shape gate: the door and the funnel share ONE discriminator
-        #     (mesh_lib.FACT_SHAPES, 2026-09-16). A project-type memory with an
-        #     IP in its rule is refused at the door BEFORE any file lands; a
-        #     reference-type one is admitted at the door AND the --pointer
-        #     carve-out reaches make_event, so the event lands in the mesh.
-        #     The half-state this closes is "file written, event refused".
+        # 1b. Fact-shape gate: project memory with an IP is refused before any
+        #     file lands; a reference memory is admitted and its event lands.
         a = base_args(slug="zzselftest-b2-factcopy", type="project",
                       rule="the Envoy is at 192.0.2.158, verified",
                       session_id=None)
@@ -2186,14 +1667,8 @@ def selftest():
         check("clean session -> stamped provenance: clean",
               p.exists() and "provenance: clean" in p.read_text())
 
-        # 3. Untrusted touch this session -> DOWNGRADED, not refused. Round 1
-        #    (2026-08-06) refused unless the caller passed
-        #    --provenance-override; Grok's review named that flag itself as
-        #    the hole (F1 — the same process that mistags can rubber-stamp
-        #    its own override). This round: the write always SUCCEEDS —
-        #    called via _cmd_write DIRECTLY (bypassing the door_lock wrapper
-        #    cmd_write()), the no-bypass proof: the check is IN the
-        #    sanctioned entry point, not a wrapper a direct call skips.
+        # 3. Untrusted touch this session -> downgraded, not refused. Called
+        #    via _cmd_write directly to prove the check is not wrapper-only.
         SP.record("SessionStart", {"session_id": "sess-flagged"})
         SP.record("PreToolUse", {"session_id": "sess-flagged",
                                   "tool_name": "WebFetch", "tool_input": {}})
@@ -2220,11 +1695,7 @@ def selftest():
               "wrapper too (enforcement isn't direct-call-only either)",
               p2.exists() and "lineage: contains-untrusted" in p2.read_text())
 
-        # 4. The CLI flag itself is gone, not just unused — invoke the REAL
-        #    CLI (a subprocess, not an in-process call) with
-        #    --provenance-override and confirm argparse itself rejects it.
-        #    Proves the removal at the actual command surface, not just that
-        #    nothing in this module happens to call it anymore.
+        # 4. The real CLI rejects --provenance-override.
         r = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "write",
              "--slug", "zzselftest-b2-cliflag", "--type", "user",
@@ -2236,9 +1707,7 @@ def selftest():
               r.returncode != 0 and "unrecognized arguments" in r.stderr
               and "--provenance-override" in r.stderr)
 
-        # 5. contains-untrusted lineage, explicitly declared: UNTOUCHED by
-        #    this check even in a flagged session — it already pays
-        #    require_enforceable_quarantine() the ordinary way.
+        # 5. Declared contains-untrusted is not stamped with provenance.
         a = base_args(slug="zzselftest-b2-untrusted",
                        lineage="contains-untrusted", session_id="sess-flagged")
         _cmd_write(a)
@@ -2247,8 +1716,7 @@ def selftest():
               "(check is craig-direct-scoped, by design)",
               p.exists() and "provenance:" not in p.read_text())
 
-        # 6. Corrupt provenance log -> unverified (never "clean"), write
-        #    still proceeds (never blocks on an unmeterable/broken check).
+        # 6. Corrupt provenance log -> unverified, write proceeds.
         prov_log.write_text("not valid json at all\n")
         a = base_args(slug="zzselftest-b2-corrupt", session_id="sess-clean")
         _cmd_write(a)
@@ -2257,9 +1725,7 @@ def selftest():
               p.exists() and "provenance: unverified" in p.read_text())
         prov_log.write_text("")
 
-        # 7. Instrument unavailable (simulated import failure) -> degrades
-        #    to unverified; never a silent pass rendered as clean
-        #    (no-data-must-not-render-as-positive-data).
+        # 7. Instrument unavailable -> unverified, never clean.
         real_lookup = globals()["_session_provenance"]
         globals()["_session_provenance"] = lambda: None
         try:
@@ -2274,11 +1740,7 @@ def selftest():
         finally:
             globals()["_session_provenance"] = real_lookup
 
-        # 8. retag: the signed-mesh gate closes the laundering path Grok's
-        #    review found in round 1 (dirty session -> quarantined, wait for
-        #    a later CLEAN session, retag straight to craig-direct with no
-        #    session check catching it — session state is the wrong signal
-        #    for a tool that promotes already-written content).
+        # 8. retag to craig-direct requires a signed promotion.
         a = base_args(slug="zzselftest-b2-retagtarget",
                        lineage="contains-untrusted", session_id="sess-clean")
         _cmd_write(a)
@@ -2316,11 +1778,7 @@ def selftest():
         finally:
             globals()["has_signed_promotion"] = real_hsp
 
-        # 8a-verbal. THE SECOND PROMOTION CLASS (2026-08-12, Craig's ruling:
-        # "there is key signed and verbally signed"). Every promise the new
-        # path makes gets an assertion, including the ones that are
-        # inconvenient — that a verbal promotion is REFUSED when it quotes
-        # nothing, and that it is stamped WEAKER rather than equal.
+        # 8a. Verbal promotion: stamped distinctly; token quotes refused.
         target_file.write_text(set_lineage(target_file.read_text(),
                                            "contains-untrusted"))
         va = argparse.Namespace(
@@ -2335,7 +1793,7 @@ def selftest():
         check("a verbal promotion is STAMPED verbally-signed, so it can never "
               "be mistaken for a key-signed one",
               "promotion: verbally-signed" in after)
-        check("Craig's verbatim words are recorded in the file — the only "
+        check("The owner's verbatim words are recorded in the file — the only "
               "audit trail a signature-less promotion has",
               "verbally signed" in after and after.count("approved:") == 1)
 
@@ -2385,13 +1843,8 @@ def selftest():
         finally:
             globals()["has_signed_promotion"] = real_hsp
 
-        # 8b. B3: has_signed_promotion() itself detects a post-promotion
-        #     content change, not just retag's plumbing around it. Simulate
-        #     a signed event carrying a body_sha256 that does NOT match the
-        #     current file (content changed after signing) by monkeypatching
-        #     mesh_lib.fold_events() through the real function — cheapest
-        #     way to exercise the real comparison logic without needing an
-        #     actual interactive signature.
+        # 8b. has_signed_promotion() detects content changed after signing
+        #     (fake fold with a mismatched body_sha256).
         real_mesh_lib = globals()["_mesh_lib"]
         import types
         fake_signed_stale = {
@@ -2439,10 +1892,7 @@ def selftest():
         finally:
             globals()["_mesh_lib"] = real_mesh_lib
 
-        # 8c. B3's real invariance property, unmocked: content_fingerprint()
-        #     is identical across a lineage change, different across a body
-        #     change — proven directly, not by inference from retag's
-        #     behavior alone.
+        # 8c. content_fingerprint() ignores lineage, tracks the body.
         M_real = real_mesh_lib()
         text_a = ("---\nname: x\ndescription: d\nlineage: craig-direct\n"
                   "metadata:\n  node_type: memory\n  type: user\n---\n\nbody\n")
@@ -2459,11 +1909,7 @@ def selftest():
               M_real.content_fingerprint(text_a) !=
               M_real.content_fingerprint(text_c_diff_body))
 
-        # 8d. The write-path twin (Delta 2): overwriting an ALREADY-promoted
-        #     craig-direct memory with different content, from a CLEAN
-        #     session, auto-demotes instead of silently keeping the trusted
-        #     stamp — closes the door B3's retag-only design would have
-        #     left wide open.
+        # 8d. Overwriting a signed-promoted memory with new content downgrades it.
         promoted_slug = "zzselftest-b3-writepath"
         (shadow_store / f"{promoted_slug}.md").write_text(
             "---\nname: %s\ndescription: d\nlineage: craig-direct\n"
@@ -2502,10 +1948,7 @@ def selftest():
         finally:
             globals()["_mesh_lib"] = real_mesh_lib
 
-        # Same slug, SAME content as what's on disk now (post-revocation) —
-        # a same-content write must NOT trip the check (nothing to protect
-        # once the fake signed event's hash no longer applies here; this
-        # also proves the check doesn't false-positive on a no-op write).
+        # A write with no prior signed promotion is unaffected.
         wa2 = base_args(slug="zzselftest-b2-clean", session_id="sess-clean")
         _cmd_write(wa2)
         check("write-path twin: an ordinary craig-direct write with no "
@@ -2513,10 +1956,7 @@ def selftest():
               "provenance: promotion-revoked" not in
               (shadow_store / "zzselftest-b2-clean.md").read_text())
 
-        # 8e. Bug bash 2026-09-27 #4 (verify-A G4): the slug file was written
-        #     with target.write_text(), which FOLLOWS a symlink -- a link
-        #     planted in the store (`ln -sfn`) sent the door's bytes to a file
-        #     OUTSIDE it. The door must refuse and leave the outside untouched.
+        # 8e. A symlinked store file is refused; its target is untouched.
         outside = tmp / "outside-target.txt"
         outside.write_text("ORIGINAL\n")
         link = shadow_store / "zzselftest-g4-symlink.md"
@@ -2533,15 +1973,8 @@ def selftest():
         check("G4: the link is still a link (not silently replaced)",
               link.is_symlink())
 
-        # 9. correct: a live content claim (like write), so it gets the
-        #    session-taint check, not the signed-mesh one — and since
-        #    correct's charter is "never touch lineage frontmatter" it
-        #    refuses outright rather than downgrading.
-        # Re-seed sess-flagged: test 6 (corrupt-log) truncated prov_log to
-        # empty as part of ITS OWN cleanup, which wiped every session's
-        # recorded rows, sess-flagged included — without this, sess-flagged
-        # would read as unverified here, not flagged, and the refusal below
-        # would pass for the wrong reason (or not exercise the real check).
+        # 9. correct from a flagged session is refused. Re-seed sess-flagged:
+        #    test 6 truncated prov_log.
         SP.record("SessionStart", {"session_id": "sess-flagged"})
         SP.record("PreToolUse", {"session_id": "sess-flagged",
                                   "tool_name": "WebFetch", "tool_input": {}})
@@ -2569,9 +2002,7 @@ def selftest():
               "corrected in a flagged session" in
               (shadow_store / "zzselftest-b2-clean.md").read_text())
 
-        # 10. adopt: an UNTAGGED file (no lineage: key at all) used to
-        #     default silently to craig-direct — closed the same way as
-        #     retag, by requiring a signed promotion before trusting it.
+        # 10. adopt of an untagged file requires a signed promotion.
         import contextlib
         import io
         untagged = shadow_store / "zzselftest-b2-untagged.md"
@@ -2590,12 +2021,7 @@ def selftest():
               "craig-direct without a signed promotion",
               "untagged file, never promoted" in buf.getvalue())
 
-        # (b3) REGRESSION, 2026-08-09: adopt sliced --content to [:1000] while
-        # make_event REFUSES lesson content over INDEX_CONTENT_CHARS (200) —
-        # it never truncates. So every description longer than 200 chars was a
-        # permanent emit failure on this path. cmd_write was fixed on
-        # 2026-08-08; this sibling call site was missed, which is why the check
-        # asserts the BOUND rather than one known-bad length.
+        # adopt bounds --content to INDEX_CONTENT_CHARS.
         long_desc = "L" * 260
         longf = shadow_store / "zzselftest-b2-longdesc.md"
         longf.write_text(
@@ -2613,10 +2039,7 @@ def selftest():
         subprocess.run = lambda cmd, *a, **k: (seen.append(cmd), _FakeProc())[1]
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                # commit=True on purpose: a dry run returns before the emit is
-                # ever built, so commit=False would assert the bound against
-                # an empty command list. subprocess.run is intercepted and
-                # no_git suppresses the commit, so nothing escapes the shadow.
+                # commit=True so the emit is built; subprocess.run is stubbed.
                 _cmd_adopt(argparse.Namespace(
                     slugs=["zzselftest-b2-longdesc"], yes=True, commit=True,
                     reconcile=False, no_git=True, no_push=True))
@@ -2631,17 +2054,14 @@ def selftest():
         check(f"adopt bounds --content to INDEX_CONTENT_CHARS "
               f"({INDEX_CONTENT_CHARS}) so make_event cannot refuse it",
               not over)
-        # The hook has its own, tighter door; assert it too rather than
-        # trusting that one bound implies the other.
+        # The hook has its own bound.
         hooks_over = [c[c.index("--hook") + 1] for c in emits
                       if "--hook" in c
                       and len(c[c.index("--hook") + 1]) > HOOK_MAX_CHARS]
         check(f"adopt bounds --hook to HOOK_MAX_CHARS ({HOOK_MAX_CHARS})",
               not hooks_over)
 
-        # (b4) proc_error must surface the EXCEPTION line of a traceback, not
-        # the header — the clip that turned an actionable refusal into a bare
-        # "skipped" for the operator.
+        # proc_error surfaces a traceback's exception line.
         class _Tb:
             returncode, stdout = 1, ""
             stderr = ('Traceback (most recent call last):\n'
@@ -2696,7 +2116,7 @@ def main():
     r.add_argument("slugs", nargs="+")
     r.add_argument("--lineage", required=True, help=" | ".join(sorted(LINEAGES)))
     r.add_argument("--operator-approved", metavar="WORDS",
-                   help="promote to craig-direct on Craig's VERBAL approval "
+                   help="promote to craig-direct on the owner's VERBAL approval "
                         "instead of a signed mesh event (2026-08-12). Value must "
                         "be his verbatim words; they are recorded in the file. "
                         "Weaker than a signature and stamped as such.")
@@ -2737,7 +2157,7 @@ def main():
                         "memory-write guard, so until 2026-08-01 there was no "
                         "sanctioned path back and the door was one-way in "
                         "practice. Still a residency delta: the fold stages "
-                        "it and Craig promotes.")
+                        "it and the owner promotes.")
     d.add_argument("--commit", action="store_true",
                    help="apply (default is dry-run). Also git-commits + pushes.")
     d.add_argument("--no-git", action="store_true")
@@ -2793,32 +2213,17 @@ def main():
     w.add_argument("--how")
     w.add_argument("--hook", required=True, help="short MEMORY.md index hook text")
     w.add_argument("--section", help="MEMORY.md section header to file under (default: Unsorted)")
-    # SPEC v4. Deliberately NOT defaulted: residency is Craig's declaration at
-    # the /improve gate, and a default would quietly re-invent the derived
-    # residency this design exists to replace. Undeclared renders exactly as
-    # v3 did, so omitting it is safe during migration.
+    # No default: residency is an explicit declaration; undeclared is safe.
     w.add_argument("--residency", choices=["doctrine", "state", "pinned"],
-                   help="SPEC v4 tier (Craig declares it). doctrine/pinned "
+                   help="SPEC v4 tier (the owner declares it). doctrine/pinned "
                         "need an operator signature to hold across the mesh.")
     w.add_argument("--expires", metavar="YYYY-MM-DD",
                    help="state rows only: render-hide after this date")
     w.add_argument("--supersedes")
     w.add_argument("--contradicts")
     w.add_argument("--session-id")
-    # B2 quick-fix (2026-08-06, Grok-reviewed): --provenance-override REMOVED.
-    # Round 1 shipped it as an audited escape hatch; Grok's adversarial review
-    # (memory-mesh/reviews/2026-08-06-grok-b2-provenance-review.md, finding
-    # F1) called it correctly: a flag the SAME agent that mistagged the write
-    # can also pass is not a control, it's a soft gate. "Recorded in git" is
-    # not a check against the process making the commit. There is no
-    # replacement flag — see _cmd_write: a flagged session now downgrades the
-    # write to contains-untrusted instead of refusing it, so there is nothing
-    # to override.
-    # NAMING TRAP, kept deliberately: --commit has always meant "actually write
-    # the file, as opposed to dry-run" — it never meant "git commit". That read
-    # the obvious wrong way and cost 10 days / 64 uncommitted memories. The flag
-    # keeps its name (every skill doc and habit uses it) but now does BOTH, which
-    # is what everyone already believed it did.
+    # There is intentionally no --provenance-override (selftest asserts this).
+    # --commit both writes the files and git-commits them.
     w.add_argument("--commit", action="store_true",
                    help="apply the write (default is dry-run/preview). Also git-commits "
                         "+ pushes the touched files unless --no-git/--no-push.")

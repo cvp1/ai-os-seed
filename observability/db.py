@@ -14,10 +14,8 @@ _SCHEMA = _HERE / "schema.sql"
 
 
 def db_path() -> Path:
-    """Resolve the store path. DEFAULT_DB is always absolute; a CC_OBS_DB
-    override MUST be absolute too — a relative value opens (and creates) a stray
-    DB at the caller's cwd (Story 026: a relative CC_OBS_DB in an interactive/test
-    session dropped a 0-byte runs.db at the repo root). Fail loud instead."""
+    """Resolve the store path; a CC_OBS_DB override must be absolute (a relative
+    one would create a stray DB in the caller's cwd)."""
     override = os.environ.get("CC_OBS_DB")
     if override is None:
         return DEFAULT_DB
@@ -31,10 +29,8 @@ def db_path() -> Path:
 def connect() -> sqlite3.Connection:
     """Open the DB for read/write, creating the file + schema on first use.
 
-    When CC_OBS_READONLY is set (used by the status-site container, which mounts
-    the repo :ro), open immutably instead: no schema creation, no locks, no
-    journal files — so it works on a read-only filesystem. The DB must already
-    exist in that mode.
+    With CC_OBS_READONLY set, open immutably (no schema, locks or journal) so it
+    works on a read-only mount; the DB must already exist.
     """
     path = db_path()
     if os.environ.get("CC_OBS_READONLY"):
@@ -45,16 +41,14 @@ def connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000;")  # tolerate the 5-min push job overlap
+    conn.execute("PRAGMA busy_timeout = 30000;")  # tolerate concurrent writers
     conn.executescript(_SCHEMA.read_text())
     _migrate(conn)
     return conn
 
 
-# Additive column migrations: CREATE TABLE IF NOT EXISTS never alters an existing
-# table, so columns added after a DB was first created must be back-filled with
-# ALTER TABLE here. SQLite has no ADD COLUMN IF NOT EXISTS, so guard on the live
-# schema. Each entry is (column, DDL-type); all are nullable (old rows stay NULL).
+# Columns added after the original schema, back-filled via ALTER TABLE on older
+# DBs. Each entry is (column, DDL-type); all nullable.
 _ADDED_COLUMNS = [
     ("cache_read_tokens", "INTEGER"),
     ("cache_creation_tokens", "INTEGER"),

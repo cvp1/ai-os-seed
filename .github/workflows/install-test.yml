@@ -1,26 +1,10 @@
 name: install test
 
-# Runs AGENT-INSTALL.md's DETERMINISTIC phases (install.py + the shipped
-# scripts it drives) directly, on a throwaway runner — no secrets, no network
-# calls beyond checkout, nothing that touches an operator's real machine.
-# This is NOT an agent reading AGENT-INSTALL.md and deciding what to run: it
-# exercises install.py's substrate guarantees (fresh/--into/collision/
-# uninstall) plus, as of Wave 2H (SEED-068/069/070), the receipt/approve/
-# audit chain for real — a live memory-mesh/install.sh run, a real
-# --approve claude-md write, --audit against this checkout, and negative
-# fixtures proving each check actually detects the tamper it claims to (not
-# just clean-path smoke tests, which prove nothing about detection). As of
-# the 2026-08-09 wave2g2 review's own CI-gap finding (Grok+GPT), it also
-# exercises: skill registration at .claude/skills/ (SEED-071), the
-# --apply-proposal/--revert-proposal happy and refusal paths including the
-# exact tampered-archive bug the review found (SEED-072), and a regression
-# test reproducing the symlinked-scheduler-directory TOCTOU attack the same
-# review flagged — proven to succeed against the pre-fix code and refused
-# by the fix. It still does NOT exercise the primary path's real trust
-# boundary (an agent obeying "show every mutating command," "stop means
-# stop," and choosing to stage+approve rather than write directly). The
-# README's honest ledger states that gap plainly — read it before treating
-# a green badge as agent-obedience coverage.
+# Runs AGENT-INSTALL.md's deterministic phases (install.py and the scripts it
+# drives) on a throwaway runner: no secrets, no network beyond checkout.
+# Covers fresh/--into/collision/uninstall, the receipt/approve/audit chain,
+# skill registration, proposal apply/revert, and negative tamper fixtures.
+# It does NOT test agent obedience (showing commands, honouring stop).
 on:
   push:
     branches: [main]
@@ -38,11 +22,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: dependencies an operator would install per the README
-        # Homebrew Python on modern macOS refuses a bare `pip install`
-        # (PEP 668, externally-managed-environment) — caught live by this
-        # CI job; --break-system-packages is appropriate on an ephemeral
-        # runner. AGENT-INSTALL.md's readiness guidance carries the real
-        # fix (a venv) for an operator's own machine.
+                # Homebrew Python refuses a bare pip install (PEP 668); fine on an ephemeral runner.
         run: python3 -m pip install --break-system-packages pyyaml || python3 -m pip install --user pyyaml
 
       - name: readiness (Phase 0)
@@ -87,11 +67,7 @@ jobs:
           "
 
       - name: findings file appears on a real fault and is REMOVED when clean (SEED-074)
-        # Both directions on purpose. A test that only proves the file appears
-        # is half the mechanism: write-on-problem without delete-on-clean
-        # leaves a repaired fault sitting there as a permanent false alarm.
-        # The fault is INJECTED (a backdated run), not hoped for -- a green
-        # run against a fixture with no fault proves nothing about detection.
+                # Both directions: the file must appear on an injected fault and vanish when clean.
         env:
           CC_OBS_DB: ${{ runner.temp }}/aios-target/observability/data/runs.db
           CC_HYGIENE_ROOT: ${{ runner.temp }}/aios-target
@@ -121,17 +97,14 @@ jobs:
           sys.path.insert(0, '$ROOT/observability')
           import freshness as f
           from datetime import datetime, timezone
-          # Drive the delete path directly: this runner's scheduler state makes
-          # a naturally-clean end-to-end run unreliable, but the contract under
-          # test -- no findings means REMOVE the file -- is exactly this call.
+                    # Drive the delete path directly; a naturally clean run is unreliable on CI.
           f.write_findings([], datetime.now(timezone.utc))
           "
           test ! -f "$FIND" || { echo "FAIL: findings file survived a clean run"; cat "$FIND"; exit 1; }
           echo "reverse direction OK: file removed when clean"
 
       - name: findings file is bounded, and says so when it truncates (SEED-074)
-        # A bound that only caps a SECTION is not a bound. Measure the fully
-        # composed artifact in the consumer's units and re-read what landed.
+                # Measure the fully composed file, not one section.
         run: |
           ROOT="${{ runner.temp }}/aios-target"
           python3 -c "
@@ -151,10 +124,7 @@ jobs:
           "
 
       - name: skills are registered at .claude/skills/ (SEED-071)
-        # SEED-071: shipping skills/<name>/SKILL.md is not enough — Claude
-        # Code only discovers skills under .claude/skills/ (or ~/.claude/
-        # skills/). install.py symlinks each shipped skill in at install
-        # time; this was live-tested by hand but never asserted in CI.
+                # Claude Code only discovers skills under .claude/skills/; install.py symlinks them in.
         run: |
           ROOT="${{ runner.temp }}/skills-target"
           python3 install.py --target "$ROOT"
@@ -256,11 +226,7 @@ jobs:
             (echo "a refused stale proposal still wrote after_content"; exit 1)
           python3 -c "
           p = '$ROOT/scheduler/manifest.yml'
-          # Read BEFORE opening for write: the previous one-liner opened for
-          # 'w' first (truncating) and then read the now-empty file, so every
-          # later sub-fixture ran against an EMPTY manifest. Unnoticed until
-          # SEED-077's validity check refused to write a manifest with no
-          # jobs: key (2026-09-02) -- the guard caught the fixture's own bug.
+                    # Read before opening for write, or the truncation empties the manifest.
           text = open(p).read().replace('# drift\n', '')
           open(p, 'w').write(text)
           "
@@ -317,9 +283,7 @@ jobs:
           if python3 install.py --target "$ROOT" --revert-proposal driftrevert; then
             echo "expected revert to refuse over a post-apply edit"; exit 1; fi
 
-          # tampered archive: the exact bug the 2026-08-09 wave2g2 review found —
-          # revert_proposal trusted the archived before_content without
-          # re-hashing it against what apply recorded at apply time
+                    # tampered archive: revert must re-hash the archived before_content
           python3 <<PYEOF
           import hashlib, json, pathlib
           root = pathlib.Path("$ROOT")
@@ -344,14 +308,8 @@ jobs:
             echo "expected revert to refuse a tampered archive (SEC REGRESSION)"; exit 1; fi
 
       - name: apply-proposal / revert-proposal refuse a symlinked scheduler/ (TOCTOU hardening, wave2g2 review 2026-08-09)
-        # GPT+Gemini independently: the hash-check and the write weren't a
-        # single locked operation resolved via descriptor-relative opens, so
-        # a symlinked scheduler/ directory could redirect the read/write
-        # outside --target. Reproduced against the pre-fix code as part of
-        # this fix (see cc-seed/BACKLOG.md SEED-073 2026-08-09 entry): the
-        # old code actually overwrote the victim file. This regression-locks
-        # the fix — an out-of-target victim file must survive both attempts
-        # untouched.
+                # A symlinked scheduler/ must not redirect the read/write outside --target;
+        # the out-of-target victim file must survive both attempts untouched.
         run: |
           ROOT="${{ runner.temp }}/proposal-toctou-target"
           VICTIM="${{ runner.temp }}/toctou-victim"
@@ -408,11 +366,8 @@ jobs:
             (echo "SECURITY REGRESSION: revert-proposal wrote through the symlinked scheduler/"; exit 1)
 
       - name: widened allowlist, validity checks, batch, and confirm-bound single apply (SEED-077)
-        # Every branch is asserted in BOTH directions: what must be written
-        # and what must NOT be. The settings.json target is the one whose
-        # whole point is a refusal (no token -> diff shown, nothing written),
-        # so a green run that only checked the happy path would prove
-        # nothing about the guard.
+                # Every branch asserts both what must and must not be written; settings.json
+        # is the refusal case (no token -> diff shown, nothing written).
         run: |
           ROOT="${{ runner.temp }}/proposal-077-target"
           python3 install.py --target "$ROOT"
@@ -494,9 +449,8 @@ jobs:
       - name: compose into an existing workspace (--into), user content untouched
         run: |
           WS="${{ runner.temp }}/existing-workspace"
-          # model an AI-OS-Core-shaped workspace: user files, a live memory/,
-          # AND a pre-existing recipient-owned skill (SEED-071 x --into: skill
-          # registration must not collide with or disturb it)
+                    # model an existing workspace: user files, a live memory/, and a
+          # recipient-owned skill that registration must not disturb
           mkdir -p "$WS/my-project" "$WS/memory" "$WS/.claude/skills/mine"
           echo "user content" > "$WS/CLAUDE.md.mine"
           echo "user note" > "$WS/my-project/notes.txt"
@@ -510,11 +464,7 @@ jobs:
           # existing memory/ must SATISFY, not collide (the AI-OS Core case)
           python3 install.py --target "$WS" --into
           python3 "$WS/_lib/selftest.py"
-          # Two lines, not `test A && test B`: the first term of an && list is
-          # exempt from errexit, so a MISSING CLAUDE.md.mine returned 1 in a
-          # position bash forgives and the next command ran green
-          # (2026-09-19 review, finding 10, executed as
-          # compose_preservation_guard_masked).
+                    # Separate lines: the first term of an && list is exempt from errexit.
           test -f "$WS/CLAUDE.md.mine"
           test -f "$WS/my-project/notes.txt"
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
@@ -527,41 +477,21 @@ jobs:
           # collision refusal: a second --into must refuse, not merge
           if python3 install.py --target "$WS" --into; then
             echo "second --into should refuse"; exit 1; fi
-          # pre-existing content silently modified, no gated-write record ->
-          # check 1 FLAGS it (Wave 2H: the baseline captured before Phase 2
-          # wrote anything catches this even though the path was never
-          # shipped by the package)
+                    # pre-existing content modified without a gated-write record -> check 1 FLAGS it
           echo "tampered without approval" > "$WS/my-project/notes.txt"
-          # captured, not piped straight into grep -q: under pipefail (GH
-          # Actions' default), an EARLY match in a longer stream lets grep
-          # exit before install.py finishes writing, SIGPIPE-ing it into a
-          # nonzero exit that fails the pipeline even though grep DID match
-          # (reproduced live 2026-08-09 fixing this same CI gap) — capture
-          # first so grep's read never races install.py's write.
+                    # Capture first: piping into grep -q can SIGPIPE install.py under pipefail.
           OUT="$(python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" || true)"
           echo "$OUT" | grep -q "\[FLAGGED\] check 1:" || \
             (echo "expected check 1 to flag a tampered pre-existing file; got:"; echo "$OUT"; exit 1)
           echo "user note" > "$WS/my-project/notes.txt"
-          # SEED-070 ships repo_hygiene as scheduled-by-default, so a
-          # freshly --into'd manifest drifts from the not-yet-synced real
-          # cron/launchd state (check 2) until sync.sh actually reconciles
-          # it — the same step "enable + install the demo job" below does
-          # for --target installs. Found alongside the check-1 fix above
-          # while making this step's RESULT:PASS assertion true for the
-          # first time (never previously exercised: this workflow only
-          # runs in the PUBLISHED ai-os-seed repo's CI, and Wave 2G-2 was
-          # never published this session).
+                    # repo_hygiene is scheduled by default, so sync before check 2 can pass.
           bash "$WS/scheduler/sync.sh"
           OUT="$(python3 install.py --target "$WS" --audit --package "$GITHUB_WORKSPACE" || true)"
           echo "$OUT" | grep -q "RESULT: PASS" || \
             (echo "expected a clean audit once the tamper is reverted; got:"; echo "$OUT"; exit 1)
           # surgical uninstall: seed components go, user content AND memory stay
           python3 install.py --target "$WS" --uninstall
-          # Two lines, not `test A && test B`: the first term of an && list is
-          # exempt from errexit, so a MISSING CLAUDE.md.mine returned 1 in a
-          # position bash forgives and the next command ran green
-          # (2026-09-19 review, finding 10, executed as
-          # compose_preservation_guard_masked).
+                    # Separate lines: the first term of an && list is exempt from errexit.
           test -f "$WS/CLAUDE.md.mine"
           test -f "$WS/my-project/notes.txt"
           grep -q "the user's live memory index" "$WS/memory/MEMORY.md"
@@ -604,21 +534,13 @@ jobs:
           if [ -d "$ROOT" ]; then echo "uninstall left the tree behind"; exit 1; fi
 
       - name: install-audit — clean chain (Wave 2H, SEED-068/069)
-        # Never invoked before this wave: a real memory-mesh/install.sh run,
-        # a real --approve claude-md write, and --audit against this
-        # checkout as --package. Green here means the receipt/approve/audit
-        # chain works end to end, not just the deterministic substrate.
+                # A real memory-mesh install, --approve claude-md write, and --audit against
+        # this checkout: the receipt/approve/audit chain end to end.
         run: |
           ROOT="${{ runner.temp }}/aios-audit-target"
           PKG="$GITHUB_WORKSPACE"
           python3 install.py --target "$ROOT"
-          # SEED-070 ships repo_hygiene scheduled-by-default in the
-          # manifest, but a plain install doesn't sync it to real
-          # cron/launchd — sync first so check 2 has something to find, same
-          # as "enable + install the demo job" does for --target installs.
-          # Found the same day as this CI-coverage pass: this call was
-          # previously unreachable-in-practice (this workflow has never run
-          # in the published ai-os-seed repo's real CI).
+                    # repo_hygiene is scheduled by default; sync so check 2 has something to find.
           bash "$ROOT/scheduler/sync.sh"
           python3 install.py --target "$ROOT" --audit --package "$PKG"
 
@@ -633,12 +555,8 @@ jobs:
           python3 install.py --target "$ROOT" --audit --package "$PKG" --json | python3 -c "import json,sys; r=json.load(sys.stdin); assert r['result']=='PASS', r"
 
       - name: install-audit — empty pre-existing CLAUDE.md must not false-flag (F5 fix, 2026-08-06 Gemini review)
-        # A 0-byte pre-existing CLAUDE.md still gets a baseline entry (hash
-        # of b""), but _approve_claude_md never prepends the "\n\n"
-        # separator to nothing — before check 3's fix, a byte-perfect
-        # --into install over an empty CLAUDE.md incorrectly FLAGGED
-        # "content outside the region does not match the pre-install
-        # baseline".
+                # A 0-byte pre-existing CLAUDE.md gets no separator prepended on approve, so a
+        # byte-perfect --into install over it must audit clean.
         run: |
           WS="${{ runner.temp }}/f5-empty-claude-md"
           PKG="$GITHUB_WORKSPACE"
@@ -674,12 +592,7 @@ jobs:
           python3 install.py --target "$ROOT"
           bash "$ROOT/scheduler/sync.sh"  # SEED-070's default-scheduled repo_hygiene needs syncing before check 2 can PASS
 
-          # F6 fix (2026-08-06 Gemini review): assert_flagged used to check
-          # only the check ID, so a check FLAGGED for the WRONG reason (e.g.
-          # a false-positive on an unrelated fixture) still passed CI. An
-          # optional third arg now requires that specific reason text appear
-          # in the flag's own detail line, not just any FLAGGED under the
-          # right ID.
+                    # assert_flagged CHECK [REASON]: REASON must appear in that check's own flag.
           assert_flagged() {
             CHECK="$1"
             REASON="${2:-}"
@@ -687,13 +600,7 @@ jobs:
             echo "$OUT" | grep -q "\[FLAGGED\] check $CHECK:" || \
               (echo "expected check $CHECK to be FLAGGED; got:"; echo "$OUT"; exit 1)
             if [ -n "$REASON" ]; then
-              # SCOPED to this check's own block. The reason grep used to run
-              # over the WHOLE report, so check 1 flagged for an unrelated
-              # reason plus check 2 containing the expected text satisfied
-              # `assert_flagged 1 "content differs"` (2026-09-19 review,
-              # finding 16, executed as reason_from_wrong_check). The comment
-              # claiming the 2026-08-06 fix covered this described behaviour
-              # the implementation did not have.
+                            # Scoped to this check's own block, not the whole report.
               BLOCK="$(echo "$OUT" | awk -v c="$CHECK" '
                 $0 ~ ("^\\[ *[A-Z]+\\] check " c ":") { on=1; print; next }
                 /^\[ *[A-Z]+\] check / { on=0 }
@@ -750,33 +657,24 @@ jobs:
           python3 -c "t = open('$ROOT/CLAUDE.md').read().replace('original approved content', 'original approved content\ninjected'); open('$ROOT/CLAUDE.md', 'w').write(t)"
           assert_flagged 3 "does not match the approved hash"
 
-          # 2. scheduler/sync.py edited directly -> check 2 refuses to execute
-          # it rather than running unverified code as part of a read-only
-          # audit (Wave 2H-2, F2 fix — the flag message itself, not just a
-          # nonzero exit, must prove this was a refusal, not an executed-and-
-          # then-diffed drift report)
+                    # 2. scheduler/sync.py edited directly -> check 2 refuses to execute it
           cp "$ROOT/scheduler/sync.py" "${{ runner.temp }}/sync.py.orig"
           echo "# tampered" >> "$ROOT/scheduler/sync.py"
           assert_flagged 2 "refusing to execute"
           cp "${{ runner.temp }}/sync.py.orig" "$ROOT/scheduler/sync.py"
           assert_passed 2
 
-          # 7. receipt.json edited directly on disk (bypassing install.py,
-          # e.g. an agent forging its own baseline entry) -> check 7 (Wave
-          # 2H-2, F1 fix). The out-of-target anchor a same-uid --target-
-          # scoped agent can't also write is what catches this.
+                    # 7. receipt.json edited directly on disk -> check 7 (caught by the
+          # out-of-target anchor)
           cp "$ROOT/.cc-seed/receipt.json" "${{ runner.temp }}/receipt.json.orig"
           python3 -c "import json; p='$ROOT/.cc-seed/receipt.json'; r=json.load(open(p)); r['baseline']['forged-by-agent.txt']={'type':'file','mode':'0o644','size':0,'hash':'sha256:'+'0'*64}; json.dump(r, open(p,'w'), indent=2, sort_keys=True)"
           assert_flagged 7 "edited directly rather than through install.py"
           cp "${{ runner.temp }}/receipt.json.orig" "$ROOT/.cc-seed/receipt.json"
           assert_passed 7
 
-      # --- SEED-080: the memory contract, and the origin rule ---------------
-      # What CI can prove without a harness, a network or a secret: the door,
-      # the store, the fold's projection and the mesh's own breakage report.
-      # M1's harness turn, M4's delivery and M5's citation need a real agent
-      # CLI, so they are SKIPped BY NAME here and proven by the daily drill on
-      # a host that has one. A SKIP is an unmet proof obligation, never a pass.
+            # --- the memory contract, and the origin rule ----------------------------
+      # Harness-dependent properties (M1, M4 delivery, M5) SKIP by name here;
+      # a SKIP is an unmet obligation, never a pass.
       - name: memory contract (script half) + the hook approval round trip
         shell: bash
         run: |
@@ -785,9 +683,7 @@ jobs:
           rm -rf "$ROOT"
           python3 install.py --target "$ROOT"
 
-          # The hooks are wired by the SAME --approve shape a human uses; CI
-          # never gets a --yes flag of its own, because a flag meaning "skip
-          # the human" is one typo from being passed by one.
+                    # Hooks are wired by the same --approve a human uses; CI has no --yes flag.
           CI=true python3 install.py --target "$ROOT" --approve memory-hooks --apply
           grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json"
 
@@ -795,7 +691,7 @@ jobs:
           # SKIP by name, and the run must still be green on the rest.
           OUT="$(python3 "$ROOT/memory-mesh/contract_test.py" --json "${{ runner.temp }}/contract.json" 2>&1 || true)"
           echo "$OUT"
-          # Anchored: "10 fail" contains "0 fail" (2026-09-19 review).
+                    # Anchored: "10 fail" contains "0 fail".
           echo "$OUT" | grep -qE '(^|[^0-9])0 fail' || (echo "contract has failures"; exit 1)
           python3 - "${{ runner.temp }}/contract.json" <<'PY'
           import json, sys
@@ -811,26 +707,13 @@ jobs:
 
           # --revoke puts settings.json back exactly, and the contract notices.
           #
-          # Both guards below are `if`, not `cmd && (...; exit 1) || true`.
-          # That older shape CANNOT FAIL: the parse is `(A && B) || true`, so
-          # the subshell's exit 1 is swallowed by the trailing `|| true` and
-          # the step goes green having printed its own alarm. Measured
-          # 2026-09-18 — `true && (echo X; exit 1) || true` exits 0. Two
-          # negative controls sat decorative here, which is the failure mode
-          # the contract exists to catch, one level up.
+                    # Guards use `if`: `cmd && (...; exit 1) || true` can never fail.
           CI=true python3 install.py --target "$ROOT" --revoke memory-hooks --apply
           if grep -q "memory-mesh/retrieve.py" "$ROOT/.claude/settings.json"; then
             echo "revoke left the hook entries behind"; exit 1
           fi
-          # M4-WIRING, not M4. `--only M4` also runs M4-serve, which fails
-          # here for an unrelated reason (no manifest, because M1/M3 were
-          # never seeded in this invocation) — so the negative control went
-          # green while measuring nothing about wiring at all (2026-09-19
-          # review, finding 11, executed as
-          # revoke_negative_control_without_revoke: M4-wiring PASSED and the
-          # command still exited 1). The full contract above already proved
-          # M4-wiring GREEN with the hooks in place; this is the same
-          # property after the revoke, and it must now fail.
+                    # Check M4-wiring specifically (M4-serve fails here for unrelated reasons);
+          # it passed above and must now fail after the revoke.
           if python3 "$ROOT/memory-mesh/contract_test.py" --only M4 2>&1 | \
                grep -q "ok: M4-wiring"; then
             echo "M4-wiring still passes after --revoke — the contract is not measuring delivery"
@@ -849,8 +732,7 @@ jobs:
           cp skills/improve/SKILL.md "$HOME/.claude/skills/improve/SKILL.md"
           OUT="$(python3 install.py --target "$ROOT")"
           echo "$OUT" | grep -q "deferring to it" || (echo "$OUT"; exit 1)
-          # -e follows the link, so a DANGLING symlink satisfies `! -e` while
-          # very much existing (2026-09-19 review). -L catches it.
+                    # -e misses a dangling symlink; -L catches it.
           test ! -e "$ROOT/.claude/skills/improve/SKILL.md"
           test ! -L "$ROOT/.claude/skills/improve/SKILL.md"
           python3 -c "
@@ -861,12 +743,8 @@ jobs:
 
           # The deferral is re-checked at audit time: edit the twin, audit reds.
           echo "changed after the deferral" >> "$HOME/.claude/skills/improve/SKILL.md"
-          # Captured, not piped: the audit is EXPECTED to exit 1 here, and
-          # under `set -o pipefail` that nonzero killed the step even when
-          # detection worked perfectly (2026-09-19 review, finding 12,
-          # executed as origin_pipeline_false_failure, shell_rc=1). And the
-          # exit code IS part of the property — a changed twin must make the
-          # audit red, not merely make it talk.
+                    # Captured, not piped: the audit is expected to exit 1 under pipefail, and
+          # the exit code is part of the property.
           set +e
           AUDIT_OUT="$(python3 install.py --target "$ROOT" --audit --package . 2>&1)"
           AUDIT_RC=$?

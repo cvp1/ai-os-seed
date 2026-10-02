@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""memory-mesh producer — append one event to THIS host's log, commit, nudge.
+"""memory-mesh producer: append one event to this host's log, commit, nudge peers.
 
-    emit.py --kind correct --subject ssh-route/{{REDACTED}} --polarity exists \
-            --content "ssh st21 verified live" --home "FLEET.md#reachability" \
+    emit.py --kind correct --subject ssh-route/HOST --polarity exists \
+            --content "..." --home "FLEET.md#reachability" \
             --session $SESH [--sync] [--pin] [--supersedes ID] ...
 
-Local append + local commit: succeeds through any partition (acks=1).
---sync: block until ≥1 peer has fetched this event id — opt-in acks=all for
-operator corrections (SPEC Kafka-gap row 1). Nudge is garnish, never
-load-bearing.
+Local append + commit succeeds through any partition; --sync blocks until a peer has the event.
 """
 import argparse
 import json
@@ -79,12 +76,6 @@ def main():
                          "(one home per fact).")
     args = ap.parse_args()
 
-    # The fact-shape gate used to sit here, over `--content` only, exempted by
-    # `--home`. It never looked at `--body`, which is where the 2026-09-13
-    # fact-copy actually was. It now lives in mesh_lib.make_event — the funnel
-    # every producer passes through — over content, hook AND body, with no
-    # home exemption. See mesh_lib.FACT_SHAPES.
-
     body = args.body
     if args.body_file:
         if body:
@@ -92,36 +83,17 @@ def main():
         body = Path(args.body_file).read_text(encoding="utf-8")
     hook = args.hook
     if hook is not None and len(hook) > M.HOOK_MAX_CHARS:
-        # Refuse, never truncate (SPEC v4 A4). A machine-shortened hook is a
-        # rule with its qualifier cut off, and this one is the line the agent
-        # actually reads every session — degrading it silently is how a bounded
-        # rule becomes a wrong rule.
+        # Refuse rather than truncate: a cut hook can lose its qualifier.
         sys.exit(f"emit: --hook is {len(hook)} chars, over the "
                  f"{M.HOOK_MAX_CHARS} limit — rewrite it shorter; it is the "
                  "line every session reads")
-    # Audience confidentiality under body-in-event (SPEC v4 A2): bodies ride
-    # the fleet git transport, so only fleet-visible audiences may carry one.
-    # family/host-private memories emit hook-only and keep the body local —
-    # render-time filtering is not confidentiality.
+    # Bodies replicate to every peer, so only fleet-visible audiences may carry one.
     if body is not None and args.audience not in M.BODY_AUDIENCES:
         sys.exit(f"emit: audience {args.audience!r} may not carry a body — "
                  "bodies replicate to every peer host. Emit hook-only and "
                  "keep the body in the local store.")
-    # SPEC v4: close the ghost hole. A lesson event with NO body and NO store
-    # file behind it renders an always-on index row that /recall cannot serve —
-    # measured 2026-07-31: 11 such rows, 2,825 B, invisible to an exact-title
-    # query. The ghosts came from agents invoking this producer directly, so the
-    # gate belongs here rather than in any one caller.
-    #
-    # This cannot cause amnesia: BOTH escapes keep the lesson. Carry --body (the
-    # event is then self-sufficient and the fold projects the file), or write
-    # through memory_write, which creates the file and emits in one locked step.
-    #
-    # Resolved through harness_store(), which carries the SANDBOX GUARD: a
-    # drill or replay pointed at a throwaway event log gets None and the gate
-    # stands down. Hardcoding the operator's store path here would have made
-    # every sandbox consult — and be judged against — the real brain, which is
-    # the same class of bug that guard was written for.
+    # Refuse a lesson with no body and no store file (an index row recall cannot
+    # serve). harness_store() returns None in a sandbox, which disables the gate.
     ghost = M.ghost_refusal_reason(args.kind, args.subject, body,
                                    M.harness_store())
     if ghost:
@@ -139,11 +111,8 @@ def main():
             return 0
         supersedes = sorted(set(ids) | set(supersedes or []))
     elif args.kind == "lesson" and not supersedes:
-        # Lessons chain EXPLICITLY (invariant 4 — resolution is never
-        # temporal): a lesson re-emit on a subject supersedes every live
-        # predecessor it can see. Two hosts revising blind to each other
-        # therefore leave two live lessons — which the fold PARKS, making the
-        # race visible instead of letting a clock decide who wins.
+        # A lesson re-emit supersedes every live predecessor it can see;
+        # concurrent revisions on two hosts stay live and the fold parks them.
         supersedes = M.unsuperseded_ids(args.subject) or None
 
     reg = M.load_registry()
@@ -160,25 +129,15 @@ def main():
         hook=hook, body=body, expires=args.expires,
         carry_forward=args.carry_forward, pointer=args.pointer)
 
-    # Everything above is validation — make_event raises on a refused admission,
-    # a bad schema or an oversized event, so reaching here means this event WOULD
-    # be accepted. That is the whole answer a diagnosis needs, and it is now
-    # available without a write. Placed before repo_lock so a dry run takes no
-    # lock and cannot block a concurrent writer.
+    # make_event has validated; a dry run stops here, before taking the lock.
     if args.dry_run:
         print(json.dumps(ev, ensure_ascii=False, indent=1))
         print(f"dry-run: VALID — {len(line.encode())} B, would append to "
               f"{M.HOST}.ndjson as {ev['id']}. Nothing written.", file=sys.stderr)
         return 0
 
-    # One write() of one line — a torn append is a torn LINE, which the fold
-    # holds out as unparseable rather than corrupting neighbors (drill 3).
-    # append_event_line also heals a pre-existing torn tail (drill 7).
-    # Lock the WHOLE append+add+commit, not each git call: several agents in
-    # one shell on one host are several writers to this single-writer log, and
-    # a commit that loses index.lock leaves its event uncommitted — invisible
-    # to the fold, which reads committed state only. Measured 2/5 failures at
-    # 5-way concurrency before this lock (2026-07-28).
+    # Lock append+add+commit together: concurrent local writers would otherwise
+    # race on index.lock and leave events uncommitted (the fold reads commits only).
     with M.repo_lock():
         log = M.append_event_line(line)
         M.git("add", str(log.relative_to(M.MESH_ROOT)))
@@ -193,9 +152,7 @@ def main():
                 capture_output=True, timeout=10)
 
     if args.sync:
-        # acks=all, opt-in: a peer's fold fetches us; we then see OUR event
-        # replicated by fetching THEIR last-seen state marker. Simplest
-        # honest check at 3 nodes: ask each peer for the id over ssh.
+        # Poll each peer over ssh until one has the event id.
         deadline = time.time() + 60
         confirmed = None
         while time.time() < deadline and not confirmed:

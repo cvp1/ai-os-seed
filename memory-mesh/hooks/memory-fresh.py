@@ -1,19 +1,8 @@
 #!/usr/bin/env python3
-"""PreToolUse staleness guard for memory-mesh views.
+"""PreToolUse hook: kick a detached fold when the mesh views are stale.
 
-INSTALLED ONLY BY THE OPERATOR (finish-mesh.sh) — hook installation is gated
-self-modification by standing doctrine; this file living in the repo is the
-proposal, Craig running the installer is the signature.
-
-Closes the mid-session window: a running session acts on views loaded at
-start; a correction can land elsewhere mid-session. This keeps the local
-materialized views fresh so read-at-point-of-use reads fresh state.
-
-HARD RULES for living on the every-tool-call path:
-  · fail OPEN, always exit 0 — memory freshness must never block work
-  · never print — stdout would inject noise into every tool call
-  · microseconds on the happy path (two stats); the kick is detached
-  · throttled — at most one fold kick per 120s no matter how stale
+Installed by the operator via finish-mesh.sh. Always exits 0, never prints,
+and kicks at most once per KICK_EVERY_S.
 """
 import os
 import subprocess

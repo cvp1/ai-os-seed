@@ -5,12 +5,8 @@
 set -euo pipefail
 KEY="$HOME/.key"
 
-# The {{REDACTED}} gateway auto-starts at boot while the vault is still locked, so it
-# comes up without HASS_TOKEN/TELEGRAM_BOT_TOKEN (now vault-only, see
-# /etc/systemd/system/{{REDACTED}}-gateway.service.d/vault-secrets.conf). Restart it
-# now that ~/.key/{{REDACTED}}.env is readable so HA + Telegram re-activate. Needs sudo.
-# Only on the real-unlock path: it costs a sudo prompt and a gateway blip, and
-# once the vault is open a fresh gateway already reads its secrets.
+# Restart {{REDACTED}}-gateway so it picks up its secrets from the now-readable vault.
+# Needs sudo; only run on a real unlock.
 restart_{{REDACTED}}_gateway() {
   if systemctl list-unit-files {{REDACTED}}-gateway.service >/dev/null 2>&1; then
     echo "Restarting {{REDACTED}}-gateway to load its vault secrets..."
@@ -22,18 +18,9 @@ restart_{{REDACTED}}_gateway() {
   fi
 }
 
-# Containers that bind-mount files out of ~/.key cannot start while the vault is
-# locked: Docker's mount setup fails with "required key not available" and the
-# container exits 255. `restart: unless-stopped` does NOT save it — the failure is
-# at container-create time, so Docker gives up with restartCount=0 and the service
-# is simply gone. That is exactly how the ranch-status dashboard (status-site,
-# :8088, 12 secret mounts) sat dead for 4 days after the 2026-07-27 reboot while
-# every other container came back — none of the others mount ~/.key.
-#
-# Discriminator for "restart this": mounts ~/.key, not running, has a restart
-# policy (so it was meant to be up), and exited NON-ZERO. The exit code is what
-# keeps this from fighting Craig — a deliberate `docker stop` exits 0 or 137, a
-# locked-vault mount failure exits 255. We never start something stopped on purpose.
+# Restart containers that bind-mount ~/.key and failed to start while the vault
+# was locked. Only containers with a restart policy that exited non-zero are
+# touched; exit 0/137 means a deliberate stop and is left alone.
 restart_vault_containers() {
   command -v docker >/dev/null 2>&1 || return 0
   docker info >/dev/null 2>&1 || { echo "  (docker not reachable — skipping container repair)"; return 0; }
@@ -65,10 +52,7 @@ restart_vault_containers() {
   done < <(docker ps -a --format '{{.Names}}' 2>/dev/null)
 }
 
-# The container repair is re-drivable on purpose: if a restart failed, or a new
-# casualty turns up hours later, re-running unlock.sh has to redo it — so the
-# "already unlocked" path does the sweep too instead of exiting early. It needs
-# no sudo and only touches containers that crashed, so it is safe to repeat.
+# The container sweep also runs when already unlocked, so re-running is safe.
 if [ -f "$KEY/.vault_unlocked" ]; then
   echo "Vault already unlocked — re-running the container sweep."
   restart_vault_containers

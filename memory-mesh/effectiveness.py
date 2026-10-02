@@ -1,64 +1,17 @@
 #!/usr/bin/env python3
-"""effectiveness — is the retrieval-delivery channel actually working?
+"""effectiveness: measure the retrieval channel from retrieval-log.ndjson.
 
-Complements canary.py. canary asks "CAN the channel serve a memory" (self-cue
-positive control, daily). This asks "IS it serving well" — using the real
-`retrieval-log.ndjson` the hook has been writing on every turn since the v4
-residency split moved most rules off always-on and onto retrieval.
-
-Three things this measures, and why each earns its place:
-
-  DELIVERY   fire rate, hits/turn, and — the one that matters most —
-             SATURATION: the fraction of fired turns that hit exactly TOP_K.
-             A near-100% saturation rate looks identical to "the corpus is
-             perfectly matched" and to "the scorer pads to k almost every
-             turn regardless of relevance." Measured live 2026-08-14 on
-             14,449 real turns: fire rate 99.5%, saturation 99.4%. That is
-             not proof of precision — it is the numbers a degraded-precision
-             channel would ALSO produce, so it is reported as a flag, not a
-             win (Principle 1, distrust green).
-
-  COVERAGE   what share of the servable corpus got pulled at least once in
-             the window, and which slugs did NOT — the dead-weight list.
-             All-time coverage on this corpus is 380/381 (99.7%), which is
-             uselessly high at 14k turns — nearly everything eventually
-             matches something once. Windowed to the last N turns (default
-             1000) it is a real curation signal: a slug absent from a
-             1000-turn window is a demotion/prune candidate. Line-count
-             windowing is a proxy for time — the log carries no timestamp
-             before this script's ts field was added, so hard day-boundaries
-             are not yet available; see NOT MEASURED below.
-
-  COST       always-on bytes (index_growth's own number) vs on-demand corpus
-             bytes still on disk. This is the one architecture claim that IS
-             fully falsifiable from data already collected: the v4 bet was
-             "shrink the hot-path payload without shrinking what's
-             reachable" — this section proves or disproves that with real
-             byte counts, not an intent statement.
-
-WHAT THIS DOES NOT MEASURE, on purpose, so nobody reads a green number as
-proof of the thing it isn't:
-  * PRECISION — whether a served memory was actually relevant to the turn.
-    The log stores hit slugs/scores and a char COUNT, deliberately not the
-    turn text (smaller log, no incidental capture of turn content) — so this
-    script cannot re-judge past turns for relevance. The honest instrument
-    for that is a periodic sampled review (the tri-model pattern already used
-    in reviews/*.md), not an automated grep, because "was this the right
-    memory" is a judgment call a heuristic will fool itself on.
-  * RECALL — memories that SHOULD have fired but didn't. Needs a labeled
-    eval set (turn -> expected slug); none exists yet. canary.py's self-cue
-    is the nearest proxy today and only tests a memory against its own
-    description, not a real turn.
-  * whether a served memory changed the agent's behavior at all (a "material
-    steer" vs an ignored line) — that requires the transcript, not the log.
+Reports delivery (fire rate, hits/turn, saturation at top_k), windowed coverage
+and dead-weight slugs, and always-on vs on-demand byte cost. Does not measure
+precision, recall, or behavioural effect. High saturation is flagged, not
+treated as proof of precision.
 
     python3 memory-mesh/effectiveness.py
     python3 memory-mesh/effectiveness.py --window 2000
     python3 memory-mesh/effectiveness.py --dry-run
     python3 memory-mesh/effectiveness.py --selftest
 
-Stdlib; _lib.influx optional (the seed does not ship it — the write is then
-skipped, loudly). Targets /usr/bin/python3.
+Stdlib; _lib.influx optional (the write is skipped with a stderr note if absent).
 """
 import argparse
 import json
@@ -79,10 +32,7 @@ DEAD_WEIGHT_SHOW = 20       # cap the printed list; the count is the real number
 
 
 def _read_log(path):
-    """Parse the ndjson log. Corrupt lines are skipped, not fatal — a torn
-    tail on an append-only file is expected, not exceptional (mesh_lib heals
-    the analogous case in the events log; this log is best-effort telemetry,
-    so skipping is enough)."""
+    """Parse the ndjson log, skipping corrupt lines."""
     out = []
     try:
         with open(path, encoding="utf-8") as fh:
@@ -109,10 +59,7 @@ def _servable(path=None):
 
 
 def snapshot(log_path=None, manifest_path=None, store=None, window=DEFAULT_WINDOW):
-    """Returns a report dict, or {'error': ...} if the inputs aren't there.
-
-    Never raises: a broken report must not look like a broken channel.
-    """
+    """Return a report dict, or {'error': ...} if inputs are missing."""
     log_path = log_path or (M.MESH_ROOT / "state" / "retrieval-log.ndjson")
     records = _read_log(log_path)
     if not records:
@@ -144,9 +91,7 @@ def snapshot(log_path=None, manifest_path=None, store=None, window=DEFAULT_WINDO
                 top_k = len(hits)
             for h in hits:
                 pulls[h["slug"]] += 1
-    # saturation needs a k to compare against; use the observed max as the
-    # channel's live TOP_K rather than importing retrieve.py's constant, so
-    # this stays correct even if the module changes k later.
+    # Use the observed max hit count as the channel's live top_k.
     top_k = top_k or 0
     saturated = sum(1 for r in win if len(r.get("hits") or []) == top_k) if top_k else 0
 
@@ -164,9 +109,7 @@ def snapshot(log_path=None, manifest_path=None, store=None, window=DEFAULT_WINDO
          if slug in servable and n / max(1, fired) >= OVEREXPOSED_FRAC),
         key=lambda t: -t[1])
 
-    # cost split: always-on bytes are index_growth's own number (what's
-    # actually on the hot path); on-demand bytes are what's reachable but not
-    # — the number the v4 bet was supposed to move weight into.
+    # Cost split: always-on index bytes vs on-demand memory file bytes.
     always_on_bytes = None
     ondemand_bytes = 0
     ondemand_files = 0
@@ -275,8 +218,7 @@ def main():
     fields = {k: v for k, v in snap.items()
               if isinstance(v, (int, float)) and v is not None}
     try:
-        # lazy: the seed's _lib has no influx.py, and a top-level import killed
-        # every importer (test_core included) — bug bash 2026-09-27 #15
+        # Lazy import: _lib.influx may be absent.
         from _lib import influx
     except ImportError as e:
         print(f"effectiveness: influx write skipped — _lib.influx unavailable ({e})",
@@ -290,8 +232,7 @@ def main():
 
 
 def _selftest():
-    """Prove the math on a fixture with known answers, and that missing
-    inputs degrade to a labeled error instead of a crash or a fake zero."""
+    """Check the metrics on a known fixture and that missing inputs return a labeled error."""
     import tempfile
     fails = []
 

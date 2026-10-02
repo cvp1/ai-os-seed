@@ -1,22 +1,10 @@
 #!/usr/bin/env python3
-"""weekly — regenerate NOW.md, a deterministic weekly projection over this
-install's own facts.
+"""weekly — regenerate NOW.md, a deterministic weekly view of this install's facts.
 
-The last arrow of the loop: jobs write facts (runs.db, via log_run.py);
-this reads them back and derives a view, no LLM involved (see
-memory/THE-LOOP.md for how this fits with /status, /improve, /recall).
-Modeled on CC's own weekly fleet-state projection, authored fresh here —
-same shape, only the sources an installed system actually has:
-
-  observability/report.py's store (runs.db)     per-job week-over-week
-  observability/freshness.py                     current exceptions
-  git log, this workspace                        recent activity
-
-Every source degrades to a marked "unavailable" line rather than crashing
-the whole page — one broken source shouldn't hide the rest. Silent on
-success (edge-trigger); exit 1 only if writing NOW.md itself fails.
-
-Stdlib only; targets /usr/bin/python3.
+Sources: runs.db (per-job week-over-week), freshness.py (current exceptions),
+git log (recent activity). A failing source shows as "unavailable" rather than
+crashing the page. Silent on success; exit 1 only if writing NOW.md fails.
+Stdlib only.
 """
 import json
 import subprocess
@@ -75,9 +63,7 @@ def job_lines():
 
 
 def _age_seconds(age):
-    """Parse freshness.py's formatted age string (e.g. '45s', '20m', '3h',
-    '2d') back to seconds, purely to rank STALE jobs oldest-first — the
-    JSON contract doesn't carry raw seconds, only the formatted label."""
+    """Parse a formatted age ('45s', '20m', '3h', '2d') to seconds, for ranking STALE jobs."""
     if not age:
         return -1
     unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(age[-1])
@@ -88,8 +74,7 @@ def _age_seconds(age):
 
 
 def freshness_lines():
-    """Current exceptions (STALE/FAILING/MISSING) via the same JSON contract
-    the /status skill reads — one source of truth, two consumers."""
+    """Current STALE/FAILING/MISSING jobs from freshness.py --json."""
     try:
         r = subprocess.run(
             [sys.executable, str(ROOT / "observability" / "freshness.py"), "--all", "--json"],
@@ -107,10 +92,7 @@ def freshness_lines():
 
 
 def git_lines():
-    """Recent activity in this workspace. A single install is usually one repo
-    (ROOT itself); the growth path — several repos under one workspace root,
-    same convention this seed's own source workspace uses — is handled too:
-    if ROOT isn't a repo, scan its immediate subdirectories for ones that are."""
+    """Recent git activity in ROOT, or in its immediate subdirectory repos if ROOT isn't one."""
     candidates = [ROOT] if (ROOT / ".git").is_dir() else [
         p for p in sorted(ROOT.iterdir()) if (p / ".git").is_dir()
     ]

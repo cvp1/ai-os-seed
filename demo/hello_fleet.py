@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""hello-fleet — the seed's one working demo job (SEED-017).
+"""hello-fleet — demo job exercising scheduler -> log_run.py -> runs.db -> freshness.py.
 
-Proves the whole substrate end-to-end in a single scheduled run:
-    scheduler -> this script -> observability/log_run.py -> runs.db -> freshness.py
-
-Reads local host stats (uptime, disk free, load average) and prints ONE
-summary line — nothing to configure, nothing that assumes a domain (no
-solar, no cameras, no fleet roster). Delete this once you have a real first
-job; it exists to be the thing you point at and say "that's alive."
-
-Always exits 0 — a heartbeat has no failure mode of its own to report; if a
-stat is unreadable on this platform it degrades to "unknown" rather than
-breaking the run (see PRINCIPLES.md: degrade toward safety, loudly).
-
-Stdlib only; targets /usr/bin/python3 on Linux or macOS.
+Prints one line of local host stats (uptime, load, disk free). Always exits 0;
+unreadable stats show as "unknown". Replace it once you have a real job.
+Stdlib only; Linux or macOS.
 """
 import os
 import platform
@@ -24,9 +14,7 @@ from datetime import timedelta
 
 
 def _uptime_str():
-    """Linux: /proc/uptime. macOS: no stdlib equivalent (no /proc) — degrade
-    to 'unknown' rather than shelling out to `sysctl` (keep this stdlib-only,
-    per the _lib invariant this demo is supposed to model)."""
+    """Uptime from /proc/uptime; 'unknown' where /proc is absent (macOS)."""
     try:
         with open("/proc/uptime") as f:
             seconds = float(f.read().split()[0])

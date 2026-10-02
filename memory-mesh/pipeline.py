@@ -1,26 +1,10 @@
 #!/usr/bin/env python3
-"""pipeline.py — mechanical stages of the improve/capture memory pipeline.
+"""pipeline.py: mechanical stages of the improve/capture memory pipeline.
 
-Story D2 (harness-portability audit): the harvest -> filter -> classify ->
-dedup -> lineage-gate pipeline lived entirely in SKILL.md prose. This CLI
-exposes the MECHANICAL stages so any harness (or Craig by hand) can drive the
-judgment steps around it. The split, explicitly:
-
-  mechanical (this tool)            judgment (the model / Craig — SKILL.md prose)
-  --------------------------------  ---------------------------------------------
-  harvest: scan given files for     deciding a lesson is real, durable and
-    correction/preference signal      general enough to keep; distilling wording
-  dedup: check a slug + keywords    choosing update-in-place vs supersede vs
-    against the live memory store     contradicts when a belief changed
-  stage: structural filter (slug,   classifying type; setting lineage HONESTLY
-    type, lineage present, why/how    (does the lesson trace to untrusted
-    contract, secret scan) + emit     content?); Craig's show-then-write approval
-    the exact memory_write.py call
-
-SECURITY INVARIANT (Story 029, OWASP ASI06): this tool NEVER writes into the
-memory store. memory_write.py remains the one sanctioned writer with the
-lineage gate. `stage` prints the memory_write.py invocation as a PROPOSAL —
-it does not execute it. All subcommands are read-only against the store.
+harvest scans files for candidate-lesson lines; dedup checks a slug/keywords
+against the store; stage runs the structural filter and prints the
+memory_write.py call as a proposal. Judgment (what to keep, lineage honesty)
+stays with the caller. Read-only against the store; never writes memory.
 
 Usage:
     /usr/bin/python3 pipeline.py harvest <file>... [--topic X]
@@ -42,11 +26,7 @@ import shlex
 import sys
 from pathlib import Path
 
-# _lib lives at the workspace root. Since 2026-09-18 (SEED-080) this file's
-# canonical home is memory-mesh/ in git, so the workspace is simply its
-# parent — true for the fleet's ~/{{REDACTED}} and for any seed recipient's
-# chosen root alike. The older candidates stay, last, for a checkout that
-# still runs from the vault's skills-core or from cc-skills.
+# Locate the workspace root holding _lib (normally this file's parent dir).
 _HERE = Path(__file__).resolve().parent
 for _root in (_HERE.parent, _HERE.parents[2], Path.home() / "{{REDACTED}}"):
     if (_root / "_lib" / "frontmatter.py").exists():
@@ -54,9 +34,7 @@ for _root in (_HERE.parent, _HERE.parents[2], Path.home() / "{{REDACTED}}"):
         break
 from _lib import frontmatter  # noqa: E402
 
-# The store is DERIVED, never typed: the literal here was one host's truth
-# shipped to every host (SEED-080 M2, the one-store property). mesh_lib owns
-# the derivation; without it, fall back to the same rule applied locally.
+# Store path is derived by mesh_lib; fall back to the same rule if unavailable.
 def _store():
     try:
         sys.path.insert(0, str(_HERE))
@@ -117,11 +95,7 @@ def _read_capped(path):
 
 # ================================================================== harvest ==
 def harvest(paths, topic=None):
-    """Scan the given transcript/source files for candidate-lesson lines.
-
-    Mechanical only: pattern-matched signal lines with provenance. Whether a
-    candidate is a REAL durable lesson, and its wording, is model judgment.
-    """
+    """Scan files for pattern-matched candidate-lesson lines, with file/line provenance."""
     candidates, errors, truncated = [], [], False
     for p in paths[:MAX_FILES]:
         path = Path(p)
@@ -165,32 +139,13 @@ def harvest(paths, topic=None):
 
 # ==================================================================== dedup ==
 def _frontmatter_fields(text):
-    """Best-effort name/description from a memory note's frontmatter.
-
-    Thin wrapper over _lib.frontmatter.parse (2026-08-08 — this used to be a
-    third near-duplicate of session_brief.parse_brief / agy-bundle's
-    _frontmatter; see that module's docstring). Keeps this function's
-    original (name, desc) tuple return shape so its one call site (dedup)
-    doesn't change.
-    """
+    """Return (name, description) from a memory note's frontmatter."""
     meta, _ = frontmatter.parse(text)
     return meta.get("name", "").strip(), meta.get("description", "").strip('"')
 
 
 def _tiers(store):
-    """Map slug -> index tier from the store's index artifacts (read-only).
-
-    Bug fixed 2026-08-08: this used to look for a `(slug.md)` markdown-link
-    pattern in MEMORY.md's always-on bullets. The mesh-fold rendering moved
-    to `- [type/slug] text (date)` at some point and this regex was never
-    updated, so it matched zero always-on entries against every real store —
-    every slug silently fell through to "on-demand" or unknown. The
-    selftest's own MEMORY.md fixture below still used the old link format,
-    so it kept passing while production was broken the whole time (see
-    memory [[test-asserting-source-shape-defends-the-bug]]). Found building
-    cc-skills/agy-bundle/build.py, which needed real tier data and got zero
-    always-on hits against the live 104-entry store.
-    """
+    """Map slug -> index tier from MEMORY.md (`- [type/slug] ...` rows), QUARANTINE.md and _index-exclude.txt."""
     tiers = {}
     index = store / "MEMORY.md"
     quarantine = store / "QUARANTINE.md"
@@ -226,12 +181,7 @@ def _keywords_from(raw):
 
 
 def dedup(slug=None, keywords_raw=None, store=STORE):
-    """Check a proposed slug + keywords against the live memory store.
-
-    Read-only. Reports whether the slug already exists, its index tier, and
-    which existing memories overlap the keywords — the update-vs-supersede-vs-
-    new decision stays with the model/Craig.
-    """
+    """Report whether a slug exists, its tier, and which memories overlap the keywords (read-only)."""
     keywords = _keywords_from(keywords_raw)
     tiers = _tiers(store)
     slug_exists = bool(slug) and (store / f"{slug}.md").exists()
@@ -306,9 +256,7 @@ _NULL_ANSWERS = {"n/a", "na", "none", "nothing", "-", "unknown", "tbd",
 
 
 def _structural_problems(a):
-    """The structural filter — every check here is mechanical, none is policy
-    judgment. Lineage HONESTY (does the lesson trace to untrusted content?)
-    cannot be checked here; only its presence and validity can."""
+    """Return (problems, warnings) from mechanical checks on staged memory fields."""
     problems, warnings = [], []
     if not a.get("slug") or not SLUG_RE.match(a["slug"]):
         problems.append(f"slug must be kebab-case: {a.get('slug')!r}")
@@ -329,17 +277,7 @@ def _structural_problems(a):
             problems.append(f"type '{a.get('type')}' requires --why and --how")
     elif a.get("type") in ("user", "reference") and (a.get("why") or a.get("how")):
         problems.append(f"type '{a.get('type')}' is a single paragraph — no --why/--how")
-    # Earn-the-write gate (2026-08-01). Auto-memory is byte-budgeted and
-    # always-on, so a rule that PRINCIPLES.md already forces costs context in
-    # every future session and freezes the principle besides. The judgment is
-    # the model's; what is mechanical — and therefore lives here — is that the
-    # judgment was MADE and recorded. This REFUSES rather than warns, because a
-    # limit that only narrates is not a limit: the standing instruction against
-    # principle-restatement already existed in CLAUDE.md and two restatements
-    # were staged anyway (2026-08-01), which is what a prose-only gate is worth.
-    # The bar is deliberately "not FORCED by a principle for this case", not
-    # "does not resemble one" — a measured gotcha that illustrates a principle
-    # without being implied by it is exactly what auto-memory is for.
+    # Require a concrete --not-implied-by: what this adds beyond PRINCIPLES.md.
     nib = (a.get("not_implied_by") or "").strip()
     if not nib:
         problems.append(
@@ -369,12 +307,7 @@ def _structural_problems(a):
 
 
 def stage(a, store=STORE):
-    """Structural filter + emit the exact memory_write.py call as a PROPOSAL.
-
-    Executes NOTHING and writes NOTHING. memory_write.py stays the one
-    sanctioned writer; its own dry-run (no --commit) is still the preview
-    step, and Craig's approval still gates --commit.
-    """
+    """Run the structural filter and return the memory_write.py preview/commit commands; executes nothing."""
     problems, warnings = _structural_problems(a)
 
     ded = None
@@ -425,7 +358,7 @@ def stage(a, store=STORE):
     result.update({
         "preview_command": shlex.join(argv),
         "commit_command": shlex.join(argv + ["--commit"]),
-        "note": "PROPOSAL only — nothing was executed or written. Show Craig "
+        "note": "PROPOSAL only — nothing was executed or written. Show the owner "
                 "the drafted memory; on approval run preview_command (dry run) "
                 "then commit_command. memory_write.py is the only writer.",
     })
@@ -501,12 +434,7 @@ def _selftest():
         ok(dc["verdict"] == "clear" and not dc["slug_exists"], "dedup-clear")
 
         secs = sections(store)
-        # Current mesh-fold MEMORY.md carries no "## " category headers
-        # before the always-on bullets (see _tiers fix above, same drift) —
-        # "On-demand memories" is the only one that exists in the real file.
-        # A prior fixture asserted a category header format ("🛠 Working
-        # Practices & Harness Lessons") that no longer matches production;
-        # `--section` staging targets are effectively always "Unsorted" now.
+        # Generated MEMORY.md has only the "On-demand memories" section header.
         ok(secs["sections"] == ["On-demand memories"], "sections-listed")
 
         # --- stage ---

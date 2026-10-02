@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
-"""learn_harvest — sleep-time harvest of the operator's own lines into
-QUARANTINED memory candidates, plus one review card.
+"""learn_harvest: harvest the operator's own lines into quarantined memory candidates, plus a review card.
 
-Code owns the filters, fingerprints, slugs and lineage; the model only judges
-which lines hold a durable lesson. Every candidate is written through the one
-memory door (memory_write.py) as `contains-untrusted` — the fold holds it out
-of every served tier until the operator promotes it with their key
-(learn_card.py accept -> sign.py --promote). Nothing here can make a memory
-served; that is the whole safety property, and test_learn_harvest.py checks it.
+Code filters lines; a model picks durable lessons. Each candidate is written
+through memory_write.py as `contains-untrusted` and is served only after
+learn_card.py accept (sign.py --promote).
 
-Written on {{REDACTED}} (2026-08-14) against its Telegram bridge, upstreamed
-2026-09-27 with every host coupling made a setting:
+Settings (environment):
 
   LEARN_SOURCES    os.pathsep-separated line files to harvest from, each read
                    incrementally (a cursor per file). A line is "role<TAB>text"
@@ -37,7 +32,7 @@ Written on {{REDACTED}} (2026-08-14) against its Telegram bridge, upstreamed
 
     learn_harvest.py --collect            copy new source lines into the inbox (no model)
     learn_harvest.py --nightly [--no-send]  collect, judge, write, card
-    (--session-end is the pre-upstream name of --collect, kept for old hooks)
+    (--session-end is an alias for --collect)
 """
 from __future__ import annotations
 
@@ -75,8 +70,7 @@ SECRET_RX = re.compile(
     r"password\s*[=:])",
     re.I,
 )
-# Always-on generic deny set: things that must never become a memory whoever
-# the operator is. Client names and the like go in LEARN_DENY_FILE.
+# Built-in deny set; site-specific patterns go in LEARN_DENY_FILE.
 DENY_DEFAULT = re.compile(
     r"\b(nda|ssn|social security|account number|routing number|personnel|"
     r"verification code|one-time code|otp|passcode|2fa)\b",
@@ -138,8 +132,7 @@ def _deny_extra():
                 try:
                     pats.append(re.compile(ln, re.I))
                 except re.error:
-                    # A broken operator pattern must not silently let
-                    # everything through: deny ALL lines this run, loudly.
+                    # A bad pattern denies every line this run.
                     print("learn-harvest: bad deny pattern %r — denying every line" % ln,
                           file=sys.stderr)
                     return [re.compile(r"")]
@@ -173,8 +166,7 @@ def _rejected_set():
 
 
 def code_filter(lines):
-    """Lines -> the operator's own, long enough, clean, never seen, never
-    rejected. Deterministic; no model has seen anything yet."""
+    """Keep the operator's lines that are long enough, clean, and not seen or rejected before."""
     seen = set(_load_json(SEEN, {}).get("hashes") or [])
     rejected = _rejected_set()
     roles, deny = _roles(), _deny_extra()
@@ -197,7 +189,7 @@ def code_filter(lines):
 
 
 def _judge_call(prompt):
-    """The model's raw answer, or raises. The only place a model is called."""
+    """Return the configured judge model's raw answer; raises on failure."""
     which = os.environ.get("LEARN_JUDGE", "claude").strip().lower()
     extra = os.environ.get("LEARN_JUDGE_PATH")
     if extra:
@@ -261,9 +253,7 @@ def judge(texts):
 
 
 def write_untrusted(cand):
-    """One candidate through the memory door as contains-untrusted. Returns the
-    mesh event id (the only handle sign.py --promote accepts). Raises with the
-    door's own words when it refuses — e.g. a host with no mesh quarantine."""
+    """Write a candidate via memory_write.py as contains-untrusted; return its mesh event id or raise."""
     cmd = [sys.executable, str(DOOR), "write",
            "--slug", cand["slug"], "--type", "feedback",
            "--lineage", "contains-untrusted",
@@ -292,7 +282,7 @@ def _sources():
 
 
 def collect():
-    """Copy each source's NEW lines into the inbox. No model. Returns the count."""
+    """Copy each source's new lines into the inbox; return the count."""
     cursors = _load_json(STATE / "learn-cursors.json", {})
     n = 0
     for src in _sources():

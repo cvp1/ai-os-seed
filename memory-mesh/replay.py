@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
-"""Time-travel replay — the exact view any agent had at any past moment.
+"""Replay the fold as of a past instant by folding only events with ts <= T.
 
-    replay.py --at 2026-07-27T22:15:00Z [--subject ssh-route/{{REDACTED}}] [--audience operator]
-
-Because logs are append-only and the fold is deterministic, folding only the
-events with ts <= T reproduces the T-time view byte-for-byte. Mutable-DB
-memory systems cannot do this; it is this design's signature capability.
+    replay.py --at 2026-07-27T22:15:00Z [--subject ssh-route/HOST] [--audience operator]
 """
 import argparse
 import sys

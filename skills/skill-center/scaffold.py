@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """skill-center: scaffold a new Claude Code skill following this workspace's conventions.
 
-Plan-validate-execute: runs DRY by default (prints the plan + validates the
-description), only touches disk with --commit. The why: a skill that triggers
-wrong or lands in the wrong place is annoying to unwind, so we validate the one
-field that matters (description) before creating anything.
+Dry-run by default (prints the plan, validates the description); writes only
+with --commit.
 
-Conventions enforced here:
-  - canonical files live under this workspace's skills/<name>/ (version-
-    controlled with the rest of the workspace) — pass --repo-path to put a
-    skill with real code in its own repo instead
-  - .claude/skills/<name>/SKILL.md is a SYMLINK to the canonical file
-    (project-level discovery — Claude Code walks up from the working
-    directory looking for .claude/skills/)
-  - helper scripts stay next to the canonical SKILL.md, called by absolute
-    path with /usr/bin/python3
-  - secrets come from ~/.key (never hardcoded); shared helpers via _lib
+Conventions:
+  - canonical files live in skills/<name>/ (or --repo-path for its own repo)
+  - .claude/skills/<name>/SKILL.md is a symlink to the canonical file
+  - helper scripts sit next to SKILL.md, called by absolute path
+  - secrets come from ~/.key; shared helpers via _lib
 
 Usage:
   scaffold.py --name solar-peek --desc "..."                 # dry-run plan
