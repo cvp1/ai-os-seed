@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""declare — set a subject's residency tier by emitting a superseding event.
+"""declare: set a subject's residency tier by re-emitting its tip with the tier.
 
-    declare.py --residency state  home/fleet-md ...
+    declare.py --residency state  home/fleet-md ssh-route/HOST ...
+    declare.py --residency doctrine lesson/some-slug ...
     declare.py --residency state --from-file batch.txt --commit
 
-Lesson subjects carry their store body into the event. Dry-run by default.
+Each new event supersedes the live ones and carries the same kind/content, plus
+the store body for lesson subjects. Pins and promoted tips are left alone.
+Dry run by default.
 """
 import argparse
 import subprocess
@@ -48,23 +51,32 @@ def main():
         if not ids:
             skipped.append((subj, "no live event on this subject"))
             continue
-        # The tip is the newest fact event; pins are overlays and stay live.
+        # The tip is the newest non-pin event; pins are never superseded here.
         fact_ids = [i for i in ids if live[i]["kind"] != "pin"]
         if not fact_ids:
             skipped.append((subj, "only pin events live on this subject"))
             continue
         ids = fact_ids
         tip = live[ids[-1]]
+        # Refuse a promoted tip: re-emitting cannot carry its signature or
+        # approval and would demote it. Use tier.py instead.
+        if tip.get("verbal_approval") or (tip.get("sig") and tip.get("_signed")):
+            how = "verbally approved" if tip.get("verbal_approval") else "key-signed"
+            skipped.append((subj, (
+                f"tip {tip['id']} is {how} — declaring over it would strip the "
+                f"promotion and quarantine a served fact; use tier.py for "
+                f"residency, or re-promote after")))
+            continue
         body = None
         if subj.startswith("lesson/") and store:
             f = store / f"{subj.split('/', 1)[1]}.md"
             if f.exists():
                 body = f.read_text(encoding="utf-8")
-                # Oversized bodies stay in the store file; declare hook-only.
+                # Oversized bodies stay in the store file; declare without one.
                 if len(body.encode("utf-8")) + 1500 > M.MAX_EVENT_BYTES:
                     body = None
         if body is None and subj.startswith("lesson/"):
-            # No local store file: re-carry the body from the event chain.
+            # No local file: re-carry the body from the supersede chain.
             chained = M.chain_body(tip, events)
             if chained and len(chained.encode("utf-8")) + 1500 <= M.MAX_EVENT_BYTES:
                 body = chained
@@ -73,8 +85,7 @@ def main():
                   f"(supersedes {len(ids)}, body={'yes' if body else 'no'})")
             done.append(subj)
             continue
-        # --carry-forward: re-emit the tip's content verbatim, bypassing the
-        # admission gate for content this tool did not author.
+        # --carry-forward: content is re-emitted verbatim, so bypass the admission gate.
         cmd = [sys.executable, str(HERE / "emit.py"), "--no-nudge",
                "--carry-forward",
                "--kind", tip["kind"], "--subject", subj,
@@ -83,8 +94,10 @@ def main():
                "--residency", args.residency,
                "--lineage", tip.get("lineage", "operator-direct"),
                "--audience", tip.get("audience", "operator"),
+               # Carry confidence forward; emit's default would downgrade it.
+               "--confidence", tip.get("confidence", "inferred"),
                "--supersedes", ",".join(ids)]
-        # `home` is required on an assert; carry the tip's forward.
+        # `home` is required on an assert; carry it forward.
         if tip.get("home"):
             cmd += ["--home", tip["home"]]
         if tip.get("polarity") and tip["polarity"] != "n/a":
