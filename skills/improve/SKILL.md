@@ -141,7 +141,7 @@ invocation as a **proposal** (it executes nothing):
 ```bash
 /usr/bin/python3 memory-mesh/pipeline.py stage \
   --slug <kebab-slug> --type feedback|user|project|reference \
-  --description "<one-line description>" --lineage craig-direct|contains-untrusted \
+  --description "<one-line description>" --lineage operator-direct|contains-untrusted \
   --rule "<the lesson, plain text>" \
   --why "<why it matters>" --how "<exactly what to do next time>" \
   --hook "<short MEMORY.md index hook>" --section "<MEMORY.md section header>" \
@@ -169,7 +169,7 @@ approval gate is prose because it *is* the human step — no tool can hold it.
 ---
 name: <short-kebab-case-slug>
 description: "<one-line summary — used for recall relevance>"
-lineage: craig-direct       # REQUIRED — see Lineage below. craig-direct | contains-untrusted
+lineage: operator-direct       # REQUIRED — see Lineage below. operator-direct | contains-untrusted
 supersedes: [old-slug]      # OPTIONAL — this fact REPLACES that one (kept as history); omit if none
 contradicts: [other-slug]   # OPTIONAL — known unresolved tension with that fact; omit if none
 metadata:
@@ -191,7 +191,7 @@ metadata:
 
 Every memory carries a **`lineage:`** trust class, set honestly at write time:
 
-- **`craig-direct`** — Craig typed, dictated, or explicitly approved this lesson.
+- **`operator-direct`** — the owner typed, dictated, or explicitly approved this lesson (legacy spelling `craig-direct` is still accepted).
   Only these earn a line in `MEMORY.md` (always-on standing policy).
 - **`contains-untrusted`** — the session this was distilled from ingested
   **untrusted text**: an email body from any inbox connector, a fetched web page

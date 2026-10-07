@@ -130,7 +130,7 @@ emits the exact writer invocation as a proposal (executes nothing):
 ```bash
 /usr/bin/python3 memory-mesh/pipeline.py stage \
   --slug <kebab-slug> --type feedback|user|project|reference \
-  --description "<one-line description>" --lineage craig-direct|contains-untrusted \
+  --description "<one-line description>" --lineage operator-direct|contains-untrusted \
   --rule "<the lesson>" [--why "<...>" --how "<...>"] \
   --hook "<short MEMORY.md hook>" --section "<MEMORY.md section header>" \
   --not-implied-by "<what PRINCIPLES.md does not force for this case>" \

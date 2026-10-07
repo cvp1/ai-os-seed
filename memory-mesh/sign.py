@@ -80,14 +80,14 @@ def reconcile_store(subject, approved_words=None):
               f"this fact. Retag it by hand-equivalent tooling.", file=sys.stderr)
         return
     cmd = [sys.executable, str(MEMORY_WRITE), "retag", slug,
-           "--lineage", "craig-direct", "--commit"]
+           "--lineage", "operator-direct", "--commit"]
     # A verbal promotion passes the approval words through to retag's gate.
     if approved_words:
         cmd += ["--operator-approved", approved_words]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode == 0:
         klass = M.PROMOTION_VERBAL if approved_words else M.PROMOTION_KEY
-        print(f"  store reconciled: {slug} -> lineage: craig-direct ({klass})")
+        print(f"  store reconciled: {slug} -> lineage: operator-direct ({klass})")
     else:
         print(f"  STORE NOT RECONCILED for {slug} (the signed event stands and "
               f"is authoritative, but the store copy still says "

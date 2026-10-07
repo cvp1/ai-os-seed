@@ -419,15 +419,15 @@ def chain_body(tip, events):
         if carrier is None:
             return None
         if authority.get("_signed"):
-            return _stamp(carrier["body"], "craig-direct", PROMOTION_KEY)
-        return _stamp(carrier["body"], "craig-direct", PROMOTION_VERBAL,
+            return _stamp(carrier["body"], "operator-direct", PROMOTION_KEY)
+        return _stamp(carrier["body"], "operator-direct", PROMOTION_VERBAL,
                       (authority.get("verbal_approval") or {}).get("words"))
     carrier = next((e for e in chain[1:] if ok_carrier(e)), None)
     if carrier is None:
         return None
     trusted = (tip.get("lineage") == "operator-direct"
                and carrier.get("lineage") == "operator-direct")
-    return _stamp(carrier["body"], "craig-direct" if trusted else "contains-untrusted")
+    return _stamp(carrier["body"], "operator-direct" if trusted else "contains-untrusted")
 
 
 # Alias kept for callers and tests.
@@ -509,7 +509,7 @@ def project_store(fold, store, apply=False, events=None):
                 continue
             stub = (f"---\nname: {slug}\n"
                     f"description: {content.splitlines()[0][:200]}\n"
-                    f"lineage: {'craig-direct' if e.get('lineage') == 'operator-direct' else 'contains-untrusted'}\n"
+                    f"lineage: {'operator-direct' if e.get('lineage') == 'operator-direct' else 'contains-untrusted'}\n"
                     f"{RECONSTRUCTED_MARK}\n"
                     f"metadata:\n  node_type: memory\n  type: feedback\n---\n\n"
                     f"{content}\n\n"
@@ -1745,8 +1745,8 @@ def store_file_lineage(slug, store=None):
     m = _FRONT_LINEAGE.search(p.read_text(encoding="utf-8", errors="replace"))
     return m.group(1) if m else "absent"
 
-# Trusted lineage in store vocabulary and mesh vocabulary.
-TRUSTED_LINEAGES = {"craig-direct", "operator-direct"}
+# Trusted lineage; "craig-direct" is the legacy store spelling, still accepted.
+TRUSTED_LINEAGES = {"operator-direct", "craig-direct"}
 
 
 def store_quarantine_drift(fold, store=None):

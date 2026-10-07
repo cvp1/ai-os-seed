@@ -188,7 +188,7 @@ class SignedPromotionProjectionTests(unittest.TestCase):
         out, text = self._run({})
         self.assertEqual(out["created"], ["x-fact"])
         self.assertIn("the real body", text)
-        self.assertIn("lineage: craig-direct\npromotion: key-signed\n", text)
+        self.assertIn("lineage: operator-direct\npromotion: key-signed\n", text)
 
     def test_existing_file_is_never_rewritten_by_a_promotion(self):
         with tempfile.TemporaryDirectory() as d:
@@ -235,7 +235,7 @@ class SignedPromotionProjectionTests(unittest.TestCase):
                    "supersedes": ["b2"], "residency": "doctrine"}
         out, text = self._chain_run([lesson, signed, declare], declare)
         self.assertEqual(out["created"], ["x-fact"])
-        self.assertIn("lineage: craig-direct\npromotion: key-signed\n", text)
+        self.assertIn("lineage: operator-direct\npromotion: key-signed\n", text)
 
     def test_verbal_authority_stamps_verbally_signed_with_the_words(self):
         lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
@@ -248,14 +248,14 @@ class SignedPromotionProjectionTests(unittest.TestCase):
         out, text = self._chain_run([lesson, verbal], verbal)
         self.assertIn('promotion: verbally-signed\napproved: "go, ship it"\n', text)
 
-    def test_trusted_chain_without_signature_projects_craig_direct(self):
-        body = self.BODY.replace("contains-untrusted", "craig-direct")
+    def test_trusted_chain_without_signature_projects_operator_direct(self):
+        body = self.BODY.replace("contains-untrusted", "operator-direct")
         lesson = {"id": "a1", "kind": "lesson", "subject": "lesson/x-fact",
                   "audience": "operator", "body": body, "lineage": "operator-direct"}
         declare = {"id": "c3", "kind": "correct", "subject": "lesson/x-fact",
                    "audience": "shared", "lineage": "operator-direct", "supersedes": ["a1"]}
         out, text = self._chain_run([lesson, declare], declare)
-        self.assertIn("lineage: craig-direct\n", text)
+        self.assertIn("lineage: operator-direct\n", text)
         self.assertNotIn("promotion:", text)
 
     def test_supersede_cycle_terminates(self):
@@ -290,7 +290,7 @@ class BodyHashAgreementTests(unittest.TestCase):
                 "body": body, "body_sha256": sha}
 
     def test_matching_body_and_hash_validate(self):
-        b = "---\nname: x\nlineage: craig-direct\n---\nreal\n"
+        b = "---\nname: x\nlineage: operator-direct\n---\nreal\n"
         self.assertEqual(mesh_lib.validate_event(self._ev(b, mesh_lib.content_fingerprint(b))), [])
 
     def test_mismatched_body_is_invalid(self):

@@ -293,7 +293,7 @@ def m1_one_door(sb, harness):
     r = run([sys.executable, str(door), "write",
              "--slug", PROBE_SLUG, "--type", "reference",
              "--description", PROBE_DESC, "--rule", PROBE_RULE,
-             "--hook", "contract probe", "--lineage", "craig-direct",
+             "--hook", "contract probe", "--lineage", "operator-direct",
              "--no-push", "--commit"], env=sb.env)
     landed = (sb.store / f"{PROBE_SLUG}.md").is_file()
     record("M1-write", "PASS" if landed else "FAIL",
@@ -402,7 +402,7 @@ def m1_harness(sb, door, harness):
         f"/usr/bin/python3 {door} write --slug {slug} --type reference "
         f"--description 'the {harness} harness-turn contract probe' "
         f"--rule 'The contract probe records that the {harness} harness "
-        "reached the door.' --hook 'harness probe' --lineage craig-direct "
+        "reached the door.' --hook 'harness probe' --lineage operator-direct "
         "--no-push --commit")
     env = {"MEMORY_WRITE_STORE": str(sb.store), "MESH_ROOT": str(sb.mesh_root),
            "MESH_HOST": "contract", "MESH_SESSION_ID": f"contract-{harness}"}

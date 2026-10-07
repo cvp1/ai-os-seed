@@ -539,7 +539,7 @@ def main():
                 "store is blocked. Memory writes must go through "
                 "the workspace door, memory-mesh/memory_write.py (via "
                 "Bash), so "
-                "the lineage gate (craig-direct vs contains-untrusted, "
+                "the lineage gate (operator-direct vs contains-untrusted, "
                 "Story 029) is honestly set on every write -- this is the "
                 "boundary MemGhost-style email/web-borne memory poisoning "
                 "relies on not existing. Call memory_write.py instead."

@@ -15,7 +15,7 @@ Usage:
     # New or updated memory (same slug = in-place update)
     python3 memory_write.py write --slug foo-bar --type feedback \\
         --description "one-line description for recall relevance" \\
-        --lineage craig-direct \\
+        --lineage operator-direct \\
         --rule "The lesson, stated as a concrete rule." \\
         --why "Why it matters." --how "Exactly what to do next time." \\
         --hook "short index hook" --section "Working Practices & Harness Lessons"
@@ -37,7 +37,7 @@ Maintenance subcommands (index/frontmatter only, no --lineage of their own):
     python3 memory_write.py demote slug-a slug-b --commit
 
     # set lineage: on EXISTING notes, body byte-preserved
-    python3 memory_write.py retag slug-a slug-b --lineage craig-direct --commit
+    python3 memory_write.py retag slug-a slug-b --lineage operator-direct --commit
 
 Prints the rendered file + MEMORY.md diff. Without --commit it is a dry run.
 Stdlib only.
@@ -185,12 +185,19 @@ def require_enforceable_quarantine():
         "marker appears), or\n"
         "   - write this observation as a DOC (vault note / repo README) instead "
         "of a memory.\n"
-        "  A craig-direct memory is unaffected; only the untrusted class is "
+        "  A operator-direct memory is unaffected; only the untrusted class is "
         "refused.")
 
 
 TYPES = {"feedback", "user", "project", "reference"}
-LINEAGES = {"craig-direct", "contains-untrusted"}
+LINEAGES = {"operator-direct", "contains-untrusted"}
+# Legacy spelling of operator-direct; accepted on input and on read.
+LEGACY_LINEAGES = {"craig-direct": "operator-direct"}
+
+
+def canon_lineage(value):
+    """The current spelling of a lineage value; legacy aliases map forward."""
+    return LEGACY_LINEAGES.get(value, value)
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
@@ -396,7 +403,7 @@ def fact_shape(*texts):
 def _session_provenance():
     """Import session_provenance lazily, or None.
 
-    A missing import degrades the craig-direct check to UNVERIFIED, never clean."""
+    A missing import degrades the operator-direct check to UNVERIFIED, never clean."""
     try:
         d = _mesh_code_dir()
         if d is None:
@@ -446,7 +453,7 @@ def has_signed_promotion(slug):
     """(ok, reason): does `lesson/<slug>` carry a verified operator signature
     covering its current content?
 
-    The only path to promote a memory to craig-direct via `retag`. Relies on
+    The only path to promote a memory to operator-direct via `retag`. Relies on
     fold_events() re-verifying signatures (`_signed`) and compares the file's
     content_fingerprint() to the signed `body_sha256`; events without
     `body_sha256` are accepted as legacy. Any failure returns (False, reason).
@@ -558,17 +565,17 @@ def _cmd_adopt(args):
         body = f.read_text(encoding="utf-8")
         raw_lineage = _frontmatter_value(body, "lineage")
         # An untagged file needs a signed promotion to be adopted as
-        # craig-direct; an explicit tag was already checked when it was set.
+        # operator-direct; an explicit tag was already checked when it was set.
         if raw_lineage is None:
             ok, reason = has_signed_promotion(slug)
             if not ok:
                 skipped.append((slug, f"untagged file, {reason} — "
-                                      "defaulting to craig-direct is "
+                                      "defaulting to operator-direct is "
                                       "refused; retag it explicitly after "
                                       "`sign.py --promote`, or leave it "
                                       "contains-untrusted"))
                 continue
-        lineage = raw_lineage or "craig-direct"
+        lineage = canon_lineage(raw_lineage) or "operator-direct"
         desc = _frontmatter_value(body, "description") or slug
         # Residency is NOT read from frontmatter (a hand-editable mirror);
         # adopted memories arrive undeclared.
@@ -621,7 +628,7 @@ def _cmd_adopt(args):
                "--hook", desc[:HOOK_MAX_CHARS],
                "--body", body,
                "--session", os.environ.get("CLAUDE_SESSION_ID", "adopt-backfill"),
-               "--lineage", "operator-direct" if lineage == "craig-direct"
+               "--lineage", lineage if lineage == "operator-direct"
                             else "contains-untrusted"]
         if prior:
             cmd += ["--supersedes", ",".join(prior)]
@@ -688,21 +695,22 @@ def _cmd_write(args):
         raise SystemExit(f"error: slug must be kebab-case (letters/digits/hyphens): {args.slug!r}")
     if args.type not in TYPES:
         raise SystemExit(f"error: --type must be one of {sorted(TYPES)}")
+    args.lineage = canon_lineage(args.lineage)
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
 
-    # Session-provenance check on craig-direct claims: if this session touched
+    # Session-provenance check on operator-direct claims: if this session touched
     # untrusted content (web fetch, mail/calendar/drive read) before the write,
     # downgrade to contains-untrusted. No override flag; the write still succeeds.
     args.provenance = None
-    if args.lineage == "craig-direct":
+    if args.lineage == "operator-direct":
         SP = _session_provenance()
         session_id = args.session_id or os.environ.get("CLAUDE_CODE_SESSION_ID")
         if SP is None:
             # Unavailable check: record UNVERIFIED (not clean), but do not downgrade.
             args.provenance = "unverified"
             print("NOTE: session-provenance check unavailable (module not "
-                  "importable) — writing craig-direct as UNVERIFIED, not "
+                  "importable) — writing operator-direct as UNVERIFIED, not "
                   "clean. This is an observation gap, not a block.",
                   file=sys.stderr)
         else:
@@ -711,10 +719,10 @@ def _cmd_write(args):
             if state == "flagged":
                 args.lineage = "contains-untrusted"
                 args.provenance = "flagged-downgraded"
-                print(f"NOTE: craig-direct write DOWNGRADED to "
+                print(f"NOTE: operator-direct write DOWNGRADED to "
                       f"contains-untrusted — this session's own tool-call "
                       f"record shows it touched untrusted content before "
-                      f"this write ({detail}). A craig-direct tag from a "
+                      f"this write ({detail}). A operator-direct tag from a "
                       f"session that just read a Gmail thread or fetched a "
                       f"web page is exactly the GhostWriter mistag B1 "
                       f"measured getting served unscreened. The memory is "
@@ -723,13 +731,13 @@ def _cmd_write(args):
                       f"(memory-mesh/sign.py --promote).", file=sys.stderr)
             elif state == "unverified":
                 print(f"NOTE: session-provenance UNVERIFIED for this write "
-                      f"({detail}) — writing craig-direct without this "
+                      f"({detail}) — writing operator-direct without this "
                       f"second signal, not claiming it as clean.",
                       file=sys.stderr)
 
     # Changing the content of a signed-promoted slug downgrades it to
     # contains-untrusted until re-promoted.
-    if args.lineage == "craig-direct":
+    if args.lineage == "operator-direct":
         target_preview = STORE / f"{args.slug}.md"
         if target_preview.exists():
             SM = _mesh_lib()
@@ -741,7 +749,7 @@ def _cmd_write(args):
                     if new_fingerprint != old_fingerprint:
                         args.lineage = "contains-untrusted"
                         args.provenance = "promotion-revoked"
-                        print(f"NOTE: craig-direct write DOWNGRADED to "
+                        print(f"NOTE: operator-direct write DOWNGRADED to "
                               f"contains-untrusted — '{args.slug}' has a "
                               f"signed operator promotion on record, but "
                               f"this write's content does not match what "
@@ -804,7 +812,7 @@ def _cmd_write(args):
     print(f"--- {target} ---")
     print(rendered)
 
-    index_target = INDEX if args.lineage == "craig-direct" else QUARANTINE
+    index_target = INDEX if args.lineage == "operator-direct" else QUARANTINE
     line = index_line(args)
 
     if not args.commit:
@@ -825,7 +833,7 @@ def _cmd_write(args):
         index_text = index_target.read_text() if index_target.exists() else "# QUARANTINE\n\nUnpromoted contains-untrusted memories.\n"
         if args.supersedes:
             index_text = remove_index_line(index_text, args.supersedes)
-        if args.lineage == "craig-direct":
+        if args.lineage == "operator-direct":
             if args.slug in on_demand_slugs():
                 # Updating an on-demand memory never re-adds it to the index.
                 print(f"note: '{args.slug}' is on-demand (_index-exclude.txt) — "
@@ -854,8 +862,7 @@ def _cmd_write(args):
                "--hook", args.hook,
                "--body", rendered,
                "--session", os.environ.get("CLAUDE_SESSION_ID", "memory-write"),
-               "--lineage", "operator-direct" if args.lineage == "craig-direct"
-                            else "contains-untrusted"]
+               "--lineage", args.lineage]
         if getattr(args, "residency", None):
             cmd += ["--residency", args.residency]
         if getattr(args, "expires", None):
@@ -872,7 +879,7 @@ def _cmd_write(args):
             print(f"mesh: event emitted{f' ({event_id})' if event_id else ''}")
             if args.slug in on_demand_slugs():
                 _emit_tier([args.slug], "ondemand")
-            if args.lineage != "craig-direct" or args.provenance == \
+            if args.lineage != "operator-direct" or args.provenance == \
                     "flagged-downgraded":
                 # Quarantined: print the exact promote command.
                 if event_id:
@@ -1230,9 +1237,10 @@ def set_lineage(text, value):
 def cmd_retag(args):
     """Set `lineage:` on existing memories without touching their content.
 
-    Does not move index lines. Retagging to craig-direct requires either a
+    Does not move index lines. Retagging to operator-direct requires either a
     signed promotion (has_signed_promotion) or --operator-approved words.
     """
+    args.lineage = canon_lineage(args.lineage)
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
     if args.lineage == "contains-untrusted":
@@ -1242,12 +1250,12 @@ def cmd_retag(args):
     # record, not a security control; the signature path remains the strong one.
     approved = (getattr(args, "operator_approved", None) or "").strip()
     PROMOTION_KEY = PROMOTION_VERBAL = None
-    if args.lineage == "craig-direct":
+    if args.lineage == "operator-direct":
         PROMOTION_KEY, PROMOTION_VERBAL, MIN_APPROVAL_WORDS = _promotion_vocab()
-    if approved and args.lineage != "craig-direct":
+    if approved and args.lineage != "operator-direct":
         raise SystemExit(
             "error: --operator-approved only applies when promoting TO "
-            "craig-direct. Approving something INTO quarantine is not a "
+            "operator-direct. Approving something INTO quarantine is not a "
             "promotion, and silently ignoring the flag would teach the caller "
             "it had done something it had not.")
     if approved and len(approved) < MIN_APPROVAL_WORDS:
@@ -1267,7 +1275,7 @@ def cmd_retag(args):
             missing.append(slug)
             continue
         klass = None
-        if args.lineage == "craig-direct":
+        if args.lineage == "operator-direct":
             if approved:
                 klass = PROMOTION_VERBAL
             else:
@@ -1297,7 +1305,7 @@ def cmd_retag(args):
     if unsigned:
         lines = "\n".join(f"    {slug}: {reason}" for slug, reason in unsigned)
         raise SystemExit(
-            "error: refusing to retag to craig-direct:\n" + lines + "\n"
+            "error: refusing to retag to operator-direct:\n" + lines + "\n"
             "  retag no longer decides trust itself; it only executes what a "
             "signed mesh event already declared. Promote first:\n"
             "    memory-mesh/sign.py --promote <event-id>\n"
@@ -1415,6 +1423,7 @@ def cmd_correct(args):
     Writes content, so it takes its own --lineage. Fails closed on any
     ambiguity (zero or multiple matches, frontmatter hits).
     """
+    args.lineage = canon_lineage(args.lineage)
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
     if args.lineage == "contains-untrusted":
@@ -1446,14 +1455,14 @@ def cmd_correct(args):
 
     # Session-provenance check as in `write`, but refused rather than
     # downgraded: correct never changes the note's lineage.
-    if args.lineage == "craig-direct":
+    if args.lineage == "operator-direct":
         SP = _session_provenance()
         session_id = getattr(args, "session_id", None) or os.environ.get("CLAUDE_CODE_SESSION_ID")
         if SP is not None:
             state, detail = SP.state_for_session(session_id)
             if state == "flagged":
                 raise SystemExit(
-                    "error: refusing a craig-direct correction — this "
+                    "error: refusing a operator-direct correction — this "
                     "session's own tool-call record shows it touched "
                     f"untrusted content before this write ({detail}).\n"
                     "  correct cannot quarantine in place (it never touches "
@@ -1586,7 +1595,7 @@ def selftest():
             description="selftest artifact (evals-style ZZ marker, never a "
                         "real memory) — exercises the B2 session-provenance "
                         "check",
-            lineage="craig-direct", rule="selftest artifact — not real",
+            lineage="operator-direct", rule="selftest artifact — not real",
             why=None, how=None, hook="selftest artifact",
             section="Unsorted", residency=None, expires=None,
             supersedes=None, contradicts=None, session_id=None,
@@ -1713,7 +1722,7 @@ def selftest():
         _cmd_write(a)
         p = shadow_store / f"{a.slug}.md"
         check("contains-untrusted lineage: no provenance: line at all "
-              "(check is craig-direct-scoped, by design)",
+              "(check is operator-direct-scoped, by design)",
               p.exists() and "provenance:" not in p.read_text())
 
         # 6. Corrupt provenance log -> unverified, write proceeds.
@@ -1740,7 +1749,7 @@ def selftest():
         finally:
             globals()["_session_provenance"] = real_lookup
 
-        # 8. retag to craig-direct requires a signed promotion.
+        # 8. retag to operator-direct requires a signed promotion.
         a = base_args(slug="zzselftest-b2-retagtarget",
                        lineage="contains-untrusted", session_id="sess-clean")
         _cmd_write(a)
@@ -1753,14 +1762,14 @@ def selftest():
               hsp_ok is False and "never promoted" in hsp_reason)
 
         retag_args = argparse.Namespace(
-            slugs=["zzselftest-b2-retagtarget"], lineage="craig-direct",
+            slugs=["zzselftest-b2-retagtarget"], lineage="operator-direct",
             commit=True, no_git=True, no_push=True)
         refused = False
         try:
             cmd_retag(retag_args)
         except SystemExit:
             refused = True
-        check("retag to craig-direct with NO signed promotion -> refused",
+        check("retag to operator-direct with NO signed promotion -> refused",
               refused)
         check("refused retag left the file's lineage UNCHANGED",
               "lineage: contains-untrusted" in target_file.read_text())
@@ -1774,7 +1783,7 @@ def selftest():
             check("retag SUCCEEDS once has_signed_promotion() confirms a "
                   "signed event (mesh_lib.fold_events' own _signed "
                   "re-verification, not this module's to redo)",
-                  "lineage: craig-direct" in target_file.read_text())
+                  "lineage: operator-direct" in target_file.read_text())
         finally:
             globals()["has_signed_promotion"] = real_hsp
 
@@ -1782,14 +1791,14 @@ def selftest():
         target_file.write_text(set_lineage(target_file.read_text(),
                                            "contains-untrusted"))
         va = argparse.Namespace(
-            slugs=["zzselftest-b2-retagtarget"], lineage="craig-direct",
+            slugs=["zzselftest-b2-retagtarget"], lineage="operator-direct",
             commit=True, no_git=True, no_push=True,
             operator_approved="build it. There is key signed and verbally signed")
         cmd_retag(va)
         after = target_file.read_text()
-        check("verbal approval promotes to craig-direct with NO signed event "
+        check("verbal approval promotes to operator-direct with NO signed event "
               "(the whole point of the ruling)",
-              "lineage: craig-direct" in after)
+              "lineage: operator-direct" in after)
         check("a verbal promotion is STAMPED verbally-signed, so it can never "
               "be mistaken for a key-signed one",
               "promotion: verbally-signed" in after)
@@ -1804,7 +1813,7 @@ def selftest():
             refused = False
             try:
                 cmd_retag(argparse.Namespace(
-                    slugs=["zzselftest-b2-retagtarget"], lineage="craig-direct",
+                    slugs=["zzselftest-b2-retagtarget"], lineage="operator-direct",
                     commit=True, no_git=True, no_push=True,
                     operator_approved=bad))
             except SystemExit:
@@ -1833,7 +1842,7 @@ def selftest():
             target_file.write_text(set_lineage(target_file.read_text(),
                                                "contains-untrusted"))
             cmd_retag(argparse.Namespace(
-                slugs=["zzselftest-b2-retagtarget"], lineage="craig-direct",
+                slugs=["zzselftest-b2-retagtarget"], lineage="operator-direct",
                 commit=True, no_git=True, no_push=True,
                 operator_approved=None))
             check("a KEY-signed promotion is stamped too, so an unstamped file "
@@ -1870,11 +1879,11 @@ def selftest():
 
         (shadow_store / "zzselftest-b3-stale.md").write_text(
             "---\nname: zzselftest-b3-stale\ndescription: d\n"
-            "lineage: craig-direct\nmetadata:\n  node_type: memory\n"
+            "lineage: operator-direct\nmetadata:\n  node_type: memory\n"
             "  type: user\n---\n\nchanged after promotion\n")
         (shadow_store / "zzselftest-b3-legacy.md").write_text(
             "---\nname: zzselftest-b3-legacy\ndescription: d\n"
-            "lineage: craig-direct\nmetadata:\n  node_type: memory\n"
+            "lineage: operator-direct\nmetadata:\n  node_type: memory\n"
             "  type: user\n---\n\nlegacy content\n")
 
         globals()["_mesh_lib"] = lambda: _FakeMeshLib()
@@ -1894,10 +1903,10 @@ def selftest():
 
         # 8c. content_fingerprint() ignores lineage, tracks the body.
         M_real = real_mesh_lib()
-        text_a = ("---\nname: x\ndescription: d\nlineage: craig-direct\n"
+        text_a = ("---\nname: x\ndescription: d\nlineage: operator-direct\n"
                   "metadata:\n  node_type: memory\n  type: user\n---\n\nbody\n")
         text_b_same_content_diff_lineage = text_a.replace(
-            "lineage: craig-direct", "lineage: contains-untrusted")
+            "lineage: operator-direct", "lineage: contains-untrusted")
         text_c_diff_body = text_a.replace("body\n", "DIFFERENT body\n")
         check("content_fingerprint(): identical body, different lineage "
               "line -> SAME fingerprint (invariant under retag's one "
@@ -1912,7 +1921,7 @@ def selftest():
         # 8d. Overwriting a signed-promoted memory with new content downgrades it.
         promoted_slug = "zzselftest-b3-writepath"
         (shadow_store / f"{promoted_slug}.md").write_text(
-            "---\nname: %s\ndescription: d\nlineage: craig-direct\n"
+            "---\nname: %s\ndescription: d\nlineage: operator-direct\n"
             "metadata:\n  node_type: memory\n  type: user\n---\n\n"
             "original signed content\n" % promoted_slug)
         fake_signed_writepath = {
@@ -1941,7 +1950,7 @@ def selftest():
             body = (shadow_store / f"{promoted_slug}.md").read_text()
             check("write-path twin: overwriting a signed-promoted memory "
                   "with DIFFERENT content, clean session, DOWNGRADES to "
-                  "contains-untrusted (not silently kept craig-direct)",
+                  "contains-untrusted (not silently kept operator-direct)",
                   "lineage: contains-untrusted" in body)
             check("write-path twin: stamped provenance: promotion-revoked",
                   "provenance: promotion-revoked" in body)
@@ -1951,7 +1960,7 @@ def selftest():
         # A write with no prior signed promotion is unaffected.
         wa2 = base_args(slug="zzselftest-b2-clean", session_id="sess-clean")
         _cmd_write(wa2)
-        check("write-path twin: an ordinary craig-direct write with no "
+        check("write-path twin: an ordinary operator-direct write with no "
               "prior signed promotion on record is UNAFFECTED",
               "provenance: promotion-revoked" not in
               (shadow_store / "zzselftest-b2-clean.md").read_text())
@@ -1981,7 +1990,7 @@ def selftest():
         correct_args = argparse.Namespace(
             slug="zzselftest-b2-clean", old="not real",
             new="not real (corrected in a flagged session — should refuse)",
-            lineage="craig-direct", in_description=False,
+            lineage="operator-direct", in_description=False,
             reason="selftest", stamp="2026-08-06", commit=True,
             no_git=True, no_push=True, session_id="sess-flagged")
         before_body = (shadow_store / "zzselftest-b2-clean.md").read_text()
@@ -1990,14 +1999,14 @@ def selftest():
             cmd_correct(correct_args)
         except SystemExit:
             refused = True
-        check("correct with --lineage craig-direct from a FLAGGED session "
+        check("correct with --lineage operator-direct from a FLAGGED session "
               "-> refused", refused)
         check("refused correction left the body UNCHANGED",
               (shadow_store / "zzselftest-b2-clean.md").read_text() == before_body)
 
         correct_args.session_id = "sess-clean"
         cmd_correct(correct_args)
-        check("correct with --lineage craig-direct from a CLEAN session "
+        check("correct with --lineage operator-direct from a CLEAN session "
               "-> succeeds",
               "corrected in a flagged session" in
               (shadow_store / "zzselftest-b2-clean.md").read_text())
@@ -2018,7 +2027,7 @@ def selftest():
         with contextlib.redirect_stdout(buf):
             _cmd_adopt(adopt_args)
         check("adopt refuses to silently default an UNTAGGED file to "
-              "craig-direct without a signed promotion",
+              "operator-direct without a signed promotion",
               "untagged file, never promoted" in buf.getvalue())
 
         # adopt bounds --content to INDEX_CONTENT_CHARS.
@@ -2027,7 +2036,7 @@ def selftest():
         longf.write_text(
             f"---\nname: zzselftest-b2-longdesc\n"
             f"description: {long_desc}\n"
-            "lineage: craig-direct\nprovenance: clean\n"
+            "lineage: operator-direct\nprovenance: clean\n"
             "metadata:\n  node_type: memory\n  type: user\n---\n\n"
             "body long enough to adopt\n")
         seen = []
@@ -2116,7 +2125,7 @@ def main():
     r.add_argument("slugs", nargs="+")
     r.add_argument("--lineage", required=True, help=" | ".join(sorted(LINEAGES)))
     r.add_argument("--operator-approved", metavar="WORDS",
-                   help="promote to craig-direct on the owner's VERBAL approval "
+                   help="promote to operator-direct on the owner's VERBAL approval "
                         "instead of a signed mesh event (2026-08-12). Value must "
                         "be his verbatim words; they are recorded in the file. "
                         "Weaker than a signature and stamped as such.")
@@ -2207,7 +2216,7 @@ def main():
     w.add_argument("--slug", required=True)
     w.add_argument("--type", required=True)
     w.add_argument("--description", required=True)
-    w.add_argument("--lineage", default="craig-direct")
+    w.add_argument("--lineage", default="operator-direct")
     w.add_argument("--rule", required=True, help="the lesson/fact body text")
     w.add_argument("--why")
     w.add_argument("--how")
@@ -2234,6 +2243,8 @@ def main():
     w.set_defaults(func=cmd_write)
 
     args = ap.parse_args()
+    if getattr(args, "lineage", None):
+        args.lineage = canon_lineage(args.lineage)
     if args.selftest:
         return selftest()
     if not args.cmd:

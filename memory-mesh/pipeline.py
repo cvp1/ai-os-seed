@@ -10,7 +10,7 @@ Usage:
     /usr/bin/python3 pipeline.py harvest <file>... [--topic X]
     /usr/bin/python3 pipeline.py dedup --slug foo-bar [--keywords "a b c"]
     /usr/bin/python3 pipeline.py stage --slug foo-bar --type feedback \\
-        --description "..." --lineage craig-direct|contains-untrusted \\
+        --description "..." --lineage operator-direct|contains-untrusted \\
         --rule "..." [--why "..." --how "..."] --hook "..." --section "..." \\
         --not-implied-by "what PRINCIPLES.md does not force here" \\
         [--supersedes s] [--contradicts s] [--session-id id]
@@ -49,7 +49,9 @@ STORE = _store()
 MEMORY_WRITE = Path(__file__).resolve().parent / "memory_write.py"
 
 TYPES = {"feedback", "user", "project", "reference"}
-LINEAGES = {"craig-direct", "contains-untrusted"}
+LINEAGES = {"operator-direct", "contains-untrusted"}
+# Legacy spelling of operator-direct; accepted on input.
+LEGACY_LINEAGES = {"craig-direct": "operator-direct"}
 SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 # ---- bounds (every loop and output is capped) -------------------------------
@@ -308,6 +310,8 @@ def _structural_problems(a):
 
 def stage(a, store=STORE):
     """Run the structural filter and return the memory_write.py preview/commit commands; executes nothing."""
+    if a.get("lineage") in LEGACY_LINEAGES:
+        a = dict(a, lineage=LEGACY_LINEAGES[a["lineage"]])
     problems, warnings = _structural_problems(a)
 
     ded = None
@@ -405,7 +409,7 @@ def _selftest():
         store.mkdir()
         (store / "solar-tilt-lesson.md").write_text(
             "---\nname: solar-tilt-lesson\ndescription: \"panel tilt angle "
-            "seasonal adjustment lesson\"\nlineage: craig-direct\n---\n\nBody about solar tilt.\n")
+            "seasonal adjustment lesson\"\nlineage: operator-direct\n---\n\nBody about solar tilt.\n")
         (store / "quarantined-note.md").write_text(
             "---\nname: quarantined-note\ndescription: \"untrusted thing\"\n"
             "lineage: contains-untrusted\n---\n\nBody.\n")
@@ -439,7 +443,7 @@ def _selftest():
 
         # --- stage ---
         base = dict(slug="new-lesson", type="feedback",
-                    description="a new lesson", lineage="craig-direct",
+                    description="a new lesson", lineage="operator-direct",
                     rule="Do it this way.", why="Because.", how="Like so.",
                     hook="new lesson hook",
                     not_implied_by="a measured host literal no principle forces",
