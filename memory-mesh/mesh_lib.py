@@ -25,6 +25,11 @@ import time
 from pathlib import Path
 
 CODE_DIR = Path(__file__).resolve().parent
+# Where this host's copy lives, home-abbreviated, for operator-facing commands.
+# Views are per-host, so a host-specific path is safe.
+_HOME = Path.home()
+CODE_DIR_SHOWN = ("~/" + str(CODE_DIR.relative_to(_HOME))
+                  if CODE_DIR.is_relative_to(_HOME) else str(CODE_DIR))
 MESH_ROOT = Path(os.environ.get("MESH_ROOT", os.path.expanduser("~/memory-events")))
 
 
@@ -1139,11 +1144,11 @@ def render_views(fold, audience):
             "# contradict a served fact. Two promotion routes (2026-08-12):",
             "#",
             "#   key-signed (strongest — an agent cannot produce this):",
-            "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <id>",
+            f"#     python3 {CODE_DIR_SHOWN}/sign.py --promote <id>",
             "#   verbally-signed (the owner reasoned it through and said yes;",
             "#   an AUDIT record, not a cryptographic gate — buys `served`,",
             "#   never `pinned`/`doctrine`):",
-            "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <id> \\",
+            f"#     python3 {CODE_DIR_SHOWN}/sign.py --promote-verbal <id> \\",
             "#            --approved \"<his verbatim words>\"",
             "#",
             "# or drop one by emitting a retract that supersedes it. Doing nothing is",
@@ -1495,11 +1500,11 @@ def render_store_quarantine(fold):
         "# tombstone, never the body). NOT standing policy.",
         "#",
         "# PROMOTE, key-signed (needs the owner's passphrase-gated key — an agent cannot):",
-        "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote <event-id>",
+        f"#     python3 {CODE_DIR_SHOWN}/sign.py --promote <event-id>",
         "# PROMOTE, verbally-signed (the owner's spoken approval, recorded verbatim.",
         "# An agent CAN write this — it is an audit record, not a gate. Serves,",
         "# but never reaches pinned/doctrine):",
-        "#     python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote-verbal <event-id> \\",
+        f"#     python3 {CODE_DIR_SHOWN}/sign.py --promote-verbal <event-id> \\",
         "#            --approved \"<his verbatim words>\"",
         "# REJECT: emit a retract superseding the event, then delete the file.",
         "#",

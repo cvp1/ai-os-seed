@@ -661,6 +661,115 @@ def _cmd_adopt(args):
     return 0
 
 
+def _sync_refusal(M, tip, f, members):
+    """Why `sync` must not overwrite store file `f` from `tip`, or None."""
+    if tip is None:
+        return "no live event for this subject"
+    if tip.get("kind") != "lesson" or not M.event_carries_body(tip):
+        return "live tip carries no body (nothing to project)"
+    if M.RECONSTRUCTED_MARK in tip["body"]:
+        return ("live tip is a fold reconstruction (a stub of the original "
+                "event) — it must never overwrite a real file")
+    if canon_lineage(tip.get("lineage")) != "operator-direct":
+        return f"tip lineage is {tip.get('lineage')!r}, not operator-direct"
+    if tip.get("audience") not in M.BODY_AUDIENCES:
+        return f"tip audience {tip.get('audience')!r} may not carry a body"
+    if tip.get("host") not in members:
+        return f"tip host {tip.get('host')!r} is not a mesh member"
+    if not f.exists() or f.is_symlink():
+        return "no regular store file (fold --project creates missing ones)"
+    if f.read_text(encoding="utf-8") == tip["body"]:
+        return "already in sync"
+    tip_ts = datetime.datetime.fromisoformat(
+        tip["ts"].replace("Z", "+00:00")).timestamp()
+    if f.stat().st_mtime >= tip_ts:
+        return ("store file is NEWER than the tip — may hold a local edit; "
+                "resolve with adopt --reconcile (file wins) after review")
+    return None
+
+
+def cmd_sync(args):
+    return _locked(_cmd_sync, args)
+
+
+def _cmd_sync(args):
+    """EVENT WINS on a store/event divergence — the mirror of `adopt --reconcile`.
+
+    For a store file left behind its event: the projector only overwrites from
+    a SIGNED tip, chain-walked signed bodies are create-only, and the batch
+    attestation (docs/DESIGN-signed-bodies.md §3) is not built — so the only
+    offered fix was `adopt --reconcile` (FILE wins), which would push stale
+    text back over a newer correction fleet-wide.
+
+    Operator-invoked only, never the timer. Emits NO event: the log is already
+    right, only this host's projection is behind. Refuses unless:
+      * the live tip of lesson/<slug> is a `lesson` carrying a body, lineage
+        operator-direct, audience operator/shared, written by a mesh member;
+      * the store file is a regular file OLDER than the tip (a newer file may
+        hold a local edit — that is `adopt --reconcile`'s case).
+    Prints the diff and whether the file equals an older body in the subject's
+    chain (lossless). The replaced file goes to ~/.Trash with a dated name.
+    """
+    import difflib
+    import shutil
+    M = _mesh_lib()
+    if M is None:
+        raise SystemExit("sync: memory-mesh not importable")
+    events, _ = M.read_all_events()
+    fold = M.fold_events(events, M.load_registry())
+    by_id = {e["id"]: e for e in events}
+    members = {M.HOST} | {h for h, _ in M.peers()}
+    live = {e["subject"]: e for e in fold["live"]}
+    done, skipped = [], []
+    today = datetime.date.today().isoformat()
+    for slug in args.slugs:
+        if not SLUG_RE.match(slug):
+            skipped.append((slug, "not a valid slug"))
+            continue
+        tip = live.get(f"lesson/{slug}")
+        f = STORE / f"{slug}.md"
+        why = _sync_refusal(M, tip, f, members)
+        if why:
+            skipped.append((slug, why))
+            continue
+        cur, want = f.read_text(encoding="utf-8"), tip["body"]
+        lossless = any(M.event_carries_body(a) and a["body"] == cur
+                       for a in M._chain(tip, by_id))
+        print(f"\n=== {slug}  tip {tip['id']} {tip['host']} {tip['ts']}  "
+              f"[{'file = older event body, lossless' if lossless else 'file pre-dates bodies in the log; old text kept in Trash'}]")
+        for l in list(difflib.unified_diff(cur.splitlines(), want.splitlines(),
+                                           "file (stale)", "event (wins)",
+                                           lineterm="", n=0))[:args.diff_lines]:
+            print(f"    {l[:160]}")
+        if not args.commit:
+            done.append(slug)
+            continue
+        if not args.yes:
+            try:
+                ans = input(f"sync {slug} (event wins)? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
+            if ans != "y":
+                skipped.append((slug, "declined"))
+                continue
+        trash = Path.home() / ".Trash" / f"{slug}_{today}.md"
+        n = 1
+        while trash.exists():
+            n += 1
+            trash = trash.with_name(f"{slug}_{today}-{n}.md")
+        shutil.copy2(f, trash)
+        _write_store_file(f, want)
+        done.append(slug)
+        print(f"synced {slug} (old file -> {trash})")
+    print(f"\n{'synced' if args.commit else 'would sync'}: {len(done)}"
+          f" | skipped: {len(skipped)}")
+    for slug, why in skipped:
+        print(f"  skip {slug}: {why}")
+    if not args.commit:
+        print("(dry run — pass --commit to apply)")
+    return 0
+
+
 def cmd_write(args):
     """Run _cmd_write under the door lock (budget read through mesh emit).
 
@@ -2086,6 +2195,54 @@ def selftest():
             returncode, stdout, stderr = 1, "", "emit: line one\n  and line two"
         check("proc_error keeps a multi-line hand-written error whole",
               "line two" in proc_error(_Plain()))
+
+        # sync (event wins): every refusal path, against fabricated tips.
+        M = _mesh_lib()
+        sf = shadow_store / "zzselftest-b2-sync.md"
+        sf.write_text("old body\n", encoding="utf-8")
+        old = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc).timestamp()
+        os.utime(sf, (old, old))
+        members = {"memory-write-selftest", "peer-a"}
+
+        def tip(**over):
+            t = {"id": "t1", "kind": "lesson", "lineage": "operator-direct",
+                 "audience": "operator", "host": "peer-a",
+                 "ts": "2026-06-01T00:00:00Z", "body": "new body\n"}
+            t.update(over)
+            return t
+
+        def refusal(t, f=sf):
+            return _sync_refusal(M, t, f, members) or ""
+
+        check("sync: a clean operator-direct tip from a member is accepted",
+              refusal(tip()) == "")
+        check("sync: legacy craig-direct lineage is accepted",
+              refusal(tip(lineage="craig-direct")) == "")
+        check("sync refuses: no live tip", "no live event" in refusal(None))
+        check("sync refuses: bodiless tip",
+              "no body" in refusal(tip(body=None)))
+        check("sync refuses: a fold reconstruction stub",
+              "reconstruction" in refusal(
+                  tip(body=f"---\n{M.RECONSTRUCTED_MARK}\n---\nstub\n")))
+        check("sync refuses: non-operator-direct lineage",
+              "not operator-direct" in refusal(tip(lineage="agent-inferred")))
+        check("sync refuses: audience outside BODY_AUDIENCES",
+              "may not carry a body" in refusal(tip(audience="host")))
+        check("sync refuses: a non-member host",
+              "not a mesh member" in refusal(tip(host="stranger")))
+        check("sync refuses: missing store file",
+              "no regular store file" in refusal(
+                  tip(), shadow_store / "zzselftest-b2-absent.md"))
+        link = shadow_store / "zzselftest-b2-link.md"
+        link.symlink_to(sf)
+        check("sync refuses: a symlinked store file",
+              "no regular store file" in refusal(tip(), link))
+        link.unlink()
+        check("sync refuses: file already in sync",
+              "already in sync" in refusal(tip(body="old body\n")))
+        check("sync refuses: store file newer than the tip",
+              "NEWER" in refusal(tip(ts="2025-01-01T00:00:00Z")))
+        sf.unlink()
     finally:
         STORE = real_store
         INDEX = real_store / "MEMORY.md"
@@ -2192,6 +2349,17 @@ def main():
                          "only other path (signing the stale event) silently "
                          "destroys the correction. Prints the diff first.")
     ad.set_defaults(func=cmd_adopt)
+    sy = sub.add_parser("sync",
+                        help="EVENT WINS: bring a stale store file up to its "
+                             "live operator-direct tip from a mesh member "
+                             "(no new event; old file moved to ~/.Trash)")
+    sy.add_argument("slugs", nargs="+")
+    sy.add_argument("--yes", action="store_true",
+                    help="skip the per-item confirmation (reviewed batch only)")
+    sy.add_argument("--commit", action="store_true",
+                    help="apply (default is dry-run)")
+    sy.add_argument("--diff-lines", type=int, default=30)
+    sy.set_defaults(func=cmd_sync)
 
     x = sub.add_parser("delete", help="delete memories whose fact now lives in its one home")
     x.add_argument("slugs", nargs="+")

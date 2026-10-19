@@ -101,7 +101,7 @@ def notify_held_residency(harness):
     lines += ["  + " + s for s in key["added"]]
     lines += ["  - " + s for s in key["dropped"]]
     lines += ["Every session loads the pre-hold index until you decide.",
-              "Run: python3 ~/{{REDACTED}}/memory-mesh/fold.py "
+              f"Run: python3 {M.CODE_DIR_SHOWN}/fold.py "
               "--promote-residency"]
     _tg_push("\n".join(lines)[:3500])
     state_f.parent.mkdir(parents=True, exist_ok=True)
@@ -396,6 +396,13 @@ def main():
 
     # Publish the retrieval tier's servable manifest from the same fold.
     alarms.extend(M.write_servable_manifest(fold).get("alarms", []))
+    # Prebuilt retrieval index, stamped with the manifest just written; a failure
+    # only costs the hook speed (it falls back to the scan) and never breaks the fold.
+    try:
+        import retrieve as _R
+        alarms.extend(_R.write_index(store).get("alarms", []))
+    except Exception as e:  # noqa: BLE001
+        alarms.append(f"retrieval index build failed: {e}")
 
     # Detect (never fix) drift between per-file `lineage:` and the fold's quarantine view.
     if M.harness_store():
@@ -467,7 +474,7 @@ def main():
             print(f"[PARKED ] {s} — opposing/inconsistent claims; see CONFLICTS.md")
         for e in fold["quarantined"]:
             print(f"[QUARANT] {e['subject']} (id {e['id']}) — untrusted lineage, "
-                  f"NOT served; promote with python3 ~/{{REDACTED}}/memory-mesh/sign.py --promote {e['id']}")
+                  f"NOT served; promote with python3 {M.CODE_DIR_SHOWN}/sign.py --promote {e['id']}")
         for a in alarms:
             print(f"[ALARM  ] {a}")
         for p in problems:

@@ -384,3 +384,49 @@ with mock.patch.object(index_growth, "snapshot", return_value={
         self.assertIn("effectiveness: influx write skipped", r.stderr)
         self.assertIn("index_growth: skipped", r.stderr)
         self.assertIn("_lib.influx", r.stderr)
+
+
+class RetrievalIndexTests(unittest.TestCase):
+    """The prebuilt index must rank exactly like the scan, and must be refused
+    when its stamps no longer match the live manifest or store."""
+
+    def _store(self, d):
+        store = Path(d) / "store"
+        store.mkdir()
+        bodies = {
+            "battery-reserve": ("keep the powerwall battery reserve above twenty percent",
+                                "battery reserve rule for storms and outages"),
+            "radio-power": ("never transmit above fifty watts on the shared antenna",
+                            "radio power ceiling on the shared antenna"),
+            "hook-latency": ("hooks on the tool path must stay under fifty milliseconds",
+                             "hook latency budget for the agent tool path"),
+            "battery-cycles": ("battery cycles are logged daily by the energy job",
+                               "battery cycle logging"),
+        }
+        for slug, (body, desc) in bodies.items():
+            (store / f"{slug}.md").write_text(
+                f"---\nname: {slug}\ndescription: {desc}\n---\n{body}\n")
+        return store, {"generated": "g1", "slugs": list(bodies)}
+
+    def test_index_ranks_exactly_like_scan(self):
+        with tempfile.TemporaryDirectory() as d:
+            store, man = self._store(d)
+            idx = retrieve.build_index(store, man)
+            docs = retrieve.corpus(store, set(man["slugs"]))
+            for q in ("battery reserve during outages", "radio antenna power",
+                      "hook latency on the tool path", "battery", "nothing matches xyzzy"):
+                for k in (1, 3, 5):
+                    self.assertEqual(retrieve.score(q, docs, k), retrieve.score_index(q, idx, k), (q, k))
+
+    def test_stale_index_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            store, man = self._store(d)
+            idx = retrieve.build_index(store, man)
+            path = Path(d) / "retrieval-index.json"
+            path.write_text(__import__("json").dumps(idx))
+            with mock.patch.object(retrieve, "index_path", return_value=path):
+                self.assertIsNotNone(retrieve.load_index(store, man))
+                self.assertIsNone(retrieve.load_index(store, dict(man, generated="g2")))
+                (store / "new-fact.md").write_text("---\ndescription: x\n---\nx\n")
+                os.utime(store, ns=(1, 1))
+                self.assertIsNone(retrieve.load_index(store, man))

@@ -18,7 +18,11 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import mesh_lib as M  # noqa: E402
 
-TOP_K = 5
+# k=3 and the short-prompt skip come from a blind-labelled sample of live
+# prompts: nearly all useful hits ranked in the top 3, and prompts under
+# MIN_PROMPT_WORDS words got none. The skip applies at the hook entry only.
+TOP_K = 3
+MIN_PROMPT_WORDS = 4
 MAX_INJECT_BYTES = 1400
 # Ingested spans excluded from scoring so they cannot steer retrieval.
 FENCE_RX = re.compile(
@@ -109,15 +113,130 @@ def fence(text):
     return FENCE_RX.sub(" ", text or "")
 
 
+# ---------------------------------------------------------------------------
+# Prebuilt index. Reading every store file and re-tokenizing them on every prompt was ~170 ms of the hook's cost;
+# loading this index is ~15 ms. The fold builds it right after it publishes
+# the manifest, from the same servable set, and stamps it with that
+# manifest's `generated` value. retrieve() uses it only when every stamp
+# still matches; otherwise it falls back to the scan below, which is the
+# reference implementation and gives the same ranking. A stale or missing
+# index costs speed, never correctness of the servable filter.
+# ---------------------------------------------------------------------------
+INDEX_VERSION = 1
+
+
+def index_path():
+    return M.MESH_ROOT / "state" / "retrieval-index.json"
+
+
+def _manifest_doc(path=None):
+    p = path if path is not None else M.servable_manifest_path()
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _store_stamp(store):
+    """Directory mtime: changes whenever a store file is added, removed or
+    atomically replaced. An in-place edit between folds is not seen; the next
+    fold (5-minute timer) rebuilds the index."""
+    return os.stat(store).st_mtime_ns
+
+
+def build_index(store, manifest_doc):
+    """Inverted index over exactly the docs corpus() would score."""
+    allow = set(manifest_doc.get("slugs") or [])
+    docs, postings = [], {}
+    for i, (slug, desc, text) in enumerate(corpus(store, allow)):
+        tf = {}
+        for w in _tok(desc) * 3 + _tok(text):
+            tf[w] = tf.get(w, 0) + 1
+        docs.append([slug, desc, sum(tf.values())])
+        for w, c in tf.items():
+            postings.setdefault(w, []).append([i, c])
+    return {"version": INDEX_VERSION, "store": str(store),
+            "store_mtime_ns": _store_stamp(store),
+            "manifest_generated": manifest_doc.get("generated"),
+            "docs": docs, "postings": postings}
+
+
+def write_index(store=None):
+    """Called by the fold after write_servable_manifest. Never raises."""
+    try:
+        store = store or M.harness_store()
+        man = _manifest_doc()
+        if store is None or man is None:
+            return {"status": "skipped", "alarms": []}
+        idx = build_index(store, man)
+        path = index_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp.write_text(json.dumps(idx, separators=(",", ":")), encoding="utf-8")
+        os.replace(tmp, path)
+        return {"status": "written", "entries": len(idx["docs"]), "alarms": []}
+    except Exception as e:  # noqa: BLE001
+        return {"status": "failed", "alarms": [f"retrieval index write failed: {e}"]}
+
+
+def load_index(store, manifest_doc):
+    """The index if every stamp matches the live manifest and store, else None."""
+    try:
+        idx = json.loads(index_path().read_text(encoding="utf-8"))
+        if (idx.get("version") == INDEX_VERSION
+                and idx.get("store") == str(store)
+                and idx.get("manifest_generated") == manifest_doc.get("generated")
+                and idx.get("store_mtime_ns") == _store_stamp(store)):
+            return idx
+    except Exception:  # noqa: BLE001 — missing/corrupt index means scan
+        pass
+    return None
+
+
+def score_index(turn_text, idx, k=TOP_K):
+    """score() over the inverted index. Same terms, same arithmetic, same
+    per-doc summation order (outer loop over the query set), same sort."""
+    qs = set(_tok(turn_text))
+    if not qs:
+        return []
+    docs, postings = idx["docs"], idx["postings"]
+    n = len(docs) or 1
+    acc = {}
+    for w in qs:
+        plist = postings.get(w)
+        if not plist:
+            continue
+        idf = math.log(1 + n / (1 + len(plist)))
+        for i, c in plist:
+            acc[i] = acc.get(i, 0.0) + (1 + math.log(c)) * idf
+    scored = [(s / math.sqrt(docs[i][2] or 1), docs[i][0], docs[i][1])
+              for i, s in acc.items() if s > 0]
+    scored.sort(reverse=True)
+    return scored[:k]
+
+
+LAST_PATH = None   # "index" | "scan": which path the last retrieve() took
+
+
 def retrieve(turn_text, store=None, k=TOP_K, manifest=None):
-    """Return top-k servable memories for this turn; [] if the manifest is missing (fails closed)."""
+    """Return top-k servable memories for this turn; [] if the manifest is missing (fails closed).
+    Uses the prebuilt index only on the live defaults, so drills and canaries exercise the scan."""
+    global LAST_PATH
+    live = store is None and manifest is None
     store = store or M.harness_store()
-    allow = servable(path=manifest)
+    man = _manifest_doc(manifest)
+    allow = set(man.get("slugs") or []) if isinstance(man, dict) else None
     if allow is None:
         if store is not None:
             print("retrieve: no servable manifest — recall SUPPRESSED until "
                   "the next fold publishes one", file=sys.stderr)
         return []
+    if live and store is not None:
+        idx = load_index(store, man)
+        if idx is not None:
+            LAST_PATH = "index"
+            return score_index(fence(turn_text), idx, k)
+    LAST_PATH = "scan"
     return score(fence(turn_text), corpus(store, allow), k)
 
 
@@ -132,6 +251,8 @@ def log_injection(turn_text, hits, path=None):
         rec = {"ts": round(time.time(), 3),
                "chars": len(turn_text or ""),
                "hits": [{"slug": s, "score": round(sc, 4)} for sc, s, _ in hits]}
+        if LAST_PATH:
+            rec["path"] = LAST_PATH      # additive: "index" or "scan"
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\n")
     except Exception:
@@ -166,7 +287,8 @@ def main():
             or ev.get("tool_response") or raw or "")
     if isinstance(turn, (dict, list)):
         turn = json.dumps(turn)
-    hits = retrieve(turn)
+    words = re.findall(r"[a-z0-9][a-z0-9_-]{2,}", fence(turn).lower())
+    hits = retrieve(turn) if len(words) >= MIN_PROMPT_WORDS else []
     log_injection(turn, hits)
     out = render(hits)
     if out:

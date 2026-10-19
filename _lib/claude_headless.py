@@ -195,7 +195,11 @@ def build_cmd(prompt, *, model=None, allowed_tools="", output_format="json",
             "claude_headless: _BUILTIN_TOOLS is empty, so a call cannot be "
             "guarded. Refusing to build an unguarded command.")
     # Accept both "Read Grep Glob" and "Read,Edit,Write" allowlist forms.
-    keep = {t for t in re.split(r"[,\s]+", tools) if t}
+    # A scoped allow rule ("Edit(//abs/path/**)") keeps its TOOL out of the
+    # denylist; without this the bare "Edit" deny overrode the scoped allow and
+    # a path-scoped agent got no Edit at all (deny beats allow). 2026-10-18,
+    # first caller: _lib/frontier_onboard.py.
+    keep = {t.split("(", 1)[0] for t in re.split(r"[,\s]+", tools) if t}
     deny = [t for t in _BUILTIN_TOOLS if t not in keep]
     for d in (extra_deny or []):
         if d and d not in deny:
