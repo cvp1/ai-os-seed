@@ -1,0 +1,108 @@
+{
+  "_doc": "memory-mesh bridge: one memory, every model. Sources feed recall; lanes decide which data classes a model may see; targets wire a harness to the memory. A host-local ~/.config/memory-mesh/bridge.json deep-merges over this file (same keys). See BRIDGE.md.",
+
+  "python": "/usr/bin/python3",
+
+  "sources": {
+    "mesh": {
+      "_doc": "The fleet memory corpus: only what the fold publishes as servable.",
+      "type": "mesh",
+      "enabled": true,
+      "weight": 1.0,
+      "always_on": true
+    },
+    "vault-fleet": {
+      "_doc": "Example markdown source, off by default. Turn on per host in the local bridge.json.",
+      "type": "markdown_dir",
+      "enabled": false,
+      "weight": 0.6,
+      "path": "~/notes/00 Meta/Fleet",
+      "glob": "*.md",
+      "data_class": "personal"
+    },
+    "external-example": {
+      "_doc": "Example command source, off by default. Any program that speaks the JSON protocol in BRIDGE.md can be a source.",
+      "type": "command",
+      "enabled": false,
+      "weight": 0.5,
+      "argv": ["/usr/bin/python3", "/path/to/your_source.py"],
+      "timeout": 5
+    }
+  },
+
+  "lanes": {
+    "_doc": "allow = data classes this lane may receive. 'unknown' means the class could not be decided (for example the client-terms file is missing).",
+    "_max_chars": "Static-context budget per lane in characters (default 3500, about 900 tokens). Recall reaches everything else.",
+    "claude": {"allow": ["personal", "employer-client", "unknown"], "max_chars": 9500},
+    "local":  {"allow": ["personal", "employer-client", "unknown"], "max_chars": 2500},
+    "codex":  {"allow": ["personal"]},
+    "grok":   {"allow": ["personal"]},
+    "gemini": {"allow": ["personal"]},
+    "corral": {"allow": ["personal"]},
+    "default": {"allow": ["personal"]}
+  },
+
+  "targets": {
+    "claude-session": {
+      "_doc": "Claude Code outside a fold-generated folder: SessionStart hook injects this render.",
+      "type": "render_only", "lane": "claude"
+    },
+    "codex": {
+      "type": "static_file", "lane": "codex", "path": "~/.codex/AGENTS.md"
+    },
+    "codex-corral": {
+      "type": "static_file", "lane": "codex",
+      "path": "~/.config/corral-light/codex-home/AGENTS.md"
+    },
+    "gemini": {
+      "_doc": "Antigravity and Gemini read this as global rules.",
+      "type": "static_file", "lane": "gemini", "path": "~/.gemini/GEMINI.md"
+    },
+    "grok": {
+      "type": "static_file", "lane": "grok", "path": "~/.grok/memory/MEMORY.md"
+    },
+    "opencode": {
+      "_doc": "The opencode plugin reads the local-lane render when the session's provider is local (Ollama).",
+      "type": "render_only", "lane": "local"
+    },
+    "opencode-cloud": {
+      "_doc": "...and this strict render for any other provider.",
+      "type": "render_only", "lane": "default"
+    },
+
+    "mcp-claude": {
+      "type": "mcp_cli", "lane": "claude",
+      "probe": ["~/.local/bin/claude", "mcp", "get", "memory"],
+      "add": ["~/.local/bin/claude", "mcp", "add", "--scope", "user", "memory", "--", "{python}", "{mcp_server}", "--lane", "claude"],
+      "remove": ["~/.local/bin/claude", "mcp", "remove", "--scope", "user", "memory"]
+    },
+    "mcp-codex": {
+      "type": "mcp_toml", "lane": "codex", "path": "~/.codex/config.toml"
+    },
+    "mcp-grok": {
+      "type": "mcp_toml", "lane": "grok", "path": "~/.grok/config.toml"
+    },
+    "mcp-opencode": {
+      "_doc": "Strict lane: one stdio server cannot see which provider an opencode session uses, so the tool door assumes cloud. Local sessions still get the local render through the plugin.",
+      "type": "mcp_opencode", "lane": "default", "path": "~/.config/opencode/opencode.json"
+    },
+    "mcp-corral": {
+      "_doc": "Every Corral pane on every lane gets this server through Corral's own MCP proxy.",
+      "type": "mcp_cli", "lane": "corral", "path": "~/.config/corral-light/mcp.json",
+      "probe": ["/usr/bin/python3", "~/corral-light/mcp.py", "test", "memory"],
+      "add": ["/usr/bin/python3", "~/corral-light/mcp.py", "add", "memory", "--stdio", "{python}", "--arg={mcp_server}", "--arg=--lane", "--arg=corral"],
+      "remove": ["/usr/bin/python3", "~/corral-light/mcp.py", "remove", "memory"]
+    },
+
+    "hooks-claude": {
+      "type": "claude_settings", "path": "~/.claude/settings.json",
+      "project_settings": ["~/ai-os/.claude/settings.json"]
+    },
+    "hooks-grok": {
+      "type": "json_file", "path": "~/.grok/hooks/memory-mesh.json", "template": "grok_hooks"
+    },
+    "plugin-opencode": {
+      "type": "text_file", "path": "~/.config/opencode/plugin/memory-mesh.js", "template": "opencode_loader"
+    }
+  }
+}

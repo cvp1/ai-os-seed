@@ -485,13 +485,25 @@ INSTALLED_SHA_EXEMPT = {
 }
 
 
+def git_checkout_components(target, components):
+    """Components kept as a live git checkout (a `.git` dir or worktree file).
+
+    Their bytes move with every commit, so a byte hash recorded at install time
+    goes red on the next push (2026-10-27 ruling, option 1): they are left out
+    of installed_sha() and verified by git instead — M0 requires a clean tree
+    at a commit an upstream ref already contains.
+    """
+    return sorted(c for c in components if (Path(target) / c / ".git").exists())
+
+
 def installed_sha(target: Path, components, root_files) -> str:
     """One hash over every shipped file as it exists in the TARGET."""
     h = hashlib.sha256()
     paths = []
+    git_verified = set(git_checkout_components(target, components))
     for comp in components:
         base = Path(target) / comp
-        if not base.is_dir():
+        if not base.is_dir() or comp in git_verified:
             continue
         paths.extend(p for p in base.rglob("*") if p.is_file())
     for f in root_files:
@@ -536,8 +548,24 @@ def _refresh_installer(target: Path, new_tree: Path) -> bool:
 
 
 def _record_installed_sha(target: Path, receipt: dict) -> str:
-    sha = installed_sha(target, receipt["install"].get("components", []), ROOT_FILES)
+    components = receipt["install"].get("components", [])
+    sha = installed_sha(target, components, ROOT_FILES)
     receipt["install"]["installed_sha"] = sha
+    # Audit only: HEAD of each git-checkout component at install time. The
+    # contract test does not compare against it (that would go red on the
+    # next commit) — it requires a clean tree at a pushed commit instead.
+    heads = {}
+    for comp in git_checkout_components(target, components):
+        try:
+            r = subprocess.run(["git", "-C", str(target / comp), "rev-parse", "HEAD"],
+                               capture_output=True, text=True, timeout=30)
+            heads[comp] = r.stdout.strip() if r.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError):
+            heads[comp] = None
+    if heads:
+        receipt["install"]["git_verified"] = heads
+    else:
+        receipt["install"].pop("git_verified", None)
     return sha
 
 

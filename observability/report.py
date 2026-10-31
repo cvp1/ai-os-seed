@@ -42,6 +42,13 @@ def _fmt_dur(ms):
     return f"{int(s // 60)}m{int(s % 60):02d}s"
 
 
+def _fmt_cost(cost, unpriced):
+    # Unpriced calls make the sum a floor — never render that as "-" (free).
+    if unpriced:
+        return f">= ${cost:.4f} ({unpriced} unpriced)"
+    return f"{cost:.4f}" if cost else "-"
+
+
 def cmd_list(conn, args):
     where, params = [], []
     if args.job:
@@ -79,6 +86,7 @@ def cmd_stats(conn, args):
                    COUNT(*)                          AS runs,
                    SUM(CASE WHEN ok=0 THEN 1 ELSE 0 END) AS fails,
                    SUM(COALESCE(cost_usd, 0))        AS cost_usd,
+                   SUM(COALESCE(unpriced_calls, 0))  AS unpriced_calls,
                    SUM(COALESCE(tokens_out, 0))      AS tokens_out,
                    MAX(started_at)                   AS last_run
             FROM runs {clause}
@@ -94,6 +102,7 @@ def cmd_stats(conn, args):
         p50 = durs[len(durs) // 2] if durs else None
         out.append({"job": r["job"], "runs": r["runs"], "fails": r["fails"],
                     "p50_ms": p50, "cost_usd": round(r["cost_usd"], 4),
+                    "unpriced_calls": r["unpriced_calls"],
                     "tokens_out": r["tokens_out"], "last_run": r["last_run"]})
     if args.json:
         print(json.dumps(out, indent=2))
@@ -102,16 +111,16 @@ def cmd_stats(conn, args):
         print("(no runs recorded yet)")
         return
     total_cost = sum(o["cost_usd"] for o in out)
+    total_unpriced = sum(o["unpriced_calls"] for o in out)
     print(f"{'JOB':22} {'RUNS':>5} {'FAIL':>5} {'p50':>8} {'COST$':>8}  LAST RUN (UTC)")
     print("-" * 80)
     for o in out:
         last = (o["last_run"] or "")[:19].replace("T", " ")
-        cost = f"{o['cost_usd']:.4f}" if o["cost_usd"] else "-"
         print(f"{o['job'][:22]:22} {o['runs']:>5} {o['fails']:>5} "
-              f"{_fmt_dur(o['p50_ms']):>8} {cost:>8}  {last}")
-    if total_cost:
+              f"{_fmt_dur(o['p50_ms']):>8} {_fmt_cost(o['cost_usd'], o['unpriced_calls']):>8}  {last}")
+    if total_cost or total_unpriced:
         print("-" * 80)
-        print(f"{'TOTAL':22} {'':>5} {'':>5} {'':>8} {total_cost:>8.4f}")
+        print(f"{'TOTAL':22} {'':>5} {'':>5} {'':>8} {_fmt_cost(total_cost, total_unpriced):>8}")
 
 
 def main():

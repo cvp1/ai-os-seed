@@ -42,11 +42,39 @@ def _tg_token():
     return None
 
 
+def _host_notify_cmd():
+    """This host's `notify` command from mesh.toml ($HOME-relative), or None."""
+    try:
+        cfg = M._load_toml(M.CODE_DIR / "mesh.toml")
+    except Exception:  # noqa: BLE001 - fall back to the direct path
+        return None
+    for h in (cfg.get("hosts") or []):
+        if h.get("name") == M.HOST and h.get("notify"):
+            p = Path(os.path.expanduser("~")) / h["notify"]
+            return str(p) if os.access(p, os.X_OK) else None
+    return None
+
+
 def _tg_push(text):
     """Send `text` to the owner's Telegram; True on confirmed delivery, never raises.
 
+    A host that declares `notify` in mesh.toml pages through that command (text
+    on stdin, exit 0 = delivered), e.g. {{REDACTED}}'s Corral bridge sender. Other
+    hosts use the direct bot path below.
     No parse_mode: slugs contain underscores that break Telegram's Markdown parser.
     """
+    cmd = _host_notify_cmd()
+    if cmd:
+        try:
+            r = subprocess.run([cmd], input=text, text=True, timeout=60,
+                               capture_output=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            print("fold: notify command failed: %s" % e, file=sys.stderr)
+            return False
+        if r.returncode != 0:
+            print("fold: notify command exit %d: %s" % (
+                r.returncode, (r.stderr or "").strip()[-300:]), file=sys.stderr)
+        return r.returncode == 0
     tok = _tg_token()
     if not tok:
         print("fold: no telegram token — held-residency notice stays in the "
@@ -90,7 +118,11 @@ def notify_held_residency(harness):
     except (OSError, ValueError):
         prev = {}
     fresh = prev.get("key") != key
-    if not fresh and now - prev.get("notified_at", 0) < 24 * 3600:
+    if not fresh and now - (prev.get("notified_at") or 0) < 24 * 3600:
+        return
+    # An undelivered page retries hourly, not every 5-minute fold.
+    if (not fresh and prev.get("delivered") is False
+            and now - prev.get("attempted_at", 0) < 3600):
         return
     since = now if fresh else prev.get("since", now)
     head = ("memory-fold: residency delta HELD — your word needed" if fresh
@@ -103,10 +135,14 @@ def notify_held_residency(harness):
     lines += ["Every session loads the pre-hold index until you decide.",
               f"Run: python3 {M.CODE_DIR_SHOWN}/fold.py "
               "--promote-residency"]
-    _tg_push("\n".join(lines)[:3500])
+    delivered = bool(_tg_push("\n".join(lines)[:3500]))
+    # Record the OUTCOME, not the attempt: fold_watch fails a hold whose page
+    # never reached the owner (2026-10-27 panel finding).
     state_f.parent.mkdir(parents=True, exist_ok=True)
     state_f.write_text(json.dumps(
-        {"key": key, "since": since, "notified_at": now}, indent=1))
+        {"key": key, "since": since,
+         "notified_at": now if delivered else (None if fresh else prev.get("notified_at")),
+         "attempted_at": now, "delivered": delivered}, indent=1))
 
 
 def mark_live_index_held(harness):
@@ -403,6 +439,14 @@ def main():
         alarms.extend(_R.write_index(store).get("alarms", []))
     except Exception as e:  # noqa: BLE001
         alarms.append(f"retrieval index build failed: {e}")
+    # Every other harness's view of the same memory (bridge.json targets):
+    # per-lane context renders and managed blocks in their instruction files.
+    if store:
+        try:
+            import bridge as _B
+            alarms.extend(_B.render_all(quiet=True).get("alarms", []))
+        except Exception as e:  # noqa: BLE001
+            alarms.append(f"bridge render failed: {e}")
 
     # Detect (never fix) drift between per-file `lineage:` and the fold's quarantine view.
     if M.harness_store():
@@ -472,9 +516,13 @@ def main():
               f"{len(alarms)} alarm(s), {len(problems)} log problem(s)")
         for s in fold["parked"]:
             print(f"[PARKED ] {s} — opposing/inconsistent claims; see CONFLICTS.md")
-        for e in fold["quarantined"]:
-            print(f"[QUARANT] {e['subject']} (id {e['id']}) — untrusted lineage, "
-                  f"NOT served; promote with python3 {M.CODE_DIR_SHOWN}/sign.py --promote {e['id']}")
+        if fold["quarantined"]:
+            # One line, one door: triage screens every pending item and takes
+            # a single owner approval for the whole list (2026-10-27).
+            print(f"[QUARANT] {len(fold['quarantined'])} memory(ies) NOT served: "
+                  + ", ".join(e['subject'].split('/', 1)[-1] for e in fold['quarantined'][:8])
+                  + (" …" if len(fold['quarantined']) > 8 else "")
+                  + f" — screen and resolve: python3 {M.CODE_DIR_SHOWN}/triage.py")
         for a in alarms:
             print(f"[ALARM  ] {a}")
         for p in problems:

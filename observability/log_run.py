@@ -44,6 +44,7 @@ ERRTAIL_MAX = 2000     # chars stored for the stderr tail (any run that wrote on
 
 # A job may append JSONL usage records (tokens_in, tokens_out, cache_read,
 # cache_creation, cost_usd, model) to $CC_OBS_TOKENS_FILE; they are summed.
+# Records lacking cost_usd are counted in unpriced_calls (cost is then a floor).
 TOKENS_ENV = "CC_OBS_TOKENS_FILE"
 
 
@@ -162,6 +163,7 @@ def _read_usage(path):
               "cache_creation": 0, "cost_usd": 0.0}
     models = set()
     seen = False
+    priced = unpriced = 0
     try:
         with open(path, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -177,13 +179,24 @@ def _read_usage(path):
                 totals["tokens_out"] += int(rec.get("tokens_out", 0) or 0)
                 totals["cache_read"] += int(rec.get("cache_read", 0) or 0)
                 totals["cache_creation"] += int(rec.get("cache_creation", 0) or 0)
-                totals["cost_usd"] += float(rec.get("cost_usd", 0) or 0)
+                # A record without cost_usd is UNPRICED, not free: count it so
+                # cost_usd reads as a lower bound (an explicit 0 is priced).
+                c = rec.get("cost_usd")
+                if c is None:
+                    unpriced += 1
+                else:
+                    totals["cost_usd"] += float(c or 0)
+                    priced += 1
                 if rec.get("model"):
                     models.add(rec["model"])
     except OSError:
         return {}
     if not seen:
         return {}
+    # cost_usd sums the priced records only; all-unpriced → NULL, never $0.
+    if not priced:
+        totals["cost_usd"] = None
+    totals["unpriced_calls"] = unpriced
     # One model → store it; several in one run → "mixed"; none reported → NULL.
     totals["model"] = models.pop() if len(models) == 1 else ("mixed" if models else None)
     return totals
@@ -217,21 +230,23 @@ def _record(job, started, finished, exit_code, stdout_b, stderr_b, usage,
         cache_read = usage.get("cache_read") if usage else None
         cache_creation = usage.get("cache_creation") if usage else None
         model = usage.get("model") if usage else None
-        cost = round(usage["cost_usd"], 6) if usage else None
+        cost = (round(usage["cost_usd"], 6)
+                if usage and usage.get("cost_usd") is not None else None)
+        unpriced = usage.get("unpriced_calls") if usage else None
         with db.connect() as conn:
             conn.execute(
                 """INSERT INTO runs
                    (job, host, started_at, finished_at, duration_ms, exit_code,
                     ok, stdout_bytes, stderr_bytes, summary, error_tail,
                     tokens_in, tokens_out, cost_usd, cache_read_tokens,
-                    cache_creation_tokens, model)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    cache_creation_tokens, model, unpriced_calls)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (job, _host(), _iso(started), _iso(finished),
                  duration_ms, exit_code, ok,
                  stdout_total if stdout_total is not None else len(stdout_b),
                  stderr_total if stderr_total is not None else len(stderr_b),
                  summary, error_tail, tok_in, tok_out, cost, cache_read,
-                 cache_creation, model),
+                 cache_creation, model, unpriced),
             )
             conn.commit()
     except Exception as e:  # noqa: BLE001 - observability must never crash the job

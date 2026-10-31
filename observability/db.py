@@ -53,6 +53,9 @@ _ADDED_COLUMNS = [
     ("cache_read_tokens", "INTEGER"),
     ("cache_creation_tokens", "INTEGER"),
     ("model", "TEXT"),
+    # usage records with no cost_usd; >0 means cost_usd is a lower bound
+    # (762a, 2026-10-31). NULL on pre-column rows = unknown.
+    ("unpriced_calls", "INTEGER"),
 ]
 
 

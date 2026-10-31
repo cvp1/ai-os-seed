@@ -184,6 +184,26 @@ def peers():
             if h["name"] != HOST]
 
 
+PEER_LIVENESS = ("required", "sleeps")
+
+
+def peer_roles():
+    """{host: "required" | "sleeps"} for every other declared mesh host.
+
+    Raises on an unknown liveness value: a typo must not silently exempt a peer."""
+    cfg = _load_toml(CODE_DIR / "mesh.toml")
+    out = {}
+    for h in (cfg.get("hosts") or []):
+        if h["name"] == HOST:
+            continue
+        role = h.get("liveness", "required")
+        if role not in PEER_LIVENESS:
+            raise ValueError(f"mesh.toml: host {h['name']!r} has liveness "
+                             f"{role!r}; expected one of {PEER_LIVENESS}")
+        out[h["name"]] = role
+    return out
+
+
 # ── event identity & IO ───────────────────────────────────────────────────────
 def event_id(host, session, ts, content, kind="", subject=""):
     """Content-derived id, so a retried append yields the same id and the fold dedups.
@@ -495,13 +515,15 @@ def project_store(fold, store, apply=False, events=None):
                         f.write_text(want, encoding="utf-8")
                     out["repaired"].append(slug)
                     out["alarms"].append(
-                        f"store file diverged from its event and was rewritten: "
+                        f"store file diverged from its event and "
+                        f"{'was rewritten' if apply else 'needs fold --project to rewrite'}: "
                         f"{slug} ({'stub upgraded' if stub else 'signed tip'})")
                 else:
                     out["alarms"].append(
                         f"store file diverges from its UNSIGNED event and was "
                         f"LEFT ALONE: {slug} — hand-edit, or an event claiming "
-                        f"a body it should not. Resolve deliberately: "
+                        f"a body it should not. Easiest: memory-mesh/triage.py "
+                        f"recommends the newer side for one owner approval. By hand: "
                         f"memory_write.py adopt {slug} --reconcile --commit "
                         f"(file wins) or sign the event (event wins). "
                         f"--reconcile is REQUIRED here: plain adopt refuses a "
@@ -1474,9 +1496,8 @@ def render_harness_memory(fold, store):
                  if e["audience"] in VIEW_INCLUDES["operator"])
     if n_quar:
         head.append(f"# {n_quar} untrusted-lineage fact(s) QUARANTINED and not "
-                    "served — views/operator/QUARANTINE.md; promote: "
-                    "sign.py --promote <id> (key) or --promote-verbal <id> "
-                    "--approved \"<owner's words>\" (verbal, weaker)")
+                    "served — resolve all pending with memory-mesh/triage.py "
+                    "(one screen, one owner approval)")
     head.append("")
     return fit_harness_memory(head, ranked, sorted(exclude))
 

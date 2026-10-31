@@ -10,6 +10,7 @@ path), plain text throughout. Design contract: `SPEC.md`. Proof obligations:
     replay.py  the exact view any agent had at any past instant
     drill.py   3-node mesh in a tempdir, runs the SPEC drills against real git
     install.sh idempotent join (Linux systemd / macOS launchd)
+    bridge.py  one memory, every model: MCP server, per-lane context, shared guard (BRIDGE.md)
 
 Events repo: `~/memory-events` (separate from this code repo; NOT on GitHub —
 LAN-only mesh; covered by the standby sync + weekly snapshot like everything

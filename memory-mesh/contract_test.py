@@ -149,6 +149,17 @@ class Sandbox:
         self.store.mkdir(parents=True)
         # The fold only generates MEMORY.md for a store that has opted in.
         (self.store / ".mesh-generated").write_text("contract_test\n")
+        # Hook wiring is install state, not sandbox state: fold_watch reads
+        # user-global settings (the write guard lives there since 2026-10-17),
+        # so mirror ONLY the real user scope's `hooks` key into the fake HOME.
+        try:
+            real = json.loads((Path.home() / ".claude" / "settings.json")
+                              .read_text(encoding="utf-8") or "{}")
+            if real.get("hooks"):
+                (self.home / ".claude" / "settings.json").write_text(
+                    json.dumps({"hooks": real["hooks"]}), encoding="utf-8")
+        except (OSError, ValueError):
+            pass                      # no user scope: project settings only
         # A sandboxed child's environment must carry no override but the
         # sandbox's own.
         composed = dict(scrubbed_environ(), **self.env)
@@ -218,14 +229,26 @@ INSTALLED_SHA_EXEMPT = {
 }
 
 
+def git_checkout_components(target, components):
+    """Components kept as a live git checkout (a `.git` dir or worktree file).
+
+    Their bytes move with every commit, so a byte hash recorded at install time
+    goes red on the next push (2026-10-27 ruling, option 1): they are left out
+    of installed_sha() and verified by git instead — M0 requires a clean tree
+    at a commit an upstream ref already contains.
+    """
+    return sorted(c for c in components if (Path(target) / c / ".git").exists())
+
+
 def installed_sha(target, components, root_files):
     """One hash over every shipped file as it exists in the TARGET."""
     import hashlib
     h = hashlib.sha256()
     paths = []
+    git_verified = set(git_checkout_components(target, components))
     for comp in components:
         base = Path(target) / comp
-        if not base.is_dir():
+        if not base.is_dir() or comp in git_verified:
             continue
         paths.extend(p for p in base.rglob("*") if p.is_file())
     for f in root_files:
@@ -274,9 +297,50 @@ def m0_package_integrity():
                f"{live[:16]} != recorded {claimed[:16]} — the bytes running "
                f"here are not the bytes this install wrote")
         return live
+    # Git-checkout components were left out of the hash; git vouches instead.
+    verified = []
+    for comp in git_checkout_components(root, components):
+        ok, detail = git_verified(root / comp)
+        if not ok:
+            record("M0-package-integrity", "FAIL",
+                   f"{comp}/ is a git checkout and git cannot vouch for it: "
+                   f"{detail}")
+            return live
+        verified.append(f"{comp}@{detail}")
     record("M0-package-integrity", "PASS",
-           f"the installed tree still matches its receipt ({live[:16]})")
+           f"the installed tree still matches its receipt ({live[:16]})"
+           + (f"; git-verified: {', '.join(verified)}" if verified else ""))
     return live
+
+
+def git_verified(path):
+    """(ok, head-or-reason): a clean checkout at a commit an upstream ref has.
+
+    Clean includes untracked files (a stray .py imports as readily as a
+    tracked one). "Pushed" is read from the local remote-tracking refs — no
+    network. Any git error is a FAIL, never a pass.
+    """
+    def git(*a):
+        return subprocess.run(["git", "-C", str(path), *a], capture_output=True,
+                              text=True, timeout=30)
+    try:
+        st = git("status", "--porcelain")
+        if st.returncode:
+            return False, f"git status failed: {st.stderr.strip()[:200]}"
+        if st.stdout.strip():
+            n = len(st.stdout.splitlines())
+            return False, (f"{n} uncommitted/untracked path(s) — the bytes "
+                           f"running are not a commit")
+        head = git("rev-parse", "--short=12", "HEAD")
+        if head.returncode:
+            return False, f"no HEAD: {head.stderr.strip()[:200]}"
+        up = git("branch", "-r", "--contains", "HEAD")
+        if up.returncode or not up.stdout.strip():
+            return False, (f"HEAD {head.stdout.strip()} is on no remote-tracking "
+                           f"ref — commit is unpushed (or never fetched)")
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"git unavailable: {e}"
+    return True, head.stdout.strip()
 
 
 # ── M1 ──────────────────────────────────────────────────────────────────────

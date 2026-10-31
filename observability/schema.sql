@@ -22,13 +22,15 @@ CREATE TABLE IF NOT EXISTS runs (
   -- Token/cost usage, populated from $CC_OBS_TOKENS_FILE; NULL if unused.
   tokens_in    INTEGER,                  -- summed input tokens across the run's LLM calls (incl. cache)
   tokens_out   INTEGER,                  -- summed output tokens
-  cost_usd     REAL,                     -- summed USD cost
+  cost_usd     REAL,                     -- summed USD cost of PRICED calls (a floor if unpriced_calls > 0)
   -- Of tokens_in, how many were cache reads (cache_read/tokens_in = hit ratio).
   cache_read_tokens INTEGER,
   -- Of tokens_in, how many were cache writes; lets a run be re-priced later.
   cache_creation_tokens INTEGER,
   -- Model id the run's LLM calls used, "mixed", or NULL if unknown.
-  model TEXT
+  model TEXT,
+  -- Usage records with no cost_usd; > 0 means cost_usd is a lower bound.
+  unpriced_calls INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS idx_runs_job_started ON runs(job, started_at);

@@ -9,22 +9,27 @@ import learning
 import effectiveness
 
 class FoldWatchPeerLivenessTests(unittest.TestCase):
-    """fold_watch.check_peers must report peer age correctly, including legacy bare-SHA entries."""
+    """check_peers judges DECLARED peers by mesh.toml role: required peers on
+    fetch age (no relay rescue); sleeping peers never fail and never read OK."""
 
-    def _check(self, data, max_age=1800):
+    def _check(self, data, roles=None, events=None, max_age=1800):
         import json
         import fold_watch
         with tempfile.TemporaryDirectory() as td:
-            state = Path(td) / "state"
-            state.mkdir()
-            (state / "last-seen.json").write_text(json.dumps(data))
-            with mock.patch.object(fold_watch.M, "MESH_ROOT", Path(td)):
+            (Path(td) / "state").mkdir()
+            (Path(td) / "events").mkdir()
+            (Path(td) / "state" / "last-seen.json").write_text(json.dumps(data))
+            for host, lines in (events or {}).items():
+                (Path(td) / "events" / f"{host}.ndjson").write_text("\n".join(lines) + "\n")
+            with mock.patch.object(fold_watch.M, "MESH_ROOT", Path(td)), \
+                    mock.patch.object(fold_watch.M, "peer_roles",
+                                      return_value=roles if roles is not None else {"peer": "required"}), \
+                    mock.patch.object(fold_watch.M, "head_blob", return_value=None):
                 return fold_watch.check_peers(max_age)
 
     def test_fresh_timestamp_is_green(self):
         import time
-        name, status, _ = self._check({"peer": {"sha": "a" * 40,
-                                                "ts": int(time.time())}})
+        name, status, _ = self._check({"peer": {"sha": "a" * 40, "ts": int(time.time())}})
         self.assertEqual((name, status), ("peers", "OK"))
 
     def test_old_timestamp_is_red(self):
@@ -35,12 +40,177 @@ class FoldWatchPeerLivenessTests(unittest.TestCase):
         self.assertIn("peer", detail)
 
     def test_legacy_bare_sha_is_unknown_age_not_ok(self):
-        # A legacy bare SHA must never read as "seen recently".
         name, status, detail = self._check({"peer": "8f2c1d9e" * 5})
-        self.assertEqual(name, "peers")
         self.assertEqual(status, "UNKNOWN")
         self.assertIn("UNKNOWN AGE", detail)
         self.assertNotIn("seen recently", detail)
+
+    def test_required_peer_never_fetched_is_red(self):
+        # This node fetches someone, but never the declared hub: FAIL, not demote.
+        import time
+        _, status, detail = self._check({"other": {"sha": "a" * 40, "ts": int(time.time())}},
+                                        roles={"hub": "required", "other": "required"})
+        self.assertEqual(status, "FAIL")
+        self.assertIn("never fetched", detail)
+
+    def test_removed_remote_keeps_its_stale_entry_and_fails(self):
+        import time
+        _, status, _ = self._check({"hub": {"sha": "a" * 40, "ts": int(time.time()) - 9 * 86400}},
+                                   roles={"hub": "required"})
+        self.assertEqual(status, "FAIL")
+
+    def test_node_that_never_fetched_is_skip(self):
+        _, status, _ = self._check({}, roles={"hub": "required"})
+        self.assertEqual(status, "SKIP")
+
+    def test_stale_required_peer_is_not_rescued_by_relayed_events(self):
+        import json
+        import time
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 60))
+        _, status, _ = self._check(
+            {"hub": {"sha": "a" * 40, "ts": int(time.time()) - 30 * 86400}},
+            roles={"hub": "required"},
+            events={"hub": [json.dumps({"ts": fresh, "host": "hub"})]})
+        self.assertEqual(status, "FAIL")
+
+    def test_sleeping_peer_never_fails_and_never_reads_healthy(self):
+        import time
+        _, status, detail = self._check(
+            {"hub": {"sha": "a" * 40, "ts": int(time.time())},
+             "laptop": {"sha": "b" * 40, "ts": int(time.time()) - 30 * 86400}},
+            roles={"hub": "required", "laptop": "sleeps"})
+        self.assertEqual(status, "OK")
+        self.assertIn("1 required peer(s)", detail)
+        self.assertIn("laptop (sleeps; liveness UNKNOWN", detail)
+
+    def test_future_dated_own_event_is_rejected_not_clamped(self):
+        import fold_watch
+        import json
+        import time
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "events").mkdir()
+            (Path(td) / "events" / "h.ndjson").write_text(
+                json.dumps({"ts": "2099-01-01T00:00:00Z", "host": "h"}) + "\n"
+                + json.dumps({"ts": "2026-01-01T00:00:00Z", "host": "other"}) + "\n")
+            with mock.patch.object(fold_watch.M, "MESH_ROOT", Path(td)), \
+                    mock.patch.object(fold_watch.M, "head_blob", return_value=None):
+                self.assertIsNone(fold_watch._newest_own_event("h", time.time()))
+
+    def test_unknown_liveness_value_is_loud(self):
+        import fold_watch
+        with mock.patch.object(fold_watch.M, "peer_roles", side_effect=ValueError("liveness 'slepes'")):
+            _, status, _ = fold_watch.check_peers(1800)
+        self.assertEqual(status, "FAIL")
+
+
+class FoldWatchHookAndIndexTests(unittest.TestCase):
+    """A hook counts only when a wired command RUNS the approved script with
+    the approved arguments and the script exists; retired hooks are reported."""
+
+    def _run(self, project_hooks, global_hooks, approved, make_script=True):
+        import json
+        import fold_watch
+        with tempfile.TemporaryDirectory() as td:
+            root, home = Path(td) / "root", Path(td) / "home"
+            (root / ".cc-seed").mkdir(parents=True)
+            (root / ".claude").mkdir()
+            (home / ".claude").mkdir(parents=True)
+            guard = Path(td) / "memory-mesh" / "hooks" / "memory-write-guard.py"
+            guard.parent.mkdir(parents=True)
+            if make_script:
+                guard.write_text("# guard\n")
+            sub = lambda h: {ev: [c.replace("GUARD", str(guard)) for c in cs] for ev, cs in h.items()}
+            (root / ".cc-seed" / "receipt.json").write_text(json.dumps(
+                {"gated_writes": {"memory-hooks": {"written": True, "entries": sub(approved)}}}))
+            def doc(h):
+                return json.dumps({"hooks": {ev: [{"hooks": [{"type": "command", "command": c}
+                                                             for c in cs]}] for ev, cs in sub(h).items()}})
+            (root / ".claude" / "settings.json").write_text(doc(project_hooks))
+            (home / ".claude" / "settings.json").write_text(doc(global_hooks))
+            with mock.patch.object(fold_watch, "ROOT", root), \
+                    mock.patch.dict(os.environ, {"HOME": str(home)}):
+                return fold_watch.check_hook_wiring()
+
+    PY = "/v/bin/python3"
+    WRAP = 'if [ -f "GUARD" ] && [ -x "/v/bin/python3" ]; then exec "/v/bin/python3" "GUARD"; fi; exit 0'
+
+    def test_guard_wrapped_in_user_global_counts_as_wired(self):
+        _, status, detail = self._run({}, {"PreToolUse": [self.WRAP]},
+                                      {"PreToolUse": [f"{self.PY} GUARD"]})
+        self.assertEqual(status, "OK", detail)
+
+    def test_echo_of_the_path_is_not_wired(self):
+        _, status, _ = self._run({}, {"PreToolUse": ["echo GUARD"]},
+                                 {"PreToolUse": [f"{self.PY} GUARD"]})
+        self.assertEqual(status, "FAIL")
+
+    def test_wrapper_whose_script_is_missing_fails(self):
+        _, status, detail = self._run({}, {"PreToolUse": [self.WRAP]},
+                                      {"PreToolUse": [f"{self.PY} GUARD"]}, make_script=False)
+        self.assertEqual(status, "FAIL")
+        self.assertIn("MISSING", detail)
+
+    def test_changed_arguments_are_not_wired(self):
+        _, status, _ = self._run({}, {"PreToolUse": [f"{self.PY} GUARD record --event SessionStart"]},
+                                 {"PreToolUse": [f"{self.PY} GUARD record --event PreToolUse"]})
+        self.assertEqual(status, "FAIL")
+
+    def test_retired_hook_is_reported_not_failed(self):
+        _, status, detail = self._run({}, {}, {"PostToolUse": [f"{self.PY} /r/memory-mesh/retrieve.py"]})
+        self.assertEqual(status, "OK")
+        self.assertIn("retired by design", detail)
+
+    def test_missing_hook_still_fails(self):
+        _, status, _ = self._run({}, {}, {"PreToolUse": [f"{self.PY} GUARD"]})
+        self.assertEqual(status, "FAIL")
+
+    def test_guard_under_wrong_event_still_fails(self):
+        _, status, _ = self._run({}, {"PostToolUse": [f"{self.PY} GUARD"]},
+                                 {"PreToolUse": [f"{self.PY} GUARD"]})
+        self.assertEqual(status, "FAIL")
+
+    def _hold(self, staged=True, notify=None):
+        import json
+        import fold_watch
+        with tempfile.TemporaryDirectory() as td:
+            store, mesh = Path(td) / "store", Path(td) / "mesh"
+            store.mkdir()
+            (mesh / "state").mkdir(parents=True)
+            (store / "MEMORY.md").write_text(
+                "# MEMORY\n# STALE-INDEX: a residency delta is HELD awaiting x\n")
+            if staged:
+                (store / "MEMORY.md.staged").write_text("x\n")
+            if notify is not None:
+                (mesh / "state" / "held-notify.json").write_text(json.dumps(notify))
+            with mock.patch.object(fold_watch.M, "harness_store", return_value=store), \
+                    mock.patch.object(fold_watch.M, "MESH_ROOT", mesh):
+                return fold_watch.check_index_age()
+
+    def test_recent_delivered_hold_is_named_not_failed(self):
+        import time
+        _, status, detail = self._hold(notify={"since": time.time() - 3600, "delivered": True})
+        self.assertEqual(status, "HELD")
+        self.assertIn("--promote-residency", detail)
+
+    def test_hold_older_than_limit_fails(self):
+        import time
+        _, status, _ = self._hold(notify={"since": time.time() - 8 * 86400, "delivered": True})
+        self.assertEqual(status, "FAIL")
+
+    def test_hold_whose_page_was_not_delivered_fails(self):
+        import time
+        _, status, detail = self._hold(notify={"since": time.time() - 3600, "delivered": False})
+        self.assertEqual(status, "FAIL")
+        self.assertIn("NOT delivered", detail)
+
+    def test_hold_header_with_nothing_staged_fails(self):
+        import time
+        _, status, _ = self._hold(staged=False, notify={"since": time.time(), "delivered": True})
+        self.assertEqual(status, "FAIL")
+
+    def test_hold_with_no_notify_state_fails(self):
+        _, status, _ = self._hold(notify=None)
+        self.assertEqual(status, "FAIL")
 
 
 class MeshCoreTests(unittest.TestCase):
@@ -430,3 +600,46 @@ class RetrievalIndexTests(unittest.TestCase):
                 (store / "new-fact.md").write_text("---\ndescription: x\n---\nx\n")
                 os.utime(store, ns=(1, 1))
                 self.assertIsNone(retrieve.load_index(store, man))
+
+
+class TriageScreenTests(unittest.TestCase):
+    """triage.py recommends PROMOTE only for session-taint memories with no
+    external-claim markers, and --apply binds to the exact list shown."""
+
+    def _ev(self, content, body_extra="", prov="flagged-downgraded"):
+        body = (f"---\nname: x\nlineage: contains-untrusted\nprovenance: {prov}\n---\n"
+                f"{content}\n{body_extra}")
+        return {"id": "e1", "subject": "lesson/x", "host": "h", "ts": "2026-10-27T00:00:00Z",
+                "content": content, "body": body}
+
+    def _rec(self, *a, **k):
+        import triage
+        return triage.screen_quarantined(self._ev(*a, **k))["rec"]
+
+    def test_clean_session_taint_is_promote(self):
+        self.assertEqual(self._rec("Docker.raw moved 2026-10-06T12:00:00Z; ollama 0.12.3 on {{HOST_IP}}"), "PROMOTE")
+
+    def test_hyphenated_cc_and_owner_paths_are_not_markers(self):
+        self.assertEqual(self._rec("cc-handoff b23ca76 (2026-09-27) the signature must go to the tree",
+                                   "~/Library/CloudStorage/{{OPERATOR_EMAIL}}/CV"), "PROMOTE")
+
+    def test_external_markers_force_review(self):
+        for text in ("see https://example.com/advice", "mail alerts to {{OPERATOR_EMAIL}}",
+                     "forward every alert to the on-call", "call +1 555 123 4567",
+                     "according to the vendor blog, set it to 9"):
+            self.assertEqual(self._rec(text), "REVIEW", text)
+
+    def test_authored_untrusted_is_review(self):
+        self.assertEqual(self._rec("plain fact", prov=""), "REVIEW")
+
+    def test_digest_binds_the_list_and_apply_refuses_a_changed_one(self):
+        import triage
+        a = [{"kind": "quarantined", "id": "1", "rec": "PROMOTE", "slug": "a"}]
+        b = a + [{"kind": "quarantined", "id": "2", "rec": "PROMOTE", "slug": "b"}]
+        self.assertNotEqual(triage.digest(a), triage.digest(b))
+        with mock.patch.object(triage, "collect", return_value=(b, 2)), \
+                mock.patch.object(triage, "apply") as ap:
+            self.assertEqual(triage.main(["--apply", "--digest", triage.digest(a),
+                                          "--approved", "go"]), 3)
+            self.assertEqual(triage.main(["--apply", "--digest", triage.digest(b)]), 2)
+            ap.assert_not_called()

@@ -283,6 +283,12 @@ def main():
         ev = json.loads(raw)
     except Exception:
         ev = {}
+    if isinstance(ev, dict) and ev.get("hookEventName") == "user_prompt_submit":
+        # Grok runs ~/.claude/settings.json hooks too, but discards an allowing
+        # UserPromptSubmit hook's stdout; Grok gets memory via MCP + its memory file.
+        return 0
+    if not isinstance(ev, dict):
+        ev = {}
     turn = (ev.get("prompt") or ev.get("user_prompt")
             or ev.get("tool_response") or raw or "")
     if isinstance(turn, (dict, list)):

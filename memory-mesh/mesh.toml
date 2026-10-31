@@ -10,6 +10,9 @@
 # name = "desktop"          # the machine's mesh slug (usually its hostname)
 # ssh = "desktop"           # ssh alias every OTHER host can reach it by
 # repo = "memory-events"    # events repo path relative to $HOME on that host
+# notify = "bin/page-me"    # optional: $HOME-relative command the fold pages
+#                           # you through (text on stdin, exit 0 = delivered);
+#                           # absent = the direct Telegram bot path
 #
 # [[hosts]]
 # name = "laptop"
