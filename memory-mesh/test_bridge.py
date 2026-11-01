@@ -485,6 +485,45 @@ class Mcp(unittest.TestCase):
                                    "params": {"name": "nope"}}, "x")["error"]["code"], -32602)
 
 
+class McpCliExe(unittest.TestCase):
+    """A harness CLI that is not at its configured path must be found on PATH
+    (mise shims on the Omarchy laptops), and one that is absent everywhere must
+    read as "no harness" — never "ok" (false green, 2026-10-31)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.old_path = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        os.environ["PATH"] = self.old_path
+
+    def _target(self, exe):
+        return {"type": "mcp_cli", "lane": "claude",
+                "probe": [exe, "mcp", "get", "memory"],
+                "add": [exe, "mcp", "add", "memory"], "remove": [exe, "mcp", "remove", "memory"]}
+
+    def test_found_on_path_when_configured_path_missing(self):
+        shim = self.tmp / "fakeclaude"
+        shim.write_text("#!/bin/sh\nexit 1\n")
+        shim.chmod(0o755)
+        os.environ["PATH"] = str(self.tmp)
+        t = self._target(str(self.tmp / "nowhere" / "fakeclaude"))
+        self.assertEqual(B._mcp_cli_exe(t, {}), str(shim))
+        plans = B.plan_target("x", t, {})
+        self.assertEqual(plans[0][1][0], str(shim))  # add runs the resolved shim
+
+    def test_absent_everywhere_is_no_harness_not_ok(self):
+        os.environ["PATH"] = str(self.tmp)
+        cfg = {"targets": {"x": self._target(str(self.tmp / "nowhere" / "absentcli"))}}
+        self.assertEqual(B.status(cfg)[0][3], "no harness")
+
+    def test_missing_harness_script_is_no_harness(self):
+        cfg = {"targets": {"x": {"type": "mcp_cli", "lane": "corral",
+                                 "probe": [sys.executable, str(self.tmp / "mcp.py"), "test", "memory"],
+                                 "add": [sys.executable], "remove": [sys.executable]}}}
+        self.assertEqual(B.status(cfg)[0][3], "no harness")
+
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=1)

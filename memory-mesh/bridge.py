@@ -1367,18 +1367,33 @@ def plan_target(name, t, cfg, undo=False):
         new = _template(t["template"], cfg)
         return [(p, old, new)] if new != old else []
     if typ == "mcp_cli":
-        argv0 = _x(_sub(t["probe"][0], cfg))
-        exe_ok = argv0.exists() and all(_x(_sub(a, cfg)).exists() for a in t["probe"][1:2]
-                                         if a.endswith(".py"))
-        if not exe_ok:
-            return []
-        probe = subprocess.run([_sub(a, cfg) for a in t["probe"]], capture_output=True,
-                               text=True, timeout=60)
+        exe = _mcp_cli_exe(t, cfg)
+        if exe is None:
+            return []  # no harness here; status() says so rather than "ok"
+
+        def argv(key):
+            return [exe] + [_sub(a, cfg) for a in t[key][1:]]
+        probe = subprocess.run(argv("probe"), capture_output=True, text=True, timeout=60)
         present = probe.returncode == 0
         if undo:
-            return [("cmd", [_sub(a, cfg) for a in t["remove"]])] if present else []
-        return [] if present else [("cmd", [_sub(a, cfg) for a in t["add"]])]
+            return [("cmd", argv("remove"))] if present else []
+        return [] if present else [("cmd", argv("add"))]
     return []
+
+
+def _mcp_cli_exe(t, cfg):
+    """The harness CLI an mcp_cli target drives, or None when it is absent.
+
+    The configured path first, then the same name on PATH: a mise/asdf shim
+    (Omarchy laptops) is not at ~/.local/bin, and a hardcoded miss used to read
+    as "nothing to change" — status reported ok for a server never registered.
+    """
+    if not all(_x(_sub(a, cfg)).exists() for a in t["probe"][1:2] if a.endswith(".py")):
+        return None  # the harness's own script (e.g. Corral's mcp.py) is not here
+    want = _x(_sub(t["probe"][0], cfg))
+    if want.exists():
+        return str(want)
+    return shutil.which(want.name)
 
 
 def install(apply=False, undo=False, only=None, cfg=None):
@@ -1447,6 +1462,8 @@ def status(cfg=None):
                 if typ in ("mcp_cli", "json_file", "text_file", "mcp_toml", "mcp_opencode") and not pending:
                     p = t.get("path")
                     if p and not _x(p).exists() and typ != "mcp_cli":
+                        state = "no harness"
+                    if typ == "mcp_cli" and _mcp_cli_exe(t, cfg) is None:
                         state = "no harness"
         except Exception as e:  # noqa: BLE001
             state = f"ERROR {e.__class__.__name__}: {e}"
