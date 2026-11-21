@@ -358,6 +358,10 @@ def stage(a, store=STORE):
             argv += [f"--{opt}", a[opt]]
     if a.get("session_id"):
         argv += ["--session-id", a["session_id"]]
+    if a.get("approved"):
+        # The owner approved THIS memory in this turn: memory_write verbally
+        # promotes it if the write lands in quarantine (door checks the words).
+        argv += ["--approved", a["approved"]]
 
     result.update({
         "preview_command": shlex.join(argv),
@@ -454,6 +458,11 @@ def _selftest():
            "stage-emits-preview-and-commit-commands")
         ok("memory_write.py" in st["preview_command"], "stage-targets-memory-write")
         ok(not (store / "new-lesson.md").exists(), "stage-writes-nothing")
+        ok("--approved" not in st["commit_command"], "stage-no-approval-unless-given")
+        sta = stage(dict(base, approved="yes, write that lesson"), store=store)
+        ok(sta["ok"] and shlex.split(sta["commit_command"])[-3:] ==
+           ["--approved", "yes, write that lesson", "--commit"],
+           "stage-passes-owner-approval-through")
 
         st2 = stage(dict(base, why=None, how=None), store=store)
         ok(not st2["ok"] and any("--why" in p for p in st2["problems"]),
@@ -536,6 +545,9 @@ def main(argv=None):
                     help="REQUIRED: what this adds that PRINCIPLES.md does "
                          "not already force for this case")
     st.add_argument("--session-id", dest="session_id")
+    st.add_argument("--approved", metavar="WORDS",
+                    help="the owner's verbatim approval of THIS memory, given in "
+                         "this turn; passed to memory_write.py write --approved")
 
     a = ap.parse_args(argv)
     if a.cmd == "harvest":

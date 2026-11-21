@@ -51,7 +51,7 @@ def _ancestor_body(tip, events):
 
     # Re-verify rather than trust the fold-local `_signed` field.
     def vouches(e):
-        return (e.get("verbal_approval")
+        return (e.get("verbal_approval") or M.policy_honored(e, by_id)
                 or (e.get("sig") and (e.get("_signed") or M.verify_sig(e))))
 
     authority = next((e for e in chain
@@ -63,7 +63,7 @@ def _ancestor_body(tip, events):
     return next((e for e in chain if ok(e)), None)
 
 
-def reconcile_store(subject, approved_words=None):
+def reconcile_store(subject, approved_words=None, policy=False):
     """Retag the promoted lesson's store file as trusted via `memory_write.py retag`.
 
     Failure does not fail the promotion (the signed event is authoritative)
@@ -84,9 +84,12 @@ def reconcile_store(subject, approved_words=None):
     # A verbal promotion passes the approval words through to retag's gate.
     if approved_words:
         cmd += ["--operator-approved", approved_words]
+    if policy:
+        cmd += ["--policy-approved"]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode == 0:
-        klass = M.PROMOTION_VERBAL if approved_words else M.PROMOTION_KEY
+        klass = (M.PROMOTION_POLICY if policy else
+                 M.PROMOTION_VERBAL if approved_words else M.PROMOTION_KEY)
         print(f"  store reconciled: {slug} -> lineage: operator-direct ({klass})")
     else:
         print(f"  STORE NOT RECONCILED for {slug} (the signed event stands and "
@@ -105,6 +108,12 @@ def main():
     ap.add_argument("--approved", metavar="WORDS",
                     help="The owner's verbatim approval, recorded for audit. Required "
                          "by --promote-verbal.")
+    ap.add_argument("--promote-policy", metavar="EVENT_ID",
+                    help="promote under an owner-approved POLICY (auto_promote.py). "
+                         "Requires --policy-approval JSON. Served on-demand only, "
+                         "and only while mesh.toml declares the policy.")
+    ap.add_argument("--policy-approval", metavar="JSON",
+                    help='{"policy","lane","words","ts",...} — required by --promote-policy')
     ap.add_argument("--subject")
     ap.add_argument("--content")
     ap.add_argument("--polarity", default="n/a", choices=sorted(M.POLARITIES))
@@ -119,7 +128,20 @@ def main():
                                         args.home, args.polarity)
     supersedes = [s for s in (args.supersedes or "").split(",") if s]
 
-    # Key-signed and verbal promotion are mutually exclusive.
+    # One promotion class per event.
+    if sum(bool(x) for x in (args.promote, args.promote_verbal, args.promote_policy)) > 1:
+        sys.exit("sign: --promote, --promote-verbal and --promote-policy are mutually "
+                 "exclusive — a promotion has one class.")
+    policy = None
+    if args.promote_policy:
+        try:
+            policy = json.loads(args.policy_approval or "")
+        except ValueError:
+            sys.exit("sign: --promote-policy needs --policy-approval as a JSON object")
+        if not isinstance(policy, dict):
+            sys.exit("sign: --policy-approval must be a JSON object")
+    elif args.policy_approval:
+        sys.exit("sign: --policy-approval is only meaningful with --promote-policy")
     if args.promote and args.promote_verbal:
         sys.exit("sign: --promote and --promote-verbal are mutually exclusive — "
                  "a promotion has one class, key-signed or verbally-signed.")
@@ -138,7 +160,7 @@ def main():
                 "  checkable answer. An empty or token approval would serve an "
                 "untrusted-lineage fact while recording nothing.")
 
-    promote_id = args.promote or args.promote_verbal
+    promote_id = args.promote or args.promote_verbal or args.promote_policy
     prop = None
     if promote_id:
         events, _ = M.read_all_events()
@@ -166,6 +188,30 @@ def main():
         clash = [e for e in fold["live"]
                  if e["subject"] == subject and e["content"] != content
                  and e["id"] not in supersedes]
+        # A served version already in the promoted event's own supersede
+        # ancestry is retired by this promotion (the fold endorses that
+        # ancestry once the tip is vouched) — it is not a clash.
+        by_id = {x["id"]: x for x in events}
+        ancestry = {a["id"] for a in M._chain(prop, by_id)}
+        clash = [e for e in clash if e["id"] not in ancestry]
+        try:
+            import auto_promote
+            fact_revision = auto_promote.is_fact_revision(prop, by_id)
+        except Exception:  # noqa: BLE001 — unknown degrades to "not a revision"
+            fact_revision = False
+        if policy is not None and (args.supersedes or parked):
+            sys.exit(f"sign: REFUSED — a policy promotion supersedes only its own source; "
+                     f"it never names other events or parked claims "
+                     f"({args.supersedes or [e['id'] for e in parked]}).")
+        if policy is not None and prop.get("supersedes") and not (
+                fact_revision and policy.get("lane") == 1):
+            sys.exit(f"sign: REFUSED — {promote_id} replaces an earlier memory "
+                     f"({prop.get('supersedes')}); a policy never replaces a served "
+                     f"memory. It stays quarantined for the owner.")
+        if policy is not None and clash:
+            sys.exit(f"sign: REFUSED — {subject} is already served with different "
+                     f"content ({clash[0]['id']}); a policy never replaces a served "
+                     f"memory. It stays quarantined for the owner.")
         for e in clash:
             print(f"  WARNING: {e['id']} is SERVED on {subject} with different "
                   f"content and is NOT being superseded:\n"
@@ -226,10 +272,12 @@ def main():
         return M.make_event("correct", subject, content, session=args.session,
                             polarity=polarity, home=home, audience=args.audience,
                             confidence="operator-stated",
-                            lineage="contains-untrusted" if verbal else "operator-direct",
+                            lineage=("contains-untrusted" if (verbal or policy)
+                                     else "operator-direct"),
                             supersedes=supersedes or None,
                             body_sha256=body_sha256, body=body,
-                            verbal_approval=verbal)
+                            verbal_approval=verbal, policy_approval=policy,
+                            residency="state" if policy else M.RESIDENCY_UNSET)
     carry = shown_body if (shown_body and args.audience in M.BODY_AUDIENCES) else None
     try:
         ev, _ = _mk(carry)
@@ -242,11 +290,23 @@ def main():
         ev, _ = _mk(None)
     # Show the full bytes being attested before the PIN/touch.
     print(f"\n{'=' * 72}")
-    print(f"ABOUT TO {'VERBALLY APPROVE' if verbal else 'SIGN'}: {subject}")
+    print(f"ABOUT TO {'POLICY-APPROVE' if policy else 'VERBALLY APPROVE' if verbal else 'SIGN'}: {subject}")
     print("=" * 72)
     print(shown_body if shown_body else content)
     print(f"{'=' * 72}\n")
-    if verbal:
+    if policy:
+        import auto_promote
+        why = auto_promote.serve_time_holds(ev, {x["id"]: x for x in events})
+        if why:
+            sys.exit("sign: REFUSED — the fold would not serve this policy promotion: "
+                     + "; ".join(why))
+        line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
+        append(ev, line)
+        print(f"POLICY-approved {ev['id']} ({subject}) under {policy.get('policy')} "
+              f"lane {policy.get('lane')}")
+        print(f"  class: {M.PROMOTION_POLICY} — served on-demand only, while "
+              f"mesh.toml declares the policy.")
+    elif verbal:
         # Unsigned; body_sha256 still records which bytes were approved.
         line = json.dumps(ev, separators=(",", ":"), ensure_ascii=False)
         append(ev, line)
@@ -271,7 +331,9 @@ def main():
         slug = subject.split("/", 1)[1]
         if promote_id or M.store_file_lineage(slug) == "contains-untrusted":
             reconcile_store(subject,
-                            approved_words=verbal["words"] if verbal else None)
+                            approved_words=(verbal["words"] if verbal else
+                                            policy.get("words") if policy else None),
+                            policy=policy is not None)
     return 0
 
 

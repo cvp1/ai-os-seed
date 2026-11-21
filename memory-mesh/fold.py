@@ -431,7 +431,9 @@ def main():
     alarms.extend(M.write_store_quarantine(fold).get("alarms", []))
 
     # Publish the retrieval tier's servable manifest from the same fold.
-    alarms.extend(M.write_servable_manifest(fold).get("alarms", []))
+    # A policy promotion whose store file is not the screened bytes stays off
+    # the served list until projection repairs it (recall reads the file).
+    alarms.extend(M.write_servable_manifest(M.served_fold(fold, proj)).get("alarms", []))
     # Prebuilt retrieval index, stamped with the manifest just written; a failure
     # only costs the hook speed (it falls back to the scan) and never breaks the fold.
     try:

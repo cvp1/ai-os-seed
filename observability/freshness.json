@@ -1,5 +1,5 @@
 {
- "_comment": "Expected cadence for each SCHEDULED job. freshness.py flags a job as STALE if its newest run is older than max_age, MISSING if it has never run, or FAILING if its newest run exited non-zero. Only list jobs actually scheduled in scheduler/manifest.yml; max_age = the real interval plus slack for a missed beat. Durations: Nd / Nh / Nm. Ships pre-seeded with the demo job (SEED-017, opt-in via --enable-demo) and two jobs that are on by default: the repo-hygiene sweep (SEED-070) and the freshness backstop itself (SEED-074) \u2014 add an entry here for every real job you schedule.",
+ "_comment": "Expected cadence for each SCHEDULED job. freshness.py flags a job as STALE if its newest run is older than max_age, MISSING if it has never run, or FAILING if its newest run exited non-zero. Only list jobs actually scheduled in scheduler/manifest.yml; max_age = the real interval plus slack for a missed beat. Durations: Nd / Nh / Nm. Ships pre-seeded with the demo job (SEED-017, opt-in via --enable-demo) and two jobs that are on by default: the repo-hygiene sweep (SEED-070) and the freshness backstop itself (SEED-074) \u2014 add an entry here for every real job you schedule. A job whose FINDINGS: line means a human must act should set \"surface_findings\": true \u2014 a FINDINGS: run exits 0 (scheduler/CONVENTIONS.md \u00a71), so FAILING/STALE never see it; with the key, freshness surfaces its latest FINDINGS: line as a [FOUND] item.",
  "jobs": {
   "hello_fleet": {
    "max_age": "20m",
@@ -7,7 +7,8 @@
   },
   "repo_hygiene": {
    "max_age": "26h",
-   "label": "repo-hygiene sweep (daily 06:30) \u2014 dirty/unpushed/missing-remote drift"
+   "label": "repo-hygiene sweep (daily 06:30) \u2014 dirty/unpushed/missing-remote drift",
+   "surface_findings": true
   },
   "freshness": {
    "max_age": "26h",

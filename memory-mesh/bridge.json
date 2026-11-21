@@ -89,14 +89,14 @@
     "mcp-corral": {
       "_doc": "Every Corral pane on every lane gets this server through Corral's own MCP proxy.",
       "type": "mcp_cli", "lane": "corral", "path": "~/.config/corral-light/mcp.json",
-      "probe": ["/usr/bin/python3", "~/corral-light/mcp.py", "test", "memory"],
-      "add": ["/usr/bin/python3", "~/corral-light/mcp.py", "add", "memory", "--stdio", "{python}", "--arg={mcp_server}", "--arg=--lane", "--arg=corral"],
-      "remove": ["/usr/bin/python3", "~/corral-light/mcp.py", "remove", "memory"]
+      "probe": ["/usr/bin/python3", "{corral_mcp}", "test", "memory"],
+      "add": ["/usr/bin/python3", "{corral_mcp}", "add", "memory", "--stdio", "{python}", "--arg={mcp_server}", "--arg=--lane", "--arg=corral"],
+      "remove": ["/usr/bin/python3", "{corral_mcp}", "remove", "memory"]
     },
 
     "hooks-claude": {
       "type": "claude_settings", "path": "~/.claude/settings.json",
-      "project_settings": ["~/ai-os/.claude/settings.json"]
+      "project_settings": ["{workspace}/.claude/settings.json"]
     },
     "hooks-grok": {
       "type": "json_file", "path": "~/.grok/hooks/memory-mesh.json", "template": "grok_hooks"

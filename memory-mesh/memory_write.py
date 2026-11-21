@@ -47,6 +47,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -799,6 +800,31 @@ def _write_store_file(path, text):
         fh.write(text)
 
 
+def _approve_now(event_id, words):
+    """Record the owner's in-turn approval of a just-quarantined write as a
+    verbal promotion (sign.py --promote-verbal), which also reconciles the
+    store file. Returns True when sign.py reports the promotion."""
+    d = _mesh_code_dir()
+    sign = (d / "sign.py") if d else None
+    if sign is None or not sign.is_file():
+        print(f"APPROVAL NOT RECORDED — sign.py not found; {event_id} is "
+              f"QUARANTINED. Run sign.py --promote-verbal {event_id} "
+              f"--approved \"<words>\"")
+        return False
+    r = subprocess.run([sys.executable, str(sign), "--promote-verbal", event_id,
+                        "--approved", words, "--session", "memory-write-approved"],
+                       capture_output=True, text=True, timeout=120)
+    m = re.search(r"VERBALLY signed (\S+)", r.stdout or "")
+    if r.returncode == 0 and m:
+        print(f"APPROVED by the owner — verbal promotion {m.group(1)} supersedes "
+              f"{event_id}; served on the next fold (on-demand or always-on as "
+              f"tiered; never pinned/doctrine). Words: {words!r}")
+        return True
+    print(f"APPROVAL FAILED — {event_id} stays QUARANTINED: {proc_error(r)}\n"
+          f"  retry: sign.py --promote-verbal {event_id} --approved \"<words>\"")
+    return False
+
+
 def _cmd_write(args):
     if not SLUG_RE.match(args.slug):
         raise SystemExit(f"error: slug must be kebab-case (letters/digits/hyphens): {args.slug!r}")
@@ -807,6 +833,16 @@ def _cmd_write(args):
     args.lineage = canon_lineage(args.lineage)
     if args.lineage not in LINEAGES:
         raise SystemExit(f"error: --lineage must be one of {sorted(LINEAGES)}")
+    # Owner approval is checked BEFORE anything lands, so a token quote can
+    # never leave a half-applied write behind.
+    args.approved = (getattr(args, "approved", None) or "").strip() or None
+    if args.approved:
+        _, _, min_words = _promotion_vocab()
+        if len(args.approved) < min_words:
+            raise SystemExit(
+                f"error: --approved must quote the owner's actual words (at "
+                f"least {min_words} characters; got {len(args.approved)}). The "
+                f"quote IS the audit trail for serving this memory.")
 
     # Session-provenance check on operator-direct claims: if this session touched
     # untrusted content (web fetch, mail/calendar/drive read) before the write,
@@ -926,6 +962,12 @@ def _cmd_write(args):
 
     if not args.commit:
         print(f"\n(dry run — would write {target} and update {index_target.name}; pass --commit to apply)")
+        if args.approved:
+            print(f"(with --commit: lineage {args.lineage}; "
+                  + ("the owner's approval would be recorded as a verbal promotion "
+                     "and the memory served" if args.lineage != "operator-direct"
+                     or args.provenance in ("flagged-downgraded", "promotion-revoked")
+                     else "served as operator-direct, so no promotion is needed") + ")")
         return
 
     _write_store_file(target, rendered)
@@ -988,8 +1030,18 @@ def _cmd_write(args):
             print(f"mesh: event emitted{f' ({event_id})' if event_id else ''}")
             if args.slug in on_demand_slugs():
                 _emit_tier([args.slug], "ondemand")
-            if args.lineage != "operator-direct" or args.provenance == \
-                    "flagged-downgraded":
+            quarantined = args.lineage != "operator-direct" or \
+                args.provenance == "flagged-downgraded"
+            if quarantined and args.approved and event_id:
+                # The owner approved this memory: record his words as a verbal
+                # promotion now, so it is served without a second step.
+                _approve_now(event_id, args.approved)
+            elif quarantined and args.approved:
+                print("APPROVAL NOT RECORDED — the event id could not be parsed "
+                      "from emit output; the memory is QUARANTINED. Run "
+                      "sign.py --promote-verbal <id> --approved \"<words>\" "
+                      "with the id from ~/memory-events/events/*.ndjson")
+            elif quarantined:
                 # Quarantined: print the exact promote command.
                 if event_id:
                     print(f"QUARANTINED (lineage contains-untrusted) — not "
@@ -1161,8 +1213,8 @@ def cmd_demote(args):
 def cmd_delete(args):
     """Delete memories whose fact now lives in its own home.
 
-    --home is required and recorded in the commit; files stay recoverable in
-    the store's git history.
+    --home is required and recorded in the commit. The file moves to the
+    Trash (dated), never rm: the store is not always a git repo.
     """
     missing, victims = [], []
     for slug in args.slugs:
@@ -1197,11 +1249,21 @@ def cmd_delete(args):
         return
 
     paths = [EXCLUDE] if gen else [INDEX, EXCLUDE]
+    # Never rm (HOW-I-WORK "Deleting things"): the store is not always a git
+    # repo, so a removal moves the file to the Trash with a dated name.
+    trash = Path(os.environ.get("MEMORY_WRITE_TRASH", Path.home() / ".Trash"))
+    trash.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.date.today().isoformat()
     for slug in victims:
         fp = STORE / f"{slug}.md"
-        fp.unlink()
+        dest = trash / f"{slug}-{stamp}.md"
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = trash / f"{slug}-{stamp}-{n}.md"
+        shutil.move(str(fp), str(dest))
         paths.append(fp)
-        print(f"deleted {fp}")
+        print(f"deleted {fp} (moved to {dest}, {dest.stat().st_size} B)")
     if not gen:
         INDEX.write_text(index_text)
         print(f"updated {INDEX}")
@@ -1361,6 +1423,9 @@ def cmd_retag(args):
     PROMOTION_KEY = PROMOTION_VERBAL = None
     if args.lineage == "operator-direct":
         PROMOTION_KEY, PROMOTION_VERBAL, MIN_APPROVAL_WORDS = _promotion_vocab()
+    if getattr(args, "policy_approved", False) and not approved:
+        raise SystemExit("error: --policy-approved needs --operator-approved with "
+                         "the owner's verbatim POLICY approval")
     if approved and args.lineage != "operator-direct":
         raise SystemExit(
             "error: --operator-approved only applies when promoting TO "
@@ -1385,7 +1450,9 @@ def cmd_retag(args):
             continue
         klass = None
         if args.lineage == "operator-direct":
-            if approved:
+            if approved and getattr(args, "policy_approved", False):
+                klass = _mesh_lib().PROMOTION_POLICY
+            elif approved:
                 klass = PROMOTION_VERBAL
             else:
                 ok, reason = has_signed_promotion(slug)
@@ -1403,6 +1470,8 @@ def cmd_retag(args):
             after = set_lineage(before, args.lineage)
             if klass:
                 after = set_promotion(after, klass, approved or None)
+            elif args.lineage != "operator-direct":
+                after = drop_policy_promotion(after)
         except ValueError as e:
             raise SystemExit(f"error: {slug}: {e}")
         (unchanged if after == before else changed).append((slug, p, after))
@@ -1490,6 +1559,19 @@ def set_promotion(text, klass, words=None):
               or re.search(r"^description:[ \t]*.*$\n", fm, re.M)
               or re.search(r"^name:[ \t]*.*$\n", fm, re.M))
     fm = fm[:anchor.end()] + lines + fm[anchor.end():] if anchor else lines + fm
+    return "---\n" + fm + rest
+
+
+def drop_policy_promotion(text):
+    """A withdrawn POLICY promotion: remove its promotion/approved stamps so the
+    file is its pre-promotion bytes again (the fingerprint ignores lineage
+    only). Any other promotion stamp is left exactly as it is."""
+    if not re.search(r"(?m)^promotion:[ \t]*policy-approved[ \t]*$", text):
+        return text
+    fm, rest = _split_frontmatter(text)
+    if fm is None:
+        return text
+    fm = _FM_APPROVED.sub("", _FM_PROMOTION.sub("", fm))
     return "---\n" + fm + rest
 
 
@@ -2286,6 +2368,11 @@ def main():
                         "instead of a signed mesh event (2026-08-12). Value must "
                         "be his verbatim words; they are recorded in the file. "
                         "Weaker than a signature and stamped as such.")
+    r.add_argument("--policy-approved", action="store_true",
+                   help="the --operator-approved words approve a POLICY "
+                        "(memory-mesh/auto_promote.py), not this item: stamp "
+                        "promotion: policy-approved instead of verbally-signed. "
+                        "Retagging back to contains-untrusted removes that stamp.")
     r.add_argument("--commit", action="store_true",
                    help="apply (default is dry-run). Also git-commits + pushes.")
     r.add_argument("--no-git", action="store_true")
@@ -2399,6 +2486,13 @@ def main():
     w.add_argument("--supersedes")
     w.add_argument("--contradicts")
     w.add_argument("--session-id")
+    w.add_argument("--approved", metavar="WORDS",
+                   help="the owner approved THIS memory in this turn: his verbatim "
+                        "words. If the write lands in quarantine (session taint, "
+                        "untrusted lineage, revoked signature), the door "
+                        "immediately records a verbal promotion carrying these "
+                        "words (sign.py --promote-verbal), so it is served. The "
+                        "downgrade itself is still recorded, never overridden.")
     # There is intentionally no --provenance-override (selftest asserts this).
     # --commit both writes the files and git-commits them.
     w.add_argument("--commit", action="store_true",

@@ -524,9 +524,215 @@ class McpCliExe(unittest.TestCase):
         self.assertEqual(B.status(cfg)[0][3], "no harness")
 
 
+class PortablePaths(unittest.TestCase):
+    """bridge.json ships in the seed: no host's layout may be baked into it.
+    {corral_mcp} resolves per install method, {workspace} per host, and a host
+    that evidently HAS the thing but cannot resolve it reads ERROR, not
+    "no harness" (cc-handoff …3af6, 2026-11-21). Sandbox HOME throughout."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="bridge-home-"))
+        self.saved = {k: os.environ.get(k) for k in ("HOME", "PATH", "AIOS_WORKSPACE")}
+        os.environ["HOME"] = str(self.home)
+        os.environ["PATH"] = str(self.home / "empty-bin")   # no corral-light on PATH
+        os.environ.pop("AIOS_WORKSPACE", None)
+        self.saved_cands = getattr(B, "CORRAL_MCP_CANDIDATES", ())  # absent on old master
+        self.cfg = cfg_with()
+        self.cfg["python"] = sys.executable
+        self.log = self.home / "argv.log"
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        B.CORRAL_MCP_CANDIDATES = self.saved_cands
+        import shutil
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    # ── helpers ──
+    def _stub(self, rel):
+        """A Corral mcp.py that records its argv; `test` fails (not wired yet)."""
+        p = self.home / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("import sys, json\n"
+                     f"open({str(self.log)!r}, 'a').write(json.dumps(sys.argv) + '\\n')\n"
+                     "sys.exit(1 if sys.argv[1] == 'test' else 0)\n")
+        return p
+
+    def _corral(self):
+        return self.cfg["targets"]["mcp-corral"]
+
+    def _status(self, name):
+        return dict((r[0], r[3]) for r in B.status(self.cfg))[name]
+
+    def _assert_wires(self, mcp):
+        (kind, argv), = B.plan_target("mcp-corral", self._corral(), self.cfg)
+        self.assertEqual((kind, argv[1], argv[2]), ("cmd", str(mcp), "add"))
+        rows = B.install(apply=True, only=["mcp-corral"], cfg=self.cfg)
+        self.assertEqual(rows[0][1], "ran", rows)
+        calls = [json.loads(l) for l in self.log.read_text().splitlines()]
+        self.assertEqual(calls[-1][0], str(mcp))           # the resolved script really ran
+        self.assertEqual(calls[-1][1:3], ["add", "memory"])
+
+    # ── {corral_mcp} ──
+    def test_linux_install_sh_layout(self):
+        self._assert_wires(self._stub("tools/corral-light/mcp.py"))
+
+    def test_dev_checkout_layout(self):
+        self._assert_wires(self._stub("corral-light/mcp.py"))
+
+    def test_homebrew_layout(self):
+        mcp = self._stub("brew/opt/corral-light/libexec/mcp.py")
+        B.CORRAL_MCP_CANDIDATES = self.saved_cands[:2] + (str(mcp),)
+        self._assert_wires(mcp)
+
+    def test_shipped_candidates_cover_every_install_method(self):
+        c = self.saved_cands
+        self.assertIn("~/tools/corral-light/mcp.py", c)
+        self.assertIn("~/corral-light/mcp.py", c)
+        for prefix in ("/opt/homebrew", "/usr/local", "{{HOME}}/.linuxbrew"):
+            self.assertIn(f"{prefix}/opt/corral-light/libexec/mcp.py", c)
+
+    def test_override_wins(self):
+        self._stub("corral-light/mcp.py")                    # a candidate also exists
+        mcp = self._stub("elsewhere/mcp.py")
+        self.cfg["corral_mcp"] = str(mcp)
+        self._assert_wires(mcp)
+
+    def test_corral_absent_is_no_harness(self):
+        self.assertEqual(self._status("mcp-corral"), "no harness")
+        self.assertEqual(B.plan_target("mcp-corral", self._corral(), self.cfg), [])
+
+    def test_consult_only_config_dir_is_no_harness(self):
+        # {{REDACTED}}: ~/.config/corral-light holds codex-home + a consult
+        # session and there is no Corral. Must not become an ERROR.
+        d = self.home / ".config/corral-light/codex-home"
+        d.mkdir(parents=True)
+        (d.parent / "consult-session.json").write_text("{}")
+        self.assertEqual(self._status("mcp-corral"), "no harness")
+
+    def test_installed_but_mcp_py_unresolved_is_error(self):
+        d = self.home / ".config/corral-light"
+        d.mkdir(parents=True)
+        (d / "mcp.json").write_text("{}")
+        self.assertTrue(self._status("mcp-corral").startswith("ERROR"))
+        rows = B.install(apply=False, only=["mcp-corral"], cfg=self.cfg)
+        self.assertEqual(rows[0][1], "ERROR", rows)
+
+    def test_corral_on_path_but_mcp_py_unresolved_is_error(self):
+        b = self.home / "empty-bin"
+        b.mkdir()
+        (b / "corral-light").write_text("#!/bin/sh\n")
+        (b / "corral-light").chmod(0o755)
+        self.assertTrue(self._status("mcp-corral").startswith("ERROR"))
+
+    def test_override_pointing_nowhere_is_error(self):
+        self._stub("corral-light/mcp.py")                    # must NOT be used silently
+        self.cfg["corral_mcp"] = str(self.home / "gone/mcp.py")
+        self.assertTrue(self._status("mcp-corral").startswith("ERROR"))
+
+    # ── {workspace} ──
+    def _hooks(self, ws_dir=None):
+        user = self.home / ".claude/settings.json"
+        user.parent.mkdir(parents=True, exist_ok=True)
+        user.write_text("{}\n")
+        if ws_dir is not None:
+            proj = ws_dir / ".claude/settings.json"
+            proj.parent.mkdir(parents=True, exist_ok=True)
+            proj.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "/v/python3 /x/memory-mesh/retrieve.py"}]}]}}))
+            return proj
+        return None
+
+    def _planned(self):
+        return [p for p, _o, _n in B.plan_target("hooks-claude", self.cfg["targets"]["hooks-claude"], self.cfg)]
+
+    def test_explicit_workspace_present(self):
+        proj = self._hooks(self.home / "ai-os")
+        self.cfg["workspace"] = "~/ai-os"
+        self.assertIn(proj, self._planned())
+
+    def test_env_workspace_present(self):
+        proj = self._hooks(self.home / "ws-env")
+        os.environ["AIOS_WORKSPACE"] = str(self.home / "ws-env")
+        self.assertIn(proj, self._planned())
+
+    def test_default_workspace(self):
+        proj = self._hooks(self.home / "aios")
+        self.assertIn(proj, self._planned())
+
+    def test_explicit_workspace_missing_is_error(self):
+        self._hooks()
+        self.cfg["workspace"] = "~/ai-os"                     # set, but not on disk
+        with self.assertRaises(FileNotFoundError):
+            self._planned()
+        rows = B.install(apply=False, only=["hooks-claude"], cfg=self.cfg)
+        self.assertEqual(rows[0][1], "ERROR", rows)
+
+    def test_default_workspace_absent_skips(self):
+        self._hooks()
+        self.assertEqual(self._planned(), [self.home / ".claude/settings.json"])
+
+    def test_policy_paths_guard_the_resolved_settings_file(self):
+        self.cfg["workspace"] = str(self.home / "ai-os")
+        paths = B.policy_paths(self.cfg, include_code=False)
+        self.assertIn(str(self.home / "ai-os/.claude/settings.json"), paths)
+        self.assertFalse([p for p in paths if "{" in p], paths)
+
+    def test_shipped_bridge_json_has_no_host_layout(self):
+        raw = (HERE / "bridge.json").read_text()
+        self.assertNotIn("~/ai-os/", raw)
+        self.assertNotIn("~/corral-light/", raw)
+
+
 if __name__ == "__main__":
     try:
         unittest.main(verbosity=1)
     finally:
         import shutil
         shutil.rmtree(TMP, ignore_errors=True)
+
+
+class MarkdownExcludeTests(unittest.TestCase):
+    """A markdown source never reads or serves excluded, hidden or opted-out notes."""
+
+    def _src(self, root, exclude=()):
+        import bridge as B
+        return B.MarkdownDirSource("vault", {"type": "markdown_dir", "path": str(root),
+                                             "glob": "**/*.md", "exclude": list(exclude)})
+
+    def _tree(self, d):
+        from pathlib import Path
+        files = {"keep/pump.md": "# pump\nnutrient pump zebrafjord\n",
+                 "_inbox/clip.md": "# clip\nnutrient pump zebrafjord injected\n",
+                 "a/note.sync-conflict-1.md": "# dup\nnutrient pump zebrafjord\n",
+                 "Personal/Retirement.md": "# money\nnutrient pump zebrafjord 1,000,000\n",
+                 "opt/out.md": "---\nname: x\nserve: false\n---\nnutrient pump zebrafjord\n",
+                 ".obsidian/x.md": "# hidden\nnutrient pump zebrafjord\n"}
+        for rel, t in files.items():
+            p = Path(d) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(t)
+
+    def test_only_the_kept_note_is_searchable_or_gettable(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            s = self._src(d, ["_inbox/*", "*sync-conflict*", "Personal/Retirement*"])
+            ids = {h["id"] for h in s.search("nutrient pump zebrafjord", 10)}
+            self.assertEqual(ids, {"vault:keep/pump.md"})
+            self.assertIsNotNone(s.get("vault:keep/pump.md"))
+            for rel in ("_inbox/clip.md", "a/note.sync-conflict-1.md",
+                        "Personal/Retirement.md", "opt/out.md", ".obsidian/x.md"):
+                self.assertIsNone(s.get("vault:" + rel), rel)
+
+    def test_no_exclude_still_serves_ordinary_notes(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self._tree(d)
+            ids = {h["id"] for h in self._src(d).search("nutrient pump zebrafjord", 10)}
+            self.assertIn("vault:_inbox/clip.md", ids)
+            self.assertNotIn("vault:opt/out.md", ids)
+            self.assertNotIn("vault:.obsidian/x.md", ids)

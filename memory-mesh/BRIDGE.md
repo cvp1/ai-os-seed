@@ -36,6 +36,13 @@ touch nothing protected always pass.
 \* needs the operator's approval to install (self-modification gate):
 `bridge.py install --apply --only hooks-claude`.
 
+## Cloud agents (Duet, grok.com)
+
+Cloud surfaces can't reach a stdio server, so `remote_mcp.py` serves the same
+read-only tools over HTTPS on loopback, behind Tailscale Funnel and a Cloudflare
+pass-through. Lanes `duet` and `grok-cloud`, personal-only, lane taken from the
+token. Switch-on and switch-off steps: [`remote/README.md`](remote/README.md).
+
 ## Lanes and data classes
 
 Each memory is classed `personal`, `employer-client` or `unknown`, over
@@ -68,6 +75,9 @@ Declare it in `bridge.json` under `sources` with `"enabled": true`:
 
 - `markdown_dir`: `path`, `glob`, optional `data_class` default. Scored with
   the mesh's own TF-IDF.
+  Optional `exclude`: fnmatch globs against the path relative to `path`
+  (`*` crosses folders). Hidden paths are always skipped, and a note whose
+  frontmatter says `serve: false` is never read or served.
 - `command`: `argv`, `timeout`. The program reads one JSON object on stdin and
   prints one on stdout:
   - `{"op":"search","query":Q,"k":K}` gives `{"hits":[{"id","desc","score","text"?,"data_class"?}]}`

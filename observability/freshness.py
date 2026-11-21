@@ -559,8 +559,10 @@ def main():
                     help="treat MISSING (never run) as a paging problem too")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--write-findings", action="store_true",
-                    help="also write/remove data/FINDINGS.md so an agent finds "
-                         "it at session start (SEED-074; off by default)")
+                    help="also write/remove data/FINDINGS.md (SEED-074; off by "
+                         "default here, on in the scheduled job). Nothing reads it "
+                         "at session start unless a reader is wired — a "
+                         "CLAUDE.md check or a session-start hook")
     ap.add_argument("--ack", metavar="MATCH",
                     help="park a finding: substring of its FINDINGS.md line; "
                          "needs --until and --why")

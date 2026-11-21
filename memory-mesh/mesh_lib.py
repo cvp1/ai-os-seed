@@ -56,6 +56,13 @@ LINEAGES = {"operator-direct", "contains-untrusted"}
 # source and never changes; promotion is whether the owner vouched for it.
 PROMOTION_KEY = "key-signed"        # cryptographic, agent-impossible by construction
 PROMOTION_VERBAL = "verbally-signed"  # owner approved it in session
+# Owner approved a POLICY once (auto_promote.py), not this item. Honoured only
+# while the policy id is declared on BOTH the writing host and the folding
+# host in mesh.toml (`auto_promote = "<id>"`); remove it there and every such
+# promotion returns to quarantine on the next fold. Never pinned, doctrine or
+# always-on: on-demand only, whatever tier or residency anything else claims.
+PROMOTION_POLICY = "policy-approved"
+POLICY_LANES = {1, 2}
 MIN_APPROVAL_WORDS = 8              # an attestation shorter than this quotes nothing
 AUDIENCES = {"operator", "family", "shared"}
 CONFIDENCES = {"operator-stated", "verified-live", "inferred"}
@@ -177,6 +184,70 @@ def _load_toml(path):
     return out
 
 
+_AP_CACHE = {}
+
+
+def mesh_toml_path():
+    """mesh.toml beside the code; a drill (MESH_DRILL_LOCAL) may point MESH_TOML elsewhere."""
+    if os.environ.get("MESH_TOML") and os.environ.get("MESH_DRILL_LOCAL"):
+        return Path(os.environ["MESH_TOML"])
+    return CODE_DIR / "mesh.toml"
+
+
+def auto_promote_policies(host=None):
+    """Policy ids `host` (default: this host) declares in mesh.toml as
+    `auto_promote = "id[,id]"`. Unreadable config or no entry = none, so a
+    broken file fails toward quarantine, never toward serving."""
+    path = mesh_toml_path()
+    try:
+        stamp = (str(path), path.stat().st_mtime_ns, path.stat().st_size)
+        if _AP_CACHE.get("stamp") != stamp:
+            _AP_CACHE.clear()
+            _AP_CACHE.update(stamp=stamp, cfg=_load_toml(path))
+        cfg = _AP_CACHE["cfg"]
+    except Exception:  # noqa: BLE001 — degrade to the safe side
+        _AP_CACHE.clear()
+        return frozenset()
+    name = host or HOST
+    for h in cfg.get("hosts") or []:
+        if h.get("name") == name:
+            raw = h.get("auto_promote") or ""
+            return frozenset(x.strip() for x in str(raw).split(",") if x.strip())
+    return frozenset()
+
+
+def policy_honored(e, by_id=None):
+    """True when this host's fold serves `e` on its policy approval: a valid
+    policy_approval on a contains-untrusted `correct`, whose policy id is
+    declared by the host that WROTE it and by this host, whose one supersede
+    edge names its own quarantined source, and whose carried bytes pass the
+    policy's content screen. `by_id` (the event graph) is required: without
+    it the source cannot be checked, so the answer is no."""
+    if by_id is None:
+        return False
+    pa = e.get("policy_approval")
+    if not isinstance(pa, dict) or e.get("kind") != "correct":
+        return False
+    if e.get("lineage") != "contains-untrusted" or e.get("verbal_approval") or e.get("sig"):
+        return False
+    pid = (pa.get("policy") or "").strip()
+    if not pid or pa.get("lane") not in POLICY_LANES:
+        return False
+    if len((pa.get("words") or "").strip()) < MIN_APPROVAL_WORDS or not pa.get("ts"):
+        return False
+    if not (pid in auto_promote_policies() and pid in auto_promote_policies(e.get("host"))):
+        return False
+    # The stamp is an audit record, not a capability: the policy's own
+    # deterministic screen re-runs here on the bytes being served, so an event
+    # minted by hand (skipping auto_promote) still has to pass it. Any failure
+    # to run the screen refuses.
+    try:
+        import auto_promote
+        return not auto_promote.serve_time_holds(e, by_id)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def peers():
     """[(host, ssh_alias)] for every other mesh host in mesh.toml; empty = solo mode."""
     cfg = _load_toml(CODE_DIR / "mesh.toml")
@@ -229,7 +300,7 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
                confidence="inferred", supersedes=None, pin=False, ts=None,
                residency=RESIDENCY_UNSET, hook=None, body=None, expires=None,
                carry_forward=False, body_sha256=None, verbal_approval=None,
-               pointer=False, tier=None):
+               pointer=False, tier=None, policy_approval=None):
     # Producer gate: every event path funnels through here.
     # carry_forward=True lets retag/supersede re-emit old content verbatim.
     if kind == "lesson" and not carry_forward:
@@ -267,6 +338,8 @@ def make_event(kind, subject, content, *, session, polarity="n/a", home=None,
     # security control (any caller can pass a string). Lineage is unchanged.
     if verbal_approval is not None:
         ev["verbal_approval"] = verbal_approval
+    if policy_approval is not None:
+        ev["policy_approval"] = policy_approval
     if expires is not None:
         ev["expires"] = expires
     problems = validate_event(ev)
@@ -306,6 +379,25 @@ def validate_event(ev):
             if not va.get("ts"):
                 p.append("verbal_approval.ts missing — an approval with no "
                          "date cannot be placed in a session")
+    pa = ev.get("policy_approval")
+    if pa is not None:
+        if not isinstance(pa, dict):
+            p.append("policy_approval must be an object")
+        else:
+            if not (pa.get("policy") or "").strip():
+                p.append("policy_approval.policy missing")
+            if len((pa.get("words") or "").strip()) < MIN_APPROVAL_WORDS:
+                p.append("policy_approval.words must quote the owner's policy approval")
+            if not pa.get("ts"):
+                p.append("policy_approval.ts missing")
+            if pa.get("lane") not in POLICY_LANES:
+                p.append(f"policy_approval.lane must be one of {sorted(POLICY_LANES)}")
+        if ev.get("verbal_approval") is not None or ev.get("sig"):
+            p.append("policy_approval cannot share an event with a verbal approval "
+                     "or a signature — a promotion has one class")
+        if ev.get("lineage") != "contains-untrusted":
+            p.append("policy_approval needs lineage contains-untrusted (it vouches "
+                     "for an untrusted source; it never changes the source)")
     # Body and body_sha256 must agree; a mismatch is never served.
     if (ev.get("body") and ev.get("body_sha256")
             and content_fingerprint(ev["body"]) != ev["body_sha256"]):
@@ -334,6 +426,8 @@ def effective_residency(ev):
     however it entered the log.
     """
     r = ev.get("residency")
+    if ev.get("policy_approval") is not None or ev.get("_promotion") == PROMOTION_POLICY:
+        return MAX_UNSIGNED_RESIDENCY        # a policy promotion is on-demand only
     if r is None:
         return RESIDENCY_UNSET
     if r == "pinned" and not ev.get("_signed"):
@@ -433,7 +527,8 @@ def chain_body(tip, events):
 
     # Nearest vouching event: verified signature or verbal approval.
     authority = next((e for e in chain if e.get("body_sha256")
-                      and (e.get("_signed") or e.get("verbal_approval"))), None)
+                      and (e.get("_signed") or e.get("verbal_approval")
+                           or policy_honored(e, by_id))), None)
     if authority is not None:
         want = authority["body_sha256"]
         carrier = next((e for e in chain if ok_carrier(e)
@@ -445,8 +540,11 @@ def chain_body(tip, events):
             return None
         if authority.get("_signed"):
             return _stamp(carrier["body"], "operator-direct", PROMOTION_KEY)
-        return _stamp(carrier["body"], "operator-direct", PROMOTION_VERBAL,
-                      (authority.get("verbal_approval") or {}).get("words"))
+        if authority.get("verbal_approval"):
+            return _stamp(carrier["body"], "operator-direct", PROMOTION_VERBAL,
+                          (authority.get("verbal_approval") or {}).get("words"))
+        return _stamp(carrier["body"], "operator-direct", PROMOTION_POLICY,
+                      (authority.get("policy_approval") or {}).get("words"))
     carrier = next((e for e in chain[1:] if ok_carrier(e)), None)
     if carrier is None:
         return None
@@ -470,7 +568,8 @@ def project_store(fold, store, apply=False, events=None):
     """
     if store is None:
         return {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
-    out = {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": []}
+    out = {"created": [], "repaired": [], "inverse_ghosts": [], "alarms": [],
+           "policy_unsynced": []}
     seen = set()
     for e in fold["live"]:
         if not e["subject"].startswith("lesson/"):
@@ -491,7 +590,20 @@ def project_store(fold, store, apply=False, events=None):
         f = store / f"{slug}.md"
         if promoted is not None and f.exists():
             # Chain-walked bodies are create-only: a repair would strip the
-            # signing host's post-promotion frontmatter.
+            # signing host's post-promotion frontmatter. EXCEPT a policy
+            # promotion: recall serves the file, so it must be exactly the
+            # bytes the policy screened (store-side stamps aside).
+            if e.get("_promotion") == PROMOTION_POLICY:
+                have = f.read_text(encoding="utf-8")
+                if have != promoted:            # byte-exact: nothing is ignored
+                    if apply:
+                        f.write_text(promoted, encoding="utf-8")
+                    else:
+                        out["policy_unsynced"].append(slug)   # never served until repaired
+                    out["repaired"].append(slug)
+                    out["alarms"].append(
+                        f"store file of policy promotion {slug} differed from the "
+                        f"screened body and {'was rewritten' if apply else 'needs fold --project'}")
             continue
         if promoted is not None or event_carries_body(e):
             # Audience boundary re-checked here: events may arrive from peers or replay.
@@ -874,20 +986,57 @@ def _contradiction_alarm(subj, evs, suffix=""):
 def fold_events(events, registry):
     """Deterministic rule pass; resolution is by explicit supersedes, never by time."""
     by_id = {e["id"]: e for e in events}
-    superseded, dangling = set(), []
-    for e in events:
-        # supersedes may be one id or a list.
-        raw = e.get("supersedes")
-        for s in ([raw] if isinstance(raw, str) else (raw or [])):
-            if s in by_id:
-                superseded.add(s)
-            else:
-                dangling.append((e["id"], s))   # compaction-bug tripwire
-    # Every host re-verifies signatures at fold time.
+    # Every host re-verifies signatures at fold time (before the supersede
+    # pass, which needs to know who is vouched).
     for e in events:
         e["_signed"] = verify_sig(e) if e.get("sig") else False
         if e.get("sig") and not e["_signed"]:
             e["_badsig"] = True
+
+    def _targets(e):
+        raw = e.get("supersedes")       # supersedes may be one id or a list.
+        return [raw] if isinstance(raw, str) else list(raw or [])
+
+    # Vouched = would be served on its own lineage/promotion. Fold-local.
+    _policy_ok = {}
+
+    def _vouched(e):
+        lin = e.get("lineage")
+        if lin == "operator-direct":
+            return True
+        if lin != "contains-untrusted":
+            return False
+        if e.get("_signed") or e.get("verbal_approval"):
+            return True
+        if e["id"] not in _policy_ok:
+            _policy_ok[e["id"]] = policy_honored(e, by_id)
+        return _policy_ok[e["id"]]
+
+    # An unvouched untrusted write must not hide a vouched memory by naming
+    # it in `supersedes`: until the owner vouches for the write (directly or
+    # by promoting something that supersedes it, transitively), the trusted
+    # memory keeps serving and the write stays quarantined. `endorsed` walks
+    # supersede edges down from every vouched event; edges from outside it
+    # onto a vouched event are ignored (2026-11-01, Craig's go).
+    vouched = {e["id"] for e in events if _vouched(e)}
+    endorsed, frontier = set(vouched), list(vouched)
+    while frontier:
+        nxt = []
+        for i in frontier:
+            for s in _targets(by_id[i]):
+                if s in by_id and s not in endorsed:
+                    endorsed.add(s)
+                    nxt.append(s)
+        frontier = nxt
+    superseded, dangling, ignored_supersedes = set(), [], []
+    for e in events:
+        for s in _targets(e):
+            if s not in by_id:
+                dangling.append((e["id"], s))   # compaction-bug tripwire
+            elif e["id"] not in endorsed and s in vouched:
+                ignored_supersedes.append((e["id"], s))
+            else:
+                superseded.add(s)
     # retract only carries a supersedes edge; it never renders.
     live = [e for e in events if e["id"] not in superseded
             and e["kind"] not in ("denial", "propose-correct", "retract")]
@@ -913,6 +1062,9 @@ def fold_events(events, registry):
                 keep.append(e)
             elif e.get("verbal_approval"):
                 e["_promotion"] = PROMOTION_VERBAL
+                keep.append(e)
+            elif _vouched(e):
+                e["_promotion"] = PROMOTION_POLICY
                 keep.append(e)
             else:
                 quarantined.append(e)
@@ -1060,6 +1212,8 @@ def fold_events(events, registry):
             # Pin events never render as rows; exposed here for PINS.md.
             "pins": pins, "pins_active": sorted(pinned_subjects),
             "tiers": tiers,
+            # (writer, target) supersede edges ignored: unvouched onto vouched.
+            "ignored_supersedes": ignored_supersedes,
             "pins_refused": refused, "pinned_bytes": spent}
 
 
@@ -1284,6 +1438,10 @@ def ondemand_slugs(store, fold=None):
         elif t == "always":
             out.discard(k)
             out.discard(subj)
+    # A policy promotion is on-demand whatever a tier event says.
+    for e in (fold or {}).get("live") or ():
+        if e.get("_promotion") == PROMOTION_POLICY:
+            out.add(_tier_key(e["subject"]))
     return out
 
 
@@ -1499,7 +1657,11 @@ def render_harness_memory(fold, store):
                     "served — resolve all pending with memory-mesh/triage.py "
                     "(one screen, one owner approval)")
     head.append("")
-    return fit_harness_memory(head, ranked, sorted(exclude))
+    # A policy promotion is reachable by recall only; its name never rides
+    # into the session-start file either.
+    policy = {_tier_key(e["subject"]) for e in fold.get("live", [])
+              if e.get("_promotion") == PROMOTION_POLICY}
+    return fit_harness_memory(head, ranked, sorted(exclude - policy))
 
 
 def render_store_quarantine(fold):
@@ -1554,6 +1716,15 @@ def servable_slugs(fold):
             continue
         out.add(slug)
     return sorted(out)
+
+
+def served_fold(fold, proj):
+    """`fold` minus policy promotions whose store file is not yet the screened
+    bytes (project_store's `policy_unsynced`): recall reads the file."""
+    unsynced = {f"lesson/{s}" for s in (proj or {}).get("policy_unsynced", [])}
+    if not unsynced:
+        return fold
+    return dict(fold, live=[e for e in fold["live"] if e["subject"] not in unsynced])
 
 
 def servable_manifest_path():

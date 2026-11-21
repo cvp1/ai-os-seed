@@ -643,3 +643,63 @@ class TriageScreenTests(unittest.TestCase):
                                           "--approved", "go"]), 3)
             self.assertEqual(triage.main(["--apply", "--digest", triage.digest(b)]), 2)
             ap.assert_not_called()
+
+
+class UntrustedSupersedeTests(unittest.TestCase):
+    """An unvouched untrusted write cannot hide a vouched memory by naming it
+    in `supersedes`; a vouched (or vouched-for) writer still replaces it."""
+
+    def _ev(self, i, lineage="operator-direct", sup=None, kind="lesson", **kw):
+        e = {"id": i, "ts": "2026-11-01T00:00:0%sZ" % i[-1], "host": "h",
+             "session": "s", "kind": kind, "subject": "lesson/x-fact",
+             "content": "c-" + i, "lineage": lineage, "audience": "operator",
+             "confidence": "operator-stated", "polarity": "n/a",
+             "supersedes": sup}
+        e.update(kw)
+        return e
+
+    def _fold(self, evs):
+        f = mesh_lib.fold_events(evs, mesh_lib.load_registry())
+        return ({e["id"] for e in f["live"]}, {e["id"] for e in f["quarantined"]}, f)
+
+    def test_falsifier_quarantined_write_leaves_trusted_lesson_served(self):
+        live, quar, f = self._fold([self._ev("t1"),
+                                    self._ev("u2", "contains-untrusted", sup=["t1"])])
+        self.assertIn("t1", live)
+        self.assertIn("u2", quar)
+        self.assertEqual(f["ignored_supersedes"], [("u2", "t1")])
+
+    def test_verbal_promoted_writer_replaces_trusted(self):
+        live, _, f = self._fold([self._ev("t1"),
+                                 self._ev("u2", "contains-untrusted", sup=["t1"], kind="correct",
+                                          verbal_approval="yes promote that one please now ok")])
+        self.assertEqual(live, {"u2"})
+        self.assertEqual(f["ignored_supersedes"], [])
+
+    def test_promotion_of_the_writer_carries_its_replacement(self):
+        live, quar, f = self._fold([
+            self._ev("t1"),
+            self._ev("u2", "contains-untrusted", sup=["t1"]),
+            self._ev("p3", "contains-untrusted", sup=["u2"], kind="correct",
+                     verbal_approval="yes promote that one please now ok")])
+        self.assertEqual(live, {"p3"})
+        self.assertEqual(f["ignored_supersedes"], [])
+
+    def test_untrusted_onto_untrusted_still_supersedes(self):
+        _, quar, f = self._fold([self._ev("u1", "contains-untrusted"),
+                                 self._ev("u2", "contains-untrusted", sup=["u1"])])
+        self.assertEqual(quar, {"u2"})
+        self.assertEqual(f["ignored_supersedes"], [])
+
+    def test_unknown_lineage_cannot_hide_trusted(self):
+        live, _, _ = self._fold([self._ev("t1"), self._ev("u2", None, sup=["t1"])])
+        self.assertIn("t1", live)
+
+    def test_untrusted_retract_cannot_remove_trusted(self):
+        live, _, _ = self._fold([self._ev("t1"),
+                                 self._ev("r2", "contains-untrusted", sup=["t1"], kind="retract")])
+        self.assertIn("t1", live)
+
+    def test_operator_retract_still_removes_trusted(self):
+        live, _, _ = self._fold([self._ev("t1"), self._ev("r2", sup=["t1"], kind="retract")])
+        self.assertNotIn("t1", live)

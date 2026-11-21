@@ -13,6 +13,10 @@
 # notify = "bin/page-me"    # optional: $HOME-relative command the fold pages
 #                           # you through (text on stdin, exit 0 = delivered);
 #                           # absent = the direct Telegram bot path
+# auto_promote = "auto-promote-v1"  # optional: let auto_promote.py promote
+#                           # safe quarantined memories on this host; must be
+#                           # declared on the writing AND the folding host.
+#                           # Absent = off (every memory waits for triage.py).
 #
 # [[hosts]]
 # name = "laptop"

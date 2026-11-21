@@ -27,6 +27,7 @@ operator promotes them.
 """
 import argparse
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -35,7 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -96,11 +97,66 @@ def _x(p):
     return Path(os.path.expanduser(str(p)))
 
 
-def _sub(s, cfg):
-    return (os.path.expanduser(s)
-            .replace("{python}", cfg.get("python") or sys.executable)
-            .replace("{mcp_server}", str(MCP_SERVER))
-            .replace("{bridge}", str(HERE / "bridge.py")))
+# Where Corral's mcp.py lives, by install method ({{REDACTED}}/corral-light c56efeb):
+# install.sh puts it in ~/tools/corral-light, a dev checkout in ~/corral-light,
+# Homebrew in <prefix>/opt/corral-light/libexec. A host elsewhere sets
+# "corral_mcp" in its local bridge.json.
+CORRAL_MCP_CANDIDATES = (
+    "~/tools/corral-light/mcp.py",
+    "~/corral-light/mcp.py",
+    "/opt/homebrew/opt/corral-light/libexec/mcp.py",
+    "/usr/local/opt/corral-light/libexec/mcp.py",
+    "{{HOME}}/.linuxbrew/opt/corral-light/libexec/mcp.py",
+)
+# Substituted when nothing resolves: a path that never exists, so a probe on it
+# can only fail closed.
+NO_CORRAL_MCP = "/nonexistent/corral-light-not-installed/mcp.py"
+
+
+def corral_mcp(cfg):
+    """The resolved Corral mcp.py, or None. An override is the only candidate."""
+    o = (cfg or {}).get("corral_mcp")
+    for c in ((o,) if o else CORRAL_MCP_CANDIDATES):
+        p = _x(c)
+        if p.is_file():
+            return str(p)
+    return None
+
+
+def corral_installed(cfg):
+    """Is Corral evidently on this host, whether or not its mcp.py resolves?
+
+    Deliberately NOT "~/.config/corral-light/ exists": a host that only ran a
+    consult or holds the codex-home instruction file has that dir and no
+    Corral ({{REDACTED}}, 2026-11-21) — that is "no harness", not an error.
+    """
+    return bool((cfg or {}).get("corral_mcp") or corral_mcp(cfg)
+                or shutil.which("corral-light")
+                or _x("~/.config/corral-light/mcp.json").exists())
+
+
+def workspace(cfg):
+    """(path, explicit): cfg "workspace", then $AIOS_WORKSPACE, then ~/aios."""
+    w = (cfg or {}).get("workspace") or os.environ.get("AIOS_WORKSPACE")
+    return (_x(w), True) if w else (_x("~/aios"), False)
+
+
+def _sub(s, cfg, strict=False):
+    """Expand ~ and the bridge placeholders. strict=True raises when an
+    EXPLICIT workspace is missing: silently dropping that host's project
+    wiring is the failure this makes loud. The ~/aios default may be absent."""
+    out = (os.path.expanduser(s)
+           .replace("{python}", cfg.get("python") or sys.executable)
+           .replace("{mcp_server}", str(MCP_SERVER))
+           .replace("{bridge}", str(HERE / "bridge.py")))
+    if "{corral_mcp}" in out:
+        out = out.replace("{corral_mcp}", corral_mcp(cfg) or NO_CORRAL_MCP)
+    if "{workspace}" in out:
+        ws, explicit = workspace(cfg)
+        if strict and explicit and not ws.is_dir():
+            raise FileNotFoundError(f"workspace {ws} is set explicitly but does not exist")
+        out = out.replace("{workspace}", str(ws))
+    return out
 
 
 # ── data classes ────────────────────────────────────────────────────────────
@@ -286,20 +342,36 @@ class MeshSource(Source):
         return rows
 
 
+# A note opts out of every markdown source with a frontmatter line `serve: false`.
+_SERVE_FALSE = re.compile(r"\A---\n(?:.*\n)*?serve:\s*false\s*\n(?:.*\n)*?---", re.I)
+
+
 class MarkdownDirSource(Source):
     """Any folder of markdown files, scored with the mesh's own TF-IDF."""
     def _root(self):
         return _x(self.spec["path"])
+
+    def _excluded(self, rel):
+        """Hidden paths, and any `exclude` glob (matched against the path
+        relative to the source root, fnmatch-style), are never read or served."""
+        rel = PurePosixPath(*rel.parts)
+        if any(part.startswith(".") for part in rel.parts):
+            return True
+        return any(fnmatch.fnmatch(str(rel), pat) for pat in self.spec.get("exclude") or [])
 
     def _docs(self):
         root = self._root()
         if not root.is_dir():
             return []
         docs = []
-        for f in sorted(root.glob(self.spec.get("glob", "**/*.md")))[:MAX_SOURCE_FILES]:
+        files = [f for f in sorted(root.glob(self.spec.get("glob", "**/*.md")))
+                 if not self._excluded(f.relative_to(root))]
+        for f in files[:MAX_SOURCE_FILES]:
             try:
                 text = f.read_text(encoding="utf-8")
             except (OSError, UnicodeDecodeError):
+                continue
+            if _SERVE_FALSE.search(text):
                 continue
             m = (re.search(r"^description:\s*(.+)$", text, re.M)
                  or re.search(r"^#\s+(.+)$", text, re.M))
@@ -321,9 +393,11 @@ class MarkdownDirSource(Source):
         rel = ident.split(":", 1)[-1]
         root = self._root().resolve()
         p = (root / rel).resolve()
-        if root not in p.parents or not p.is_file():
+        if root not in p.parents or not p.is_file() or self._excluded(p.relative_to(root)):
             return None
         text = p.read_text(encoding="utf-8")
+        if _SERVE_FALSE.search(text):
+            return None
         return {"id": ident, "text": text, "source": self.name,
                 "data_class": classify_all(ident, text, default=self.spec.get("data_class"))}
 
@@ -855,7 +929,7 @@ def policy_paths(cfg=None, include_code=True):
             if isinstance(t, dict) and t.get("path") and t.get("type") != "static_file":
                 out |= _forms(_x(t["path"]))
             for pp in (t.get("project_settings") or []) if isinstance(t, dict) else []:
-                out |= _forms(_x(pp))
+                out |= _forms(_x(_sub(pp, cfg)))
         if include_code:
             try:
                 _write_if_changed(STATE_DIR / "policy-paths.json", json.dumps(sorted(out)))
@@ -1225,8 +1299,9 @@ def _template(name, cfg):
     raise KeyError(name)
 
 
-def _claude_settings_plan(t):
+def _claude_settings_plan(t, cfg=None):
     """(path, old, new) for the user-global settings and each project file."""
+    cfg = cfg or {}
     plans = []
     user = _x(t["path"])
     old = user.read_text(encoding="utf-8") if user.exists() else "{}\n"
@@ -1235,7 +1310,7 @@ def _claude_settings_plan(t):
     # The recall hook moves to user scope verbatim (fold_watch matches the string).
     recall_cmd = None
     for pp in t.get("project_settings") or []:
-        p = _x(pp)
+        p = _x(_sub(pp, cfg, strict=True))
         if not p.exists():
             continue
         pold = p.read_text(encoding="utf-8")
@@ -1355,7 +1430,7 @@ def plan_target(name, t, cfg, undo=False):
         json.loads(new)                       # never write invalid JSON
         return [(p, old, new)] if new != old else []
     if typ == "claude_settings":
-        plans = _claude_settings_unplan(t) if undo else _claude_settings_plan(t)
+        plans = _claude_settings_unplan(t) if undo else _claude_settings_plan(t, cfg)
         return [(p, o, n) for p, o, n in plans if o != n]
     if typ in ("json_file", "text_file"):
         p = _x(t["path"])
@@ -1388,6 +1463,12 @@ def _mcp_cli_exe(t, cfg):
     (Omarchy laptops) is not at ~/.local/bin, and a hardcoded miss used to read
     as "nothing to change" — status reported ok for a server never registered.
     """
+    if any("{corral_mcp}" in a for a in t["probe"]) and corral_mcp(cfg) is None:
+        if corral_installed(cfg):
+            raise FileNotFoundError(
+                "Corral is installed but its mcp.py is in none of CORRAL_MCP_CANDIDATES; "
+                'set "corral_mcp" in ~/.config/memory-mesh/bridge.json')
+        return None  # no Corral on this host
     if not all(_x(_sub(a, cfg)).exists() for a in t["probe"][1:2] if a.endswith(".py")):
         return None  # the harness's own script (e.g. Corral's mcp.py) is not here
     want = _x(_sub(t["probe"][0], cfg))

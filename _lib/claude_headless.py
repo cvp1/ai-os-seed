@@ -275,6 +275,15 @@ def run_claude(prompt, *, model="sonnet", allowed_tools="", timeout=900,
     if on_usage:
         on_usage(env.get("usage", {}) or {}, env.get("total_cost_usd", 0),
                  env.get("model") or model)
+    else:
+        # No caller hook: feed the run logger directly (a caller that passes
+        # on_usage owns emission, so a run is never counted twice).
+        try:
+            from _lib import obs_tokens
+            obs_tokens.emit_anthropic(env.get("usage"), env.get("total_cost_usd"),
+                                      env.get("model") or model)
+        except Exception:  # noqa: BLE001 - metering must never break a job
+            pass
     out = (env.get("result") or "").strip()
     if env.get("is_error") or not out:
         raise RuntimeError("empty agent result")
@@ -351,6 +360,32 @@ def _selftest():
     ok(out == "answer", "result-stripped")
     ok("--strict-mcp-config" in seen["argv"], "guard-reaches-runner")
     ok(usage_log == [({"t": 1}, 0.5, "claude-x")], "on-usage-called")
+
+    # --- run_claude: run-logger feed (CC_OBS_TOKENS_FILE) ---
+    import tempfile
+    _saved_tok = os.environ.get("CC_OBS_TOKENS_FILE")
+    _fd, _tok = tempfile.mkstemp(prefix="obs_tok_hl_")
+    os.close(_fd)
+    os.environ["CC_OBS_TOKENS_FILE"] = _tok
+    try:
+        _env = json.dumps({"result": "a", "total_cost_usd": 0.02, "model": "claude-x",
+                           "usage": {"input_tokens": 2, "output_tokens": 5,
+                                     "cache_read_input_tokens": 90,
+                                     "cache_creation_input_tokens": 8}})
+        run_claude("p", _runner=lambda a, **k: _FakeCP(0, _env))
+        _recs = [json.loads(l) for l in open(_tok, encoding="utf-8") if l.strip()]
+        ok(len(_recs) == 1 and _recs[0]["tokens_in"] == 100
+           and _recs[0]["cache_read"] == 90, "no-hook-feeds-run-logger")
+        run_claude("p", on_usage=lambda u, c, m: None,
+                   _runner=lambda a, **k: _FakeCP(0, _env))
+        _recs = [l for l in open(_tok, encoding="utf-8") if l.strip()]
+        ok(len(_recs) == 1, "hook-owner-not-double-counted")
+    finally:
+        os.unlink(_tok)
+        if _saved_tok is None:
+            os.environ.pop("CC_OBS_TOKENS_FILE", None)
+        else:
+            os.environ["CC_OBS_TOKENS_FILE"] = _saved_tok
 
     ok(raises(lambda: run_claude(
         "p", _runner=lambda a, **k: _FakeCP(1, "", "boom"))), "nonzero-raises")

@@ -5,6 +5,9 @@
 # here, then run `sync.sh`; never hand-edit crontab or a launchd .plist.
 # `sync.sh --check` reports drift without fixing it.
 #
+# A job that prints `FINDINGS:` and exits 0 is invisible to freshness unless
+# its freshness.json entry sets "surface_findings": true (CONVENTIONS.md §1).
+#
 # Fields:
 #   name      unique job id; also the --job key log_run.py records and the
 #             key freshness.json's "jobs" map looks up.
@@ -45,6 +48,7 @@
 #       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job stage_drift --
 #       /usr/bin/python3 <SEED_ROOT>/scheduler/stage_drift.py
 #   - name: mcp_guard          # MCP launch-surface drift (run `guard.py snapshot` first)
+#                              # its freshness.json entry wants "surface_findings": true
 #     schedule: "30 6 * * 1"
 #     command: >-
 #       /usr/bin/python3 <SEED_ROOT>/observability/log_run.py --job mcp_guard --

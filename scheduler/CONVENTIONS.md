@@ -25,6 +25,14 @@ line means *the job worked and found something worth telling you about*.
 Nothing downstream — freshness, a report, a future dashboard — needs to be
 taught the difference per job; `ok` just tells the truth.
 
+The flip side: because a `FINDINGS:` run exits 0, freshness's FAILING and
+STALE checks never see it. If a job's finding means *a human must act* (MCP
+launch-surface drift, unpushed work), opt it in with `"surface_findings": true`
+on its entry in `observability/freshness.json`. Freshness then reports the
+job's latest `FINDINGS:` line as a `[FOUND]` item (`job_findings_problems()` in
+`freshness.py`), and it reaches `data/FINDINGS.md` like any other problem.
+Without the key, an exit-0 finding is recorded in `runs.db` and nowhere else.
+
 ## 2. Jobs must self-notify
 
 `crontab` only emails you on non-empty stdout if `MAILTO` is set in the
